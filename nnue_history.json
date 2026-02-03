@@ -1,0 +1,51 @@
+[
+  {
+    "generation": 1,
+    "timestamp": "2026-02-02 15:46:01",
+    "config": {
+      "games": 10000,
+      "depth": 8,
+      "random_moves": 4,
+      "arch": [
+        64,
+        32
+      ],
+      "epochs": 50,
+      "used_nnue": false
+    },
+    "comparison": {
+      "wins_a": 33,
+      "wins_b": 0,
+      "draws": 17,
+      "win_rate_a": 0.83,
+      "elo_diff": 275,
+      "games": 50
+    }
+  },
+  {
+    "generation": 2,
+    "timestamp": "2026-02-03 14:32:29",
+    "config": {
+      "games": 10000,
+      "depth": 6,
+      "random_moves": 4,
+      "arch": [
+        64,
+        32
+      ],
+      "epochs": 50,
+      "used_nnue": false,
+      "search_scores": true,
+      "augment": true,
+      "input_size": 157
+    },
+    "comparison": {
+      "wins_a": 2,
+      "wins_b": 21,
+      "draws": 27,
+      "win_rate_a": 0.31,
+      "elo_diff": -139,
+      "games": 50
+    }
+  }
+]
