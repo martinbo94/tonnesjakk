@@ -1,0 +1,35 @@
+[package]
+name = "tonnesjakk_core"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "tonnesjakk_core"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+pyo3 = { version = "0.24", features = ["extension-module"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+wide = "0.7"  # Portable SIMD
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+
+# Enable native CPU features for auto-vectorization (AVX2, etc.)
+[profile.release.build-override]
+opt-level = 3
+
+# For even better vectorization, build with:
+# RUSTFLAGS="-C target-cpu=native" cargo build --release
+
+# Debug profile: release without LTO (for debugging crashes)
+# Build with: maturin develop --profile release-debug
+[profile.release-debug]
+inherits = "release"
+lto = false
+debug = true
+codegen-units = 16
+overflow-checks = true

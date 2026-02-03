@@ -1,0 +1,1033 @@
+<!DOCTYPE html>
+<html lang="no">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Tonnesjakk</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            padding: 20px;
+            color: #fff;
+        }
+
+        h1 {
+            margin-bottom: 10px;
+            font-size: 2.5em;
+            text-shadow: 2px 2px 4px rgba(0,0,0,0.3);
+        }
+
+        .subtitle {
+            color: #888;
+            margin-bottom: 20px;
+        }
+
+        #game-container {
+            display: flex;
+            gap: 40px;
+            align-items: flex-start;
+            flex-wrap: wrap;
+            justify-content: center;
+        }
+
+        .board-area {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 15px;
+        }
+
+        /* Off-board barrels */
+        .off-board-barrels {
+            display: flex;
+            gap: 10px;
+            padding: 10px 20px;
+            background: #2d2d44;
+            border-radius: 10px;
+            min-height: 60px;
+            align-items: center;
+        }
+
+        .off-board-barrels.top {
+            border-bottom: 3px solid #607d8b;
+        }
+
+        .off-board-barrels.bottom {
+            border-top: 3px solid #ffc107;
+        }
+
+        .off-board-label {
+            font-size: 12px;
+            color: #888;
+            margin-right: 10px;
+        }
+
+        .off-board-barrel {
+            width: 40px;
+            height: 40px;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: bold;
+            font-size: 12px;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+
+        .off-board-barrel:hover {
+            transform: scale(1.1);
+        }
+
+        .off-board-barrel.white {
+            background: linear-gradient(145deg, #ffffff, #e0e0e0);
+            color: #333;
+            box-shadow: 0 3px 6px rgba(0,0,0,0.3);
+        }
+
+        .off-board-barrel.black {
+            background: linear-gradient(145deg, #444, #222);
+            color: #fff;
+            box-shadow: 0 3px 6px rgba(0,0,0,0.3);
+        }
+
+        .off-board-barrel.selected {
+            box-shadow: 0 0 0 3px #4CAF50;
+        }
+
+        #board {
+            display: grid;
+            grid-template-columns: repeat(6, 60px);
+            grid-template-rows: repeat(6, 60px);
+            gap: 2px;
+            background: #2d2d44;
+            padding: 10px;
+            border-radius: 10px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.5);
+        }
+
+        .cell {
+            width: 60px;
+            height: 60px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 32px;
+            cursor: pointer;
+            border-radius: 5px;
+            transition: all 0.2s ease;
+            position: relative;
+        }
+
+        .cell.light {
+            background: #e8d4a8;
+        }
+
+        .cell.dark {
+            background: #b58863;
+        }
+
+        .cell:hover {
+            transform: scale(1.05);
+            z-index: 10;
+        }
+
+        .cell.selected {
+            box-shadow: 0 0 0 4px #4CAF50;
+        }
+
+        .cell.valid-move {
+            background: rgba(76, 175, 80, 0.5) !important;
+        }
+
+        .cell.valid-pail {
+            box-shadow: inset 0 0 0 3px #2196F3;
+        }
+
+        .cell.last-move {
+            box-shadow: inset 0 0 0 3px #FF9800;
+        }
+
+        /* Brikker */
+        .piece {
+            width: 46px;
+            height: 46px;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: bold;
+            font-size: 14px;
+            transition: transform 0.2s;
+        }
+
+        .piece.white-barrel {
+            background: linear-gradient(145deg, #ffffff, #e0e0e0);
+            color: #333;
+            box-shadow: 0 4px 8px rgba(0,0,0,0.3);
+        }
+
+        .piece.black-barrel {
+            background: linear-gradient(145deg, #444, #222);
+            color: #fff;
+            box-shadow: 0 4px 8px rgba(0,0,0,0.3);
+        }
+
+        .piece.white-pail {
+            background: linear-gradient(145deg, #fff8e1, #ffecb3);
+            color: #333;
+            border: 3px solid #ffc107;
+            width: 40px;
+            height: 40px;
+            font-size: 18px;
+        }
+
+        .piece.black-pail {
+            background: linear-gradient(145deg, #37474f, #263238);
+            color: #fff;
+            border: 3px solid #607d8b;
+            width: 40px;
+            height: 40px;
+            font-size: 18px;
+        }
+
+        /* Info panel */
+        #info-panel {
+            background: #2d2d44;
+            padding: 20px;
+            border-radius: 10px;
+            min-width: 280px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.5);
+        }
+
+        #info-panel h3 {
+            margin-bottom: 15px;
+            color: #4CAF50;
+        }
+
+        .info-row {
+            display: flex;
+            justify-content: space-between;
+            padding: 8px 0;
+            border-bottom: 1px solid #444;
+        }
+
+        .info-row:last-child {
+            border-bottom: none;
+        }
+
+        #status {
+            font-size: 1.2em;
+            padding: 20px;
+            margin: 15px 0;
+            border-radius: 8px;
+            text-align: center;
+            font-weight: bold;
+            border: 3px solid transparent;
+        }
+
+        #status.your-turn {
+            background: #1b5e20;
+            border-color: #4CAF50;
+            animation: pulse 2s infinite;
+        }
+
+        #status.ai-turn {
+            background: #e65100;
+            border-color: #FF9800;
+        }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.8; }
+        }
+
+        #status.winner {
+            background: #4CAF50;
+            font-size: 1.4em;
+        }
+
+        #status.loser {
+            background: #c62828;
+            font-size: 1.4em;
+        }
+
+        /* Instruksjoner */
+        #instructions {
+            background: #1a1a2e;
+            padding: 15px;
+            border-radius: 5px;
+            margin-top: 15px;
+            font-size: 0.9em;
+            line-height: 1.6;
+        }
+
+        #instructions h4 {
+            color: #64b5f6;
+            margin-bottom: 10px;
+        }
+
+        #instructions ol {
+            padding-left: 20px;
+        }
+
+        /* Knapper */
+        button {
+            background: #4CAF50;
+            color: white;
+            border: none;
+            padding: 12px 24px;
+            font-size: 1em;
+            border-radius: 5px;
+            cursor: pointer;
+            margin: 5px;
+            transition: background 0.2s;
+        }
+
+        button:hover {
+            background: #45a049;
+        }
+
+        button.secondary {
+            background: #666;
+        }
+
+        button.secondary:hover {
+            background: #555;
+        }
+
+        button.skip-pail {
+            background: #2196F3;
+            padding: 8px 16px;
+            font-size: 0.9em;
+        }
+
+        button.skip-pail:hover {
+            background: #1976D2;
+        }
+
+        /* Start screen */
+        #start-screen {
+            text-align: center;
+            padding: 40px;
+            background: #2d2d44;
+            border-radius: 10px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.5);
+        }
+
+        #start-screen h2 {
+            margin-bottom: 20px;
+        }
+
+        .option-group {
+            margin: 20px 0;
+        }
+
+        .option-group label {
+            display: block;
+            margin-bottom: 10px;
+            color: #888;
+        }
+
+        select {
+            padding: 10px 20px;
+            font-size: 1em;
+            border-radius: 5px;
+            border: none;
+            background: #1a1a2e;
+            color: #fff;
+        }
+
+        /* Loading */
+        .loading {
+            display: inline-block;
+            width: 20px;
+            height: 20px;
+            border: 3px solid #fff;
+            border-radius: 50%;
+            border-top-color: transparent;
+            animation: spin 1s linear infinite;
+        }
+
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+
+        /* Koordinater */
+        .coord-label {
+            position: absolute;
+            font-size: 10px;
+            color: #666;
+        }
+        .coord-label.top { top: 2px; right: 4px; }
+    </style>
+</head>
+<body>
+    <h1>Tonnesjakk</h1>
+    <p class="subtitle">Fa alle tonnene dine til motsatt side!</p>
+
+    <!-- Start screen -->
+    <div id="start-screen">
+        <h2>Nytt spill</h2>
+
+        <div class="option-group">
+            <label>Spill som:</label>
+            <select id="color-select">
+                <option value="white">Hvit (starter forst)</option>
+                <option value="black">Svart</option>
+            </select>
+        </div>
+
+        <div class="option-group">
+            <label>AI-vanskelighetsgrad:</label>
+            <select id="depth-select">
+                <option value="3">Lett (dybde 3)</option>
+                <option value="5">Medium (dybde 5)</option>
+                <option value="6" selected>Vanskelig (dybde 6)</option>
+                <option value="7">Ekspert (dybde 7)</option>
+            </select>
+        </div>
+
+        <button onclick="startGame()">Start spill</button>
+    </div>
+
+    <!-- Game container (hidden initially) -->
+    <div id="game-container" style="display: none;">
+        <div class="board-area">
+            <!-- Svarts tonner utenfor brettet (toppen) -->
+            <div id="black-reserve" class="off-board-barrels top">
+                <span class="off-board-label">Svart reserve:</span>
+            </div>
+
+            <div id="board"></div>
+
+            <!-- Hvits tonner utenfor brettet (bunnen) -->
+            <div id="white-reserve" class="off-board-barrels bottom">
+                <span class="off-board-label">Hvit reserve:</span>
+            </div>
+        </div>
+
+        <div id="info-panel">
+            <h3>Spillinfo</h3>
+
+            <div id="status" class="your-turn">Din tur</div>
+
+            <div class="info-row">
+                <span>Du spiller:</span>
+                <span id="your-color">Hvit</span>
+            </div>
+            <div class="info-row">
+                <span>Trekk:</span>
+                <span id="move-count">0</span>
+            </div>
+            <div class="info-row" style="font-weight:bold; font-size:1.1em;">
+                <span>Poeng:</span>
+                <span><span id="white-score">0</span> - <span id="black-score">0</span></span>
+            </div>
+            <div class="info-row">
+                <span>AI evaluering:</span>
+                <span id="ai-eval">-</span>
+            </div>
+
+            <div id="pail-action" style="margin-top: 15px; display: none;">
+                <button class="skip-pail" onclick="enterPailPlacementMode()">Plasser melkespann (valgfritt)</button>
+                <p style="font-size:0.8em; color:#888; margin-top:5px;">Du kan plassere melkespannet nar som helst</p>
+            </div>
+
+            <div id="legend" style="margin-top:15px; padding:10px; background:#1a1a2e; border-radius:5px;">
+                <h4 style="color:#64b5f6; margin-bottom:8px;">Brikker:</h4>
+                <div style="display:flex; gap:15px; align-items:center; font-size:0.9em;">
+                    <span><span style="display:inline-block;width:20px;height:20px;background:#fff;border-radius:50%;vertical-align:middle;"></span> Tonne</span>
+                    <span><span style="display:inline-block;width:20px;height:20px;background:#ffecb3;border:2px solid #ffc107;border-radius:50%;vertical-align:middle;"></span> Melkespann</span>
+                </div>
+            </div>
+
+            <div id="instructions">
+                <h4>Slik spiller du:</h4>
+                <ol>
+                    <li><strong>Valgfritt:</strong> Klikk pa en rute for a plassere melkespann (bla markering)</li>
+                    <li><strong>Pakrevd:</strong> Velg tonne:
+                        <ul>
+                            <li>Klikk pa en tonne i <em>reserven</em> (under brettet)</li>
+                            <li>ELLER klikk pa en tonne pa brettet</li>
+                        </ul>
+                    </li>
+                    <li>Klikk pa gronn rute for a plassere/flytte tonnen</li>
+                </ol>
+                <p style="margin-top:10px; color:#888">
+                    <strong>Mal:</strong> Fa alle tonnene til motsatt side!
+                </p>
+            </div>
+
+            <div style="margin-top: 20px; text-align: center;">
+                <button onclick="resetGame()" class="secondary">Nytt spill</button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const BOARD_SIZE = 6;
+
+        // Game state
+        let gameId = null;
+        let gameState = null;
+        let validMoves = [];
+        let playerColor = 'white';
+
+        // Selection state
+        let selectedPailDest = null;  // null means "don't place pail" or "already placed"
+        let selectedBarrelAction = null;  // { type: 'place' } or { type: 'move', from: [r,c] }
+        let phase = 'select-pail';  // 'select-pail', 'select-barrel', 'select-dest'
+        let skipPail = false;  // User chose to skip pail placement this turn
+
+        let lastAiMove = null;
+
+        // API calls
+        async function api(endpoint, method = 'GET', body = null) {
+            const options = { method, headers: { 'Content-Type': 'application/json' } };
+            if (body) options.body = JSON.stringify(body);
+            const res = await fetch(endpoint, options);
+            if (!res.ok) throw new Error(await res.text());
+            return res.json();
+        }
+
+        // Start new game
+        async function startGame() {
+            playerColor = document.getElementById('color-select').value;
+            const depth = parseInt(document.getElementById('depth-select').value);
+
+            document.getElementById('start-screen').style.display = 'none';
+            document.getElementById('game-container').style.display = 'flex';
+            document.getElementById('your-color').textContent = playerColor === 'white' ? 'Hvit' : 'Svart';
+
+            try {
+                const data = await api('/api/new-game', 'POST', {
+                    player_color: playerColor,
+                    ai_depth: depth
+                });
+
+                gameId = data.game_id;
+                gameState = data.state;
+                validMoves = data.valid_moves;
+
+                if (data.ai_move) {
+                    lastAiMove = data.ai_move;
+                }
+
+                resetSelection();
+                renderBoard();
+                updateStatus();
+            } catch (e) {
+                alert('Feil ved oppstart: ' + e.message);
+            }
+        }
+
+        // Reset selection state
+        // Start alltid i 'select-barrel' fasen - melkespann er helt valgfritt
+        function resetSelection() {
+            selectedPailDest = null;
+            selectedBarrelAction = null;
+            phase = 'select-barrel';  // Gå rett til tønnevalg
+            skipPail = !canPlacePail();  // Hvis allerede plassert, marker som hoppet over
+        }
+
+        // Check if player can still place pail
+        function canPlacePail() {
+            if (!gameState) return false;
+            const pailPlaced = playerColor === 'white'
+                ? gameState.white_pail_placed
+                : gameState.black_pail_placed;
+            return !pailPlaced;
+        }
+
+        // Enter pail placement mode
+        function enterPailPlacementMode() {
+            if (!canPlacePail()) return;
+            skipPail = false;
+            phase = 'select-pail';
+            renderBoard();
+            updateStatus();
+        }
+
+        // Cancel pail placement and go back to barrel selection
+        function cancelPailPlacement() {
+            skipPail = true;
+            selectedPailDest = null;
+            phase = 'select-barrel';
+            renderBoard();
+            updateStatus();
+        }
+
+        // Make a move (two-step: player move, then AI move)
+        async function makeMove(placePail, isPlacement, barrelFrom, barrelTo) {
+            try {
+                // Steg 1: Utfor spillerens trekk
+                const playerData = await api('/api/move', 'POST', {
+                    game_id: gameId,
+                    place_pail: placePail,
+                    is_barrel_placement: isPlacement,
+                    barrel_from: barrelFrom,
+                    barrel_to: barrelTo
+                });
+
+                // Oppdater brettet med spillerens trekk UMIDDELBART
+                gameState = playerData.state;
+                validMoves = playerData.valid_moves;
+                resetSelection();
+                renderBoard();
+
+                // Sjekk om spillet er over
+                if (playerData.game_over) {
+                    updateStatus();
+                    return;
+                }
+
+                // Steg 2: Vent pa AI
+                setStatus('AI tenker...', 'ai-turn');
+
+                const aiData = await api(`/api/ai-move/${gameId}`, 'POST');
+
+                gameState = aiData.state;
+                validMoves = aiData.valid_moves;
+
+                if (aiData.ai_move) {
+                    lastAiMove = aiData.ai_move;
+                    document.getElementById('ai-eval').textContent =
+                        (aiData.ai_score > 0 ? '+' : '') + aiData.ai_score;
+                }
+
+                renderBoard();
+                updateStatus();
+            } catch (e) {
+                alert('Feil: ' + e.message);
+                resetSelection();
+                renderBoard();
+            }
+        }
+
+        // Update status display
+        function updateStatus() {
+            document.getElementById('move-count').textContent = gameState.move_count;
+            document.getElementById('white-score').textContent = gameState.white_scored || 0;
+            document.getElementById('black-score').textContent = gameState.black_scored || 0;
+
+            // Show/hide pail placement button
+            const pailAction = document.getElementById('pail-action');
+            if (canPlacePail() && gameState.current_player === playerColor && !gameState.winner) {
+                pailAction.style.display = 'block';
+            } else {
+                pailAction.style.display = 'none';
+            }
+
+            if (gameState.winner) {
+                if (gameState.winner === playerColor) {
+                    setStatus('DU VANT!', 'winner');
+                } else {
+                    setStatus('AI vant!', 'loser');
+                }
+            } else if (gameState.current_player === playerColor) {
+                if (phase === 'select-pail') {
+                    setStatus('Klikk pa en rute for a plassere melkespannet', 'your-turn');
+                    // Show cancel button
+                    document.getElementById('pail-action').innerHTML =
+                        '<button class="skip-pail" onclick="cancelPailPlacement()">Avbryt</button>';
+                } else if (phase === 'select-barrel') {
+                    const barrelsOff = playerColor === 'white'
+                        ? gameState.white_barrels_off_board
+                        : gameState.black_barrels_off_board;
+                    if (barrelsOff > 0) {
+                        setStatus('DIN TUR: Velg tonne fra reserven eller brettet', 'your-turn');
+                    } else {
+                        setStatus('DIN TUR: Velg en tonne a flytte', 'your-turn');
+                    }
+                    // Show place pail button
+                    if (canPlacePail()) {
+                        document.getElementById('pail-action').innerHTML =
+                            '<button class="skip-pail" onclick="enterPailPlacementMode()">Plasser melkespann</button>' +
+                            '<p style="font-size:0.8em; color:#888; margin-top:5px;">Valgfritt - kan gjores nar som helst</p>';
+                    }
+                } else {
+                    setStatus('DIN TUR: Klikk pa gronn rute', 'your-turn');
+                }
+            } else {
+                setStatus('Venter pa AI...', 'ai-turn');
+            }
+        }
+
+        function setStatus(text, className) {
+            const el = document.getElementById('status');
+            el.textContent = text;
+            el.className = className;
+        }
+
+        // Get valid pail positions (where we can place the pail)
+        function getValidPailPositions() {
+            const positions = new Set();
+            validMoves.forEach(m => {
+                if (m.place_pail) {
+                    positions.add(`${m.place_pail[0]},${m.place_pail[1]}`);
+                }
+            });
+            return Array.from(positions).map(s => s.split(',').map(Number));
+        }
+
+        // Check if we can place barrel from off-board (given current pail selection)
+        function canPlaceFromReserve() {
+            const pailMatch = m => {
+                if (skipPail || !canPlacePail()) {
+                    return m.place_pail === null;
+                }
+                if (selectedPailDest === null) {
+                    return true;  // Any pail option
+                }
+                if (m.place_pail === null) return false;
+                return m.place_pail[0] === selectedPailDest[0] && m.place_pail[1] === selectedPailDest[1];
+            };
+
+            return validMoves.some(m => pailMatch(m) && m.is_barrel_placement);
+        }
+
+        // Get valid placement positions (on starting row)
+        function getValidPlacementPositions() {
+            const pailMatch = m => {
+                if (skipPail || !canPlacePail()) {
+                    return m.place_pail === null;
+                }
+                if (selectedPailDest === null) {
+                    return true;
+                }
+                if (m.place_pail === null) return false;
+                return m.place_pail[0] === selectedPailDest[0] && m.place_pail[1] === selectedPailDest[1];
+            };
+
+            const positions = new Set();
+            validMoves
+                .filter(m => pailMatch(m) && m.is_barrel_placement)
+                .forEach(m => positions.add(`${m.barrel_to[0]},${m.barrel_to[1]}`));
+
+            return Array.from(positions).map(s => s.split(',').map(Number));
+        }
+
+        // Get movable barrels on board
+        function getMovableBarrels() {
+            const pailMatch = m => {
+                if (skipPail || !canPlacePail()) {
+                    return m.place_pail === null;
+                }
+                if (selectedPailDest === null) {
+                    return true;
+                }
+                if (m.place_pail === null) return false;
+                return m.place_pail[0] === selectedPailDest[0] && m.place_pail[1] === selectedPailDest[1];
+            };
+
+            const barrels = new Set();
+            validMoves
+                .filter(m => pailMatch(m) && !m.is_barrel_placement && m.barrel_from)
+                .forEach(m => barrels.add(`${m.barrel_from[0]},${m.barrel_from[1]}`));
+
+            return Array.from(barrels).map(s => s.split(',').map(Number));
+        }
+
+        // Get valid destinations for selected barrel
+        function getValidDestinations() {
+            if (!selectedBarrelAction) return [];
+
+            const pailMatch = m => {
+                if (skipPail || !canPlacePail()) {
+                    return m.place_pail === null;
+                }
+                if (selectedPailDest === null) {
+                    // This shouldn't happen in select-dest phase, but handle it
+                    return true;
+                }
+                if (m.place_pail === null) return false;
+                return m.place_pail[0] === selectedPailDest[0] && m.place_pail[1] === selectedPailDest[1];
+            };
+
+            const destinations = [];
+
+            if (selectedBarrelAction.type === 'place') {
+                validMoves
+                    .filter(m => pailMatch(m) && m.is_barrel_placement)
+                    .forEach(m => destinations.push(m.barrel_to));
+            } else {
+                const from = selectedBarrelAction.from;
+                validMoves
+                    .filter(m =>
+                        pailMatch(m) &&
+                        !m.is_barrel_placement &&
+                        m.barrel_from &&
+                        m.barrel_from[0] === from[0] &&
+                        m.barrel_from[1] === from[1]
+                    )
+                    .forEach(m => destinations.push(m.barrel_to));
+            }
+
+            return destinations;
+        }
+
+        // Handle off-board barrel click (to select for placement)
+        function onReserveBarrelClick() {
+            if (gameState.winner) return;
+            if (gameState.current_player !== playerColor) return;
+            if (phase === 'select-pail') return;  // Must handle pail first
+
+            if (!canPlaceFromReserve()) return;
+
+            selectedBarrelAction = { type: 'place' };
+            phase = 'select-dest';
+            renderBoard();
+            updateStatus();
+        }
+
+        // Handle cell click on board
+        function onCellClick(row, col) {
+            if (gameState.winner) return;
+            if (gameState.current_player !== playerColor) return;
+
+            if (phase === 'select-pail') {
+                // Check if this is a valid pail position
+                const validPailPos = getValidPailPositions();
+                const isValid = validPailPos.some(p => p[0] === row && p[1] === col);
+
+                if (isValid) {
+                    selectedPailDest = [row, col];
+                    phase = 'select-barrel';
+                    renderBoard();
+                    updateStatus();
+                }
+            }
+            else if (phase === 'select-barrel') {
+                // Check if clicking on a movable barrel on board
+                const movableBarrels = getMovableBarrels();
+                const isMovable = movableBarrels.some(b => b[0] === row && b[1] === col);
+
+                if (isMovable) {
+                    selectedBarrelAction = { type: 'move', from: [row, col] };
+                    phase = 'select-dest';
+                    renderBoard();
+                    updateStatus();
+                }
+                // Or clicking on valid placement position directly
+                else {
+                    const placementPos = getValidPlacementPositions();
+                    const isPlacement = placementPos.some(p => p[0] === row && p[1] === col);
+                    if (isPlacement && canPlaceFromReserve()) {
+                        // Direct placement
+                        const placePail = (skipPail || !canPlacePail()) ? null : selectedPailDest;
+                        makeMove(placePail, true, null, [row, col]);
+                    }
+                }
+            }
+            else if (phase === 'select-dest') {
+                // Check if valid destination
+                const validDests = getValidDestinations();
+                const isValidDest = validDests.some(d => d[0] === row && d[1] === col);
+
+                if (isValidDest) {
+                    const placePail = (skipPail || !canPlacePail()) ? null : selectedPailDest;
+                    const isPlacement = selectedBarrelAction.type === 'place';
+                    const from = isPlacement ? null : selectedBarrelAction.from;
+                    makeMove(placePail, isPlacement, from, [row, col]);
+                }
+                // Allow re-selecting barrel
+                else {
+                    const movableBarrels = getMovableBarrels();
+                    const isMovable = movableBarrels.some(b => b[0] === row && b[1] === col);
+                    if (isMovable) {
+                        selectedBarrelAction = { type: 'move', from: [row, col] };
+                        renderBoard();
+                    }
+                }
+            }
+        }
+
+        // Render the board
+        function renderBoard() {
+            const board = document.getElementById('board');
+            board.innerHTML = '';
+
+            const validPailPos = phase === 'select-pail' ? getValidPailPositions() : [];
+            const movableBarrels = phase === 'select-barrel' ? getMovableBarrels() : [];
+            const placementPos = phase === 'select-barrel' ? getValidPlacementPositions() : [];
+            const validDests = phase === 'select-dest' ? getValidDestinations() : [];
+
+            for (let row = 0; row < BOARD_SIZE; row++) {
+                for (let col = 0; col < BOARD_SIZE; col++) {
+                    const cell = document.createElement('div');
+                    cell.className = 'cell ' + ((row + col) % 2 === 0 ? 'light' : 'dark');
+                    cell.onclick = () => onCellClick(row, col);
+
+                    // Highlight valid pail positions
+                    if (phase === 'select-pail' && validPailPos.some(p => p[0] === row && p[1] === col)) {
+                        cell.classList.add('valid-pail');
+                    }
+
+                    // Highlight selected pail destination
+                    if (selectedPailDest && selectedPailDest[0] === row && selectedPailDest[1] === col) {
+                        cell.classList.add('selected');
+                    }
+
+                    // Highlight movable barrels
+                    if (phase === 'select-barrel' && movableBarrels.some(b => b[0] === row && b[1] === col)) {
+                        cell.classList.add('valid-pail');
+                    }
+
+                    // Highlight valid placement positions
+                    if (phase === 'select-barrel' && placementPos.some(p => p[0] === row && p[1] === col)) {
+                        cell.classList.add('valid-move');
+                    }
+
+                    // Highlight selected barrel
+                    if (selectedBarrelAction && selectedBarrelAction.type === 'move' &&
+                        selectedBarrelAction.from[0] === row && selectedBarrelAction.from[1] === col) {
+                        cell.classList.add('selected');
+                    }
+
+                    // Highlight valid destinations
+                    if (phase === 'select-dest' && validDests.some(d => d[0] === row && d[1] === col)) {
+                        cell.classList.add('valid-move');
+                    }
+
+                    // Highlight last AI move
+                    if (lastAiMove) {
+                        const aiFrom = lastAiMove.barrel_from;
+                        const aiTo = lastAiMove.barrel_to;
+                        if ((aiFrom && aiFrom[0] === row && aiFrom[1] === col) ||
+                            (aiTo && aiTo[0] === row && aiTo[1] === col)) {
+                            cell.classList.add('last-move');
+                        }
+                    }
+
+                    // Add piece
+                    const val = gameState.board[row][col];
+                    if (val !== 0) {
+                        const piece = document.createElement('div');
+                        piece.className = 'piece';
+
+                        if (val === 1) {
+                            piece.classList.add('white-barrel');
+                            piece.textContent = '';  // Empty - just use the circle style
+                            piece.title = 'Hvit tonne';
+                        } else if (val === -1) {
+                            piece.classList.add('black-barrel');
+                            piece.textContent = '';
+                            piece.title = 'Svart tonne';
+                        } else if (val === 2) {
+                            piece.classList.add('white-pail');
+                            piece.textContent = 'M';  // Melkespann
+                            piece.title = 'Hvit melkespann - blokkerer hopp';
+                        } else if (val === -2) {
+                            piece.classList.add('black-pail');
+                            piece.textContent = 'M';
+                            piece.title = 'Svart melkespann - blokkerer hopp';
+                        }
+
+                        cell.appendChild(piece);
+                    }
+
+                    board.appendChild(cell);
+                }
+            }
+
+            // Render off-board barrels
+            renderReserveBarrels();
+        }
+
+        // Render barrels that are off the board
+        function renderReserveBarrels() {
+            const whiteReserve = document.getElementById('white-reserve');
+            const blackReserve = document.getElementById('black-reserve');
+
+            // Clear existing barrels
+            whiteReserve.innerHTML = '<span class="off-board-label">Hvit reserve:</span>';
+            blackReserve.innerHTML = '<span class="off-board-label">Svart reserve:</span>';
+
+            const whiteOff = gameState.white_barrels_off_board;
+            const blackOff = gameState.black_barrels_off_board;
+
+            // Add white reserve barrels
+            for (let i = 0; i < whiteOff; i++) {
+                const barrel = document.createElement('div');
+                barrel.className = 'off-board-barrel white';
+                barrel.textContent = '';  // Empty circle
+                barrel.title = 'Klikk for a plassere denne tonnen';
+
+                // If it's player's turn and they can place
+                if (playerColor === 'white' &&
+                    gameState.current_player === 'white' &&
+                    (phase === 'select-barrel' || (phase === 'select-dest' && selectedBarrelAction?.type === 'place'))) {
+
+                    if (canPlaceFromReserve()) {
+                        barrel.onclick = onReserveBarrelClick;
+                        if (selectedBarrelAction?.type === 'place') {
+                            barrel.classList.add('selected');
+                        }
+                    }
+                }
+
+                whiteReserve.appendChild(barrel);
+            }
+
+            // Add black reserve barrels
+            for (let i = 0; i < blackOff; i++) {
+                const barrel = document.createElement('div');
+                barrel.className = 'off-board-barrel black';
+                barrel.textContent = '';
+                barrel.title = 'Klikk for a plassere denne tonnen';
+
+                // If it's player's turn and they can place
+                if (playerColor === 'black' &&
+                    gameState.current_player === 'black' &&
+                    (phase === 'select-barrel' || (phase === 'select-dest' && selectedBarrelAction?.type === 'place'))) {
+
+                    if (canPlaceFromReserve()) {
+                        barrel.onclick = onReserveBarrelClick;
+                        if (selectedBarrelAction?.type === 'place') {
+                            barrel.classList.add('selected');
+                        }
+                    }
+                }
+
+                blackReserve.appendChild(barrel);
+            }
+
+            // Show "tom" if no barrels
+            if (whiteOff === 0) {
+                const empty = document.createElement('span');
+                empty.style.color = '#666';
+                empty.textContent = '(tom)';
+                whiteReserve.appendChild(empty);
+            }
+            if (blackOff === 0) {
+                const empty = document.createElement('span');
+                empty.style.color = '#666';
+                empty.textContent = '(tom)';
+                blackReserve.appendChild(empty);
+            }
+        }
+
+        // Reset game
+        function resetGame() {
+            document.getElementById('start-screen').style.display = 'block';
+            document.getElementById('game-container').style.display = 'none';
+            gameId = null;
+            gameState = null;
+            lastAiMove = null;
+            resetSelection();
+        }
+    </script>
+</body>
+</html>
