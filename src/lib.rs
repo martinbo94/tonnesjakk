@@ -2806,6 +2806,13 @@ pub struct BitBoardEngine {
     // Tracks which moves historically cause cutoffs
     history: [[i32; NUM_SQUARES]; NUM_SQUARES],
 
+    // Continuation history: [prev_to_sq][curr_to_sq] -> score
+    // Tracks which moves are good responses to a given previous move
+    cont_history: [[i32; NUM_SQUARES]; NUM_SQUARES],
+
+    // Previous move (for continuation history indexing)
+    prev_move: Option<BitMove>,
+
     // NNUE evaluator
     nnue: Option<IncrementalNNUE>,
 
@@ -2845,6 +2852,8 @@ impl BitBoardEngine {
             eval_cache: EvalCache::new(),
             killer_moves: std::array::from_fn(|_| [None, None]),
             history: [[0; NUM_SQUARES]; NUM_SQUARES],
+            cont_history: [[0i32; NUM_SQUARES]; NUM_SQUARES],
+            prev_move: None,
             nnue: None,
             acc_stack: AccumulatorStack::new(),
             eval_acc: Accumulator::default(),
@@ -2860,6 +2869,8 @@ impl BitBoardEngine {
     /// Clear history table (call between games)
     pub fn clear_history(&mut self) {
         self.history = [[0; NUM_SQUARES]; NUM_SQUARES];
+        self.cont_history = [[0i32; NUM_SQUARES]; NUM_SQUARES];
+        self.prev_move = None;
     }
 
     /// Age history table (reduce values to prevent overflow and adapt to position)
@@ -2867,6 +2878,7 @@ impl BitBoardEngine {
         for from in 0..NUM_SQUARES {
             for to in 0..NUM_SQUARES {
                 self.history[from][to] /= 2;
+                self.cont_history[from][to] /= 2;
             }
         }
     }
@@ -3115,6 +3127,13 @@ impl BitBoardEngine {
                 // Scale history to be below killer moves but significant
                 score += self.history[from_sq as usize][to_sq] / 10;
             }
+        }
+
+        // Continuation history - weight 2x relative to butterfly history
+        if let Some(ref pm) = self.prev_move {
+            let prev_to = pm.barrel_to() as usize;
+            let curr_to = mv.barrel_to() as usize;
+            score += 2 * self.cont_history[prev_to][curr_to] / 10;
         }
 
         let to_sq = mv.barrel_to() as usize;
@@ -3388,6 +3407,7 @@ impl BitBoardEngine {
     ) -> (i32, Option<BitMove>) {
         self.nodes_searched += 1;
         let original_alpha = alpha;
+        let mut depth = depth; // Make depth mutable for IIR
 
         // TT lookup - extract data first to avoid borrow issues
         let hash = bb.hash;
@@ -3421,6 +3441,16 @@ impl BitBoardEngine {
                     return (tt_score, tt_move);
                 }
             }
+        }
+
+        // ═══════════════════════════════════════════════════════════════
+        // IIR: Internal Iterative Reduction
+        // ═══════════════════════════════════════════════════════════════
+        // Without a TT move, the search has no good first move for PVS.
+        // Reduce depth by 1 — the shallower result will populate the TT
+        // for the next iterative deepening iteration.
+        if tt_move.is_none() && depth >= 4 {
+            depth -= 1;
         }
 
         // Terminal node
@@ -3508,6 +3538,9 @@ impl BitBoardEngine {
         let mut best_score = if maximizing { i32::MIN + 1 } else { i32::MAX - 1 };
         let mut moves_searched = 0;
 
+        // Save previous move for continuation history
+        let prev_mv = self.prev_move;
+
         for mv in sorted_moves {
             // ═══════════════════════════════════════════════════════════════
             // FUTILITY PRUNING - Skip futile moves
@@ -3536,6 +3569,9 @@ impl BitBoardEngine {
             }
 
             let score;
+
+            // Set prev_move for continuation history in child nodes
+            self.prev_move = Some(mv);
 
             if moves_searched == 0 {
                 // ═══════════════════════════════════════════════════════════════
@@ -3597,9 +3633,17 @@ impl BitBoardEngine {
                 }
                 alpha = alpha.max(score);
                 if beta <= alpha {
-                    // Beta cutoff - update killer moves and history
+                    // Beta cutoff - update killer moves, history, and cont_history
                     self.store_killer(&mv, depth as usize);
                     self.update_history(&mv, depth);
+                    if let Some(pm) = prev_mv {
+                        let prev_to = pm.barrel_to() as usize;
+                        let curr_to = mv.barrel_to() as usize;
+                        let bonus = (depth as i32) * (depth as i32);
+                        self.cont_history[prev_to][curr_to] += bonus;
+                        self.cont_history[prev_to][curr_to] =
+                            self.cont_history[prev_to][curr_to].clamp(-32000, 32000);
+                    }
                     self.cutoffs += 1;
                     break;
                 }
@@ -3610,14 +3654,25 @@ impl BitBoardEngine {
                 }
                 beta = beta.min(score);
                 if beta <= alpha {
-                    // Beta cutoff - update killer moves and history
+                    // Beta cutoff - update killer moves, history, and cont_history
                     self.store_killer(&mv, depth as usize);
                     self.update_history(&mv, depth);
+                    if let Some(pm) = prev_mv {
+                        let prev_to = pm.barrel_to() as usize;
+                        let curr_to = mv.barrel_to() as usize;
+                        let bonus = (depth as i32) * (depth as i32);
+                        self.cont_history[prev_to][curr_to] += bonus;
+                        self.cont_history[prev_to][curr_to] =
+                            self.cont_history[prev_to][curr_to].clamp(-32000, 32000);
+                    }
                     self.cutoffs += 1;
                     break;
                 }
             }
         }
+
+        // Restore prev_move for continuation history context
+        self.prev_move = prev_mv;
 
         // Store in TT
         let flag = if best_score <= original_alpha {
