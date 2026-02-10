@@ -3440,13 +3440,13 @@ impl BitBoardEngine {
         let static_eval = self.evaluate(bb);
 
         // ═══════════════════════════════════════════════════════════════
-        // NULL MOVE PRUNING
+        // NULL MOVE PRUNING (strengthened: R = 3 + depth/3, eval boost)
         // ═══════════════════════════════════════════════════════════════
         // If giving opponent a free move still results in a beta cutoff,
         // this position is so good we can prune.
         // Only use when position is already favorable (otherwise unlikely to cutoff)
         let nmp_margin = 50; // Only try NMP if we're at least this much better
-        let nmp_allowed = depth >= 4
+        let nmp_allowed = depth >= 3
             && static_eval.abs() < 90_000
             && !bb.has_barrel_near_goal()
             && beta.abs() < 90_000
@@ -3457,9 +3457,16 @@ impl BitBoardEngine {
             };
 
         if nmp_allowed {
-            // Determine reduction: R=2 for shallow, R=3 for deeper
-            let r = if depth >= 6 { 3 } else { 2 };
-            let null_depth = depth.saturating_sub(r + 1);
+            // Stronger reduction: R = 3 + depth/3 (was R=2-3)
+            let mut r = 3u8 + depth / 3;
+            // Eval-based boost: if eval strongly exceeds the bound, prune harder
+            if maximizing && static_eval >= beta + 200 {
+                r += 1;
+            }
+            if !maximizing && static_eval <= alpha - 200 {
+                r += 1;
+            }
+            let null_depth = (depth as i16 - r as i16 - 1).max(1) as u8;
 
             // Make null move (swap sides without moving)
             let mut new_bb = *bb;
