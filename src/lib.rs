@@ -2825,6 +2825,10 @@ pub struct BitBoardEngine {
     // Skip relational features (for benchmarking)
     skip_relational: bool,
 
+    // LMR reduction table: lmr_table[depth][move_count] = reduction
+    // Precomputed using ln(depth) * ln(move_count) / 2.5
+    lmr_table: [[u8; 64]; 32],
+
     // Fallback heuristisk vekter
     pub weight_progress: i32,
     pub weight_center_pail: i32,
@@ -2839,6 +2843,15 @@ impl Default for BitBoardEngine {
 
 impl BitBoardEngine {
     pub fn new() -> Self {
+        // Precompute LMR reduction table: R = ln(depth) * ln(move_count)
+        // Divisor 1.0 tuned for 6x6 board (shallower depths than standard chess)
+        let mut lmr_table = [[0u8; 64]; 32];
+        for d in 1..32 {
+            for m in 1..64 {
+                lmr_table[d][m] = ((d as f64).ln() * (m as f64).ln() / 1.0) as u8;
+            }
+        }
+
         BitBoardEngine {
             nodes_searched: 0,
             cutoffs: 0,
@@ -2855,6 +2868,7 @@ impl BitBoardEngine {
             acc_stack: AccumulatorStack::new(),
             eval_acc: Accumulator::default(),
             skip_relational: false,
+            lmr_table,
             weight_progress: 100,
             weight_center_pail: 10,
             weight_blocking: 15,
@@ -3600,15 +3614,24 @@ impl BitBoardEngine {
                 score = s;
             } else {
                 // ═══════════════════════════════════════════════════════════════
-                // LMR: Late Move Reductions
+                // LMR: Late Move Reductions (logarithmic table + history modulation)
                 // ═══════════════════════════════════════════════════════════════
-                // Reduser dybde for trekk sent i listen
+                // Precomputed table gives graduated reductions based on depth and move index
                 let mut reduction: u8 = 0;
-                if depth >= 3 && moves_searched >= 4 {
-                    reduction = 1;
-                    if moves_searched >= 8 {
-                        reduction = 2;
+                if depth >= 3 && moves_searched >= 2 {
+                    reduction = self.lmr_table[depth.min(31) as usize][moves_searched.min(63) as usize];
+                    // History modulation: good moves get less reduction, bad moves get more
+                    if let Some(from) = mv.barrel_from() {
+                        let to = mv.barrel_to() as usize;
+                        let from = from as usize;
+                        if self.history[from][to] > 1000 { reduction = reduction.saturating_sub(1); }
+                        if self.history[from][to] < -500 { reduction += 1; }
+                        // Don't reduce goal-reaching moves
+                        let (to_row, _) = sq_to_coords(to);
+                        if to_row == bb.goal_row(bb.current_player) { reduction = 0; }
                     }
+                    // Don't reduce more than depth-2
+                    reduction = reduction.min(depth.saturating_sub(2));
                 }
 
                 // ═══════════════════════════════════════════════════════════════
