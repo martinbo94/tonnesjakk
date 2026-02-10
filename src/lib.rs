@@ -3501,7 +3501,7 @@ impl BitBoardEngine {
         }
 
         // ═══════════════════════════════════════════════════════════════
-        // NULL MOVE PRUNING
+        // NULL MOVE PRUNING (tuned: R=2-3 + depth/eval boosts)
         // ═══════════════════════════════════════════════════════════════
         // If giving opponent a free move still results in a beta cutoff,
         // this position is so good we can prune.
@@ -3518,9 +3518,20 @@ impl BitBoardEngine {
             };
 
         if nmp_allowed {
-            // Determine reduction: R=2 for shallow, R=3 for deeper
-            let r = if depth >= 6 { 3 } else { 2 };
-            let null_depth = depth.saturating_sub(r + 1);
+            // Base reduction: R=2 shallow, R=3 deeper (proven for 6x6)
+            let mut r: u8 = if depth >= 6 { 3 } else { 2 };
+            // Depth-scaling boost: at high depths we have more margin
+            if depth >= 8 {
+                r += 1;
+            }
+            // Eval-based boost: if eval strongly exceeds the bound, prune harder
+            if maximizing && static_eval >= beta + 150 {
+                r += 1;
+            }
+            if !maximizing && static_eval <= alpha - 150 {
+                r += 1;
+            }
+            let null_depth = (depth as i16 - r as i16 - 1).max(1) as u8;
 
             // Make null move (swap sides without moving)
             let mut new_bb = *bb;
