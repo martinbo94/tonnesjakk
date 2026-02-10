@@ -3462,6 +3462,14 @@ impl BitBoardEngine {
             depth -= 1;
         }
 
+        // ═══════════════════════════════════════════════════════════════
+        // ENDGAME DETECTION: fewer barrels = more tactical, less pruning
+        // ═══════════════════════════════════════════════════════════════
+        // When few barrels remain on the board, every move is critical.
+        // Disable or reduce aggressive pruning to avoid missing winning moves.
+        let total_remaining = (4u8.saturating_sub(bb.white_scored)) + (4u8.saturating_sub(bb.black_scored));
+        let is_endgame = total_remaining <= 3;
+
         // Terminal node
         if bb.check_winner().is_some() {
             return (self.evaluate(bb), None);
@@ -3484,7 +3492,7 @@ impl BitBoardEngine {
         // When static eval is far below alpha (or above beta for minimizer),
         // drop to quiescence search. If even qsearch can't save the
         // position, prune the entire subtree.
-        if depth <= 3 {
+        if depth <= 3 && !is_endgame {
             let razor_margin = 200 + 150 * depth as i32;
             if maximizing && static_eval + razor_margin < alpha {
                 let qscore = self.quiesce(bb, alpha, beta, maximizing, 0);
@@ -3508,6 +3516,7 @@ impl BitBoardEngine {
         // Only use when position is already favorable (otherwise unlikely to cutoff)
         let nmp_margin = 50; // Only try NMP if we're at least this much better
         let nmp_allowed = depth >= 4
+            && !is_endgame
             && static_eval.abs() < 90_000
             && !bb.has_barrel_near_goal()
             && beta.abs() < 90_000
@@ -3562,12 +3571,14 @@ impl BitBoardEngine {
         // below alpha, we can skip searching most moves (they won't raise
         // alpha). Margins scale super-linearly with depth.
         const FUTILITY_MARGINS: [i32; 9] = [0, 80, 160, 250, 350, 450, 600, 750, 950];
+        // Use half the futility margin in endgame (prune less aggressively)
+        let margin = if is_endgame { FUTILITY_MARGINS[depth.min(8) as usize] / 2 } else { FUTILITY_MARGINS[depth.min(8) as usize] };
         let futility_pruning = depth <= 8
             && static_eval.abs() < 90_000 // Not near mate
             && if maximizing {
-                static_eval + FUTILITY_MARGINS[depth as usize] < alpha
+                static_eval + margin < alpha
             } else {
-                static_eval - FUTILITY_MARGINS[depth as usize] > beta
+                static_eval - margin > beta
             };
 
         // Generate and order moves
@@ -3641,6 +3652,8 @@ impl BitBoardEngine {
                         let (to_row, _) = sq_to_coords(to);
                         if to_row == bb.goal_row(bb.current_player) { reduction = 0; }
                     }
+                    // In endgame, reduce LMR reductions (every move matters)
+                    if is_endgame { reduction = reduction.saturating_sub(1); }
                     // Don't reduce more than depth-2
                     reduction = reduction.min(depth.saturating_sub(2));
                 }
