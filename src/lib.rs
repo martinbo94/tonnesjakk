@@ -2822,9 +2822,6 @@ pub struct BitBoardEngine {
     pub weight_progress: i32,
     pub weight_center_pail: i32,
     pub weight_blocking: i32,
-
-    // Futility pruning margins (indexed by depth)
-    futility_margin: [i32; 4],
 }
 
 impl Default for BitBoardEngine {
@@ -2852,8 +2849,6 @@ impl BitBoardEngine {
             weight_progress: 100,
             weight_center_pail: 10,
             weight_blocking: 15,
-            // Futility margins: depth 1 = 100cp, depth 2 = 200cp, depth 3 = 300cp
-            futility_margin: [0, 100, 200, 300],
         }
     }
 
@@ -3440,6 +3435,28 @@ impl BitBoardEngine {
         let static_eval = self.evaluate(bb);
 
         // ═══════════════════════════════════════════════════════════════
+        // RAZORING
+        // ═══════════════════════════════════════════════════════════════
+        // When static eval is far below alpha (or above beta for minimizer),
+        // drop to quiescence search. If even qsearch can't save the
+        // position, prune the entire subtree.
+        if depth <= 3 {
+            let razor_margin = 300 + 200 * depth as i32;
+            if maximizing && static_eval + razor_margin < alpha {
+                let qscore = self.quiesce(bb, alpha, beta, maximizing, 0);
+                if qscore < alpha {
+                    return (qscore, None);
+                }
+            }
+            if !maximizing && static_eval - razor_margin > beta {
+                let qscore = self.quiesce(bb, alpha, beta, maximizing, 0);
+                if qscore > beta {
+                    return (qscore, None);
+                }
+            }
+        }
+
+        // ═══════════════════════════════════════════════════════════════
         // NULL MOVE PRUNING
         // ═══════════════════════════════════════════════════════════════
         // If giving opponent a free move still results in a beta cutoff,
@@ -3484,16 +3501,18 @@ impl BitBoardEngine {
         }
 
         // ═══════════════════════════════════════════════════════════════
-        // FUTILITY PRUNING
+        // FUTILITY PRUNING (extended to depth 8)
         // ═══════════════════════════════════════════════════════════════
-        // At shallow depths, if the static evaluation is far below alpha,
-        // we can skip searching most moves (they won't raise alpha)
-        let futility_pruning = depth <= 3
+        // At shallow-to-medium depths, if the static evaluation is far
+        // below alpha, we can skip searching most moves (they won't raise
+        // alpha). Margins scale super-linearly with depth.
+        const FUTILITY_MARGINS: [i32; 9] = [0, 100, 200, 300, 450, 600, 800, 1050, 1300];
+        let futility_pruning = depth <= 8
             && static_eval.abs() < 90_000 // Not near mate
             && if maximizing {
-                static_eval + self.futility_margin[depth as usize] < alpha
+                static_eval + FUTILITY_MARGINS[depth as usize] < alpha
             } else {
-                static_eval - self.futility_margin[depth as usize] > beta
+                static_eval - FUTILITY_MARGINS[depth as usize] > beta
             };
 
         // Generate and order moves
