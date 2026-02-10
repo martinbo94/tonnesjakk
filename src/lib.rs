@@ -2839,11 +2839,12 @@ impl Default for BitBoardEngine {
 
 impl BitBoardEngine {
     pub fn new() -> Self {
-        // Precompute LMR reduction table: R = ln(depth) * ln(move_count) / 2.5
+        // Precompute LMR reduction table: R = ln(depth) * ln(move_count)
+        // Divisor 1.0 tuned for 6x6 board (shallower depths than standard chess)
         let mut lmr_table = [[0u8; 64]; 32];
         for d in 1..32 {
             for m in 1..64 {
-                lmr_table[d][m] = ((d as f64).ln() * (m as f64).ln() / 2.5) as u8;
+                lmr_table[d][m] = ((d as f64).ln() * (m as f64).ln() / 1.0) as u8;
             }
         }
 
