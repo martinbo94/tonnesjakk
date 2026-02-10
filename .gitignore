@@ -35,3 +35,9 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Compiled extensions (backups)
+*.pyd.old
+
+# Windows artifacts
+nul

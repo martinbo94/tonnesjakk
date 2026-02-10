@@ -1,0 +1,5 @@
+# .flake8
+
+[flake8]
+#ignore = E,W,F
+ignore = E501, W293, E402, W504, E722, F401, F541

@@ -37,16 +37,15 @@ NUM_PIECE_TYPES = 4  # WhiteBarrel, BlackBarrel, WhitePail, BlackPail
 
 # Feature sizes
 BASE_FEATURES = BOARD_SIZE * BOARD_SIZE * NUM_PIECE_TYPES  # 144 (piece positions)
-# Relational features:
-#   - White barrel distances to goal (4 barrels max) = 4
-#   - Black barrel distances to goal (4 barrels max) = 4
-#   - White barrels scored = 1
-#   - Black barrels scored = 1
-#   - White pail placed = 1
-#   - Black pail placed = 1
-#   - Current player (1 = white, -1 = black) = 1
-RELATIONAL_FEATURES = 13
-INPUT_SIZE = BASE_FEATURES + RELATIONAL_FEATURES  # 157
+# Relational features (only cheap, non-inferable ones):
+#   - White barrels scored = 1 (can't infer from position - scored barrels are removed)
+#   - Black barrels scored = 1 (can't infer from position - scored barrels are removed)
+#   - Current player (1 = white, -1 = black) = 1 (not in base features)
+# Removed (can be learned from base features):
+#   - Barrel distances (NN can learn that row 0/5 are goals)
+#   - Pail placed (if pail on board, it's placed)
+RELATIONAL_FEATURES = 3
+INPUT_SIZE = BASE_FEATURES + RELATIONAL_FEATURES  # 147
 
 
 # =============================================================================
@@ -108,62 +107,32 @@ def board_to_tensor(
     - Channel 2: White pail
     - Channel 3: Black pail
 
-    Relational features (13):
-    - White barrel distances to goal (4 values, normalized 0-1)
-    - Black barrel distances to goal (4 values, normalized 0-1)
-    - White/Black barrels scored (2 values, normalized 0-1)
-    - White/Black pail placed (2 values, 0 or 1)
-    - Current player (1 value, +1 white, -1 black)
+    Relational features (3) - only cheap, non-inferable features:
+    - White barrels scored (normalized 0-1) - can't infer from position
+    - Black barrels scored (normalized 0-1) - can't infer from position
+    - Current player (+1 white, -1 black) - not in base features
     """
     # Base features: piece positions
     base = np.zeros((BOARD_SIZE, BOARD_SIZE, NUM_PIECE_TYPES), dtype=np.float32)
-
-    # Track barrel positions for distance calculation
-    white_barrel_rows = []
-    black_barrel_rows = []
-    white_pail_placed = 0.0
-    black_pail_placed = 0.0
 
     for row in range(BOARD_SIZE):
         for col in range(BOARD_SIZE):
             val = board_array[row][col]
             if val == 1:    # WhiteBarrel
                 base[row, col, 0] = 1.0
-                white_barrel_rows.append(row)
             elif val == -1:  # BlackBarrel
                 base[row, col, 1] = 1.0
-                black_barrel_rows.append(row)
             elif val == 2:   # WhitePail
                 base[row, col, 2] = 1.0
-                white_pail_placed = 1.0
             elif val == -2:  # BlackPail
                 base[row, col, 3] = 1.0
-                black_pail_placed = 1.0
 
-    # Relational features
-    relational = np.zeros(RELATIONAL_FEATURES, dtype=np.float32)
-
-    # White barrel distances to goal (row 0 is goal, so distance = row)
-    # Normalize by max distance (5) and sort so closest first
-    white_dists = sorted([r / 5.0 for r in white_barrel_rows])
-    for i, d in enumerate(white_dists[:4]):
-        relational[i] = 1.0 - d  # Closer to goal = higher value
-
-    # Black barrel distances to goal (row 5 is goal, so distance = 5 - row)
-    black_dists = sorted([(5 - r) / 5.0 for r in black_barrel_rows])
-    for i, d in enumerate(black_dists[:4]):
-        relational[4 + i] = 1.0 - d
-
-    # Scored barrels (normalized by 4, which is max)
-    relational[8] = white_scored / 4.0
-    relational[9] = black_scored / 4.0
-
-    # Pails placed
-    relational[10] = white_pail_placed
-    relational[11] = black_pail_placed
-
-    # Current player
-    relational[12] = current_player
+    # Relational features (only 3 cheap features)
+    relational = np.array([
+        white_scored / 4.0,   # [0] White scored (0.0 - 1.0)
+        black_scored / 4.0,   # [1] Black scored (0.0 - 1.0)
+        current_player,       # [2] Current player (+1 white, -1 black)
+    ], dtype=np.float32)
 
     # Combine base and relational features
     features = np.concatenate([base.flatten(), relational])
@@ -172,7 +141,7 @@ def board_to_tensor(
 
 def flip_board_horizontal(board_array: List[List[int]]) -> List[List[int]]:
     """Flip board horizontally for data augmentation (exploits symmetry)."""
-    return [[board_array[r][5-c] for c in range(6)] for r in range(6)]
+    return [[board_array[r][5 - c] for c in range(6)] for r in range(6)]
 
 
 def board_to_tensor_simple(board_array: List[List[int]]) -> torch.Tensor:
@@ -364,7 +333,10 @@ class DataGenerator:
         random_opening_moves: int = 4,
         use_search_scores: bool = True,
         augment: bool = True,
-        verbose: bool = True
+        verbose: bool = True,
+        save_every: int = 0,
+        save_path: Optional[str] = None,
+        config: Optional[Dict] = None
     ) -> Tuple[torch.Tensor, torch.Tensor, TrainingStats]:
         """
         Generate training dataset from self-play games.
@@ -376,6 +348,9 @@ class DataGenerator:
             use_search_scores: Use engine search scores (better) vs game outcomes
             augment: Apply horizontal flip data augmentation (doubles data)
             verbose: Print progress
+            save_every: Save checkpoint every N games (0 = disabled)
+            save_path: Path for checkpoint saves (required if save_every > 0)
+            config: Config dict to store alongside the checkpoint
 
         Returns:
             (X, y, stats) - input tensors, labels, and statistics
@@ -385,6 +360,7 @@ class DataGenerator:
         stats = TrainingStats()
 
         start_time = time.time()
+        last_save_time = start_time
 
         for game_num in range(num_games):
             result = self.play_game(depth, random_opening_moves)
@@ -436,6 +412,16 @@ class DataGenerator:
                       f"({gps:.1f}/s, ETA {eta/60:.1f}m) | "
                       f"{stats} | {stats.total_positions:,} positions{aug_note}", flush=True)
 
+            # Periodic checkpoint save
+            if save_every > 0 and save_path and (game_num + 1) % save_every == 0:
+                save_start = time.time()
+                X_tmp = torch.stack(all_X)
+                y_tmp = torch.tensor(all_y, dtype=torch.float32).unsqueeze(1)
+                self.save_dataset(X_tmp, y_tmp, stats, save_path, config)
+                save_elapsed = time.time() - save_start
+                if verbose:
+                    print(f"  >> Checkpoint saved ({stats.total_positions:,} positions, {save_elapsed:.1f}s)", flush=True)
+
         if verbose:
             elapsed = time.time() - start_time
             print(f"\nGeneration complete in {elapsed:.1f}s")
@@ -448,6 +434,12 @@ class DataGenerator:
         # Convert to tensors
         X = torch.stack(all_X)
         y = torch.tensor(all_y, dtype=torch.float32).unsqueeze(1)
+
+        # Final save
+        if save_path:
+            self.save_dataset(X, y, stats, save_path, config)
+            if verbose:
+                print(f"  Saved dataset to: {save_path}")
 
         return X, y, stats
 
@@ -569,8 +561,8 @@ def train_model(
         num_batches = 0
 
         for i in range(0, len(X_train), batch_size):
-            batch_X = X_train_shuffled[i:i+batch_size]
-            batch_y = y_train_shuffled[i:i+batch_size]
+            batch_X = X_train_shuffled[i: i + batch_size]
+            batch_y = y_train_shuffled[i: i + batch_size]
 
             optimizer.zero_grad()
             pred = model(batch_X)
@@ -672,8 +664,10 @@ def train_nnue(
     compare_games: int = 50,
     track_history: bool = True,
     save_data: Optional[str] = None,
-    load_data: Optional[str] = None
-) -> TonnesjakkNNUE:
+    load_data: Optional[str] = None,
+    save_every: int = 0,
+    generate_only: bool = False
+) -> Optional[TonnesjakkNNUE]:
     """
     Complete NNUE training pipeline.
 
@@ -714,30 +708,38 @@ def train_nnue(
             print(f"  Self-play eval: Heuristic")
         print(f"  Labels: {'search scores' if use_search_scores else 'game outcomes'}")
         print(f"  Augmentation: {'enabled (2x data)' if augment else 'disabled'}")
+        if save_every > 0 and save_data:
+            print(f"  Checkpoint: every {save_every} games -> {save_data}")
+        if generate_only:
+            print(f"  Mode: GENERATE ONLY (no training)")
 
-        print(f"\n[1/3] Generating training data...")
+        step_label = "Generating" if generate_only else "[1/3] Generating"
+        print(f"\n{step_label} training data...")
         generator = DataGenerator(nnue_path=use_nnue)
+        config = {
+            "games": num_games,
+            "depth": depth,
+            "random_moves": random_moves,
+            "use_nnue": use_nnue,
+            "use_search_scores": use_search_scores,
+            "augment": augment,
+            "input_size": INPUT_SIZE
+        }
         X, y, stats = generator.generate_dataset(
             num_games=num_games,
             depth=depth,
             random_opening_moves=random_moves,
             use_search_scores=use_search_scores,
-            augment=augment
+            augment=augment,
+            save_every=save_every,
+            save_path=save_data,
+            config=config
         )
 
-        # Save data if requested
-        if save_data:
-            config = {
-                "games": num_games,
-                "depth": depth,
-                "random_moves": random_moves,
-                "use_nnue": use_nnue,
-                "use_search_scores": use_search_scores,
-                "augment": augment,
-                "input_size": INPUT_SIZE
-            }
-            generator.save_dataset(X, y, stats, save_data, config)
-            print(f"  Saved dataset to: {save_data}")
+        if generate_only:
+            print(f"\nGeneration complete. Data saved to: {save_data}")
+            print("Run with --load-data to train on this data.")
+            return None
 
     # Check balance
     if stats.balance_ratio < 0.5 or stats.balance_ratio > 2.0:
@@ -779,27 +781,45 @@ def train_nnue(
     export_to_json(model, str(json_path))
     print(f"  JSON weights: {json_path}")
 
-    # Step 4: Compare with previous version
+    # Step 4: Compare with heuristic baseline (and optionally previous version)
     comparison = None
-    if compare and old_weights_path:
-        print(f"\n[4/4] Comparing with previous version ({compare_games} games)...")
+    if compare:
+        compare_depth = min(depth, 5)  # Use depth 5 max for faster comparison
+
+        # Always compare against heuristic baseline
+        print(f"\n[4/4] Comparing NNUE vs Heuristic ({compare_games} games, depth {compare_depth})...")
         comparison = compare_nnue(
             str(json_path),
-            str(old_weights_path),
+            "heuristic",
             num_games=compare_games,
-            depth=min(depth, 6),  # Use depth 6 max for faster comparison
+            depth=compare_depth,
             verbose=True
         )
-        print(f"\n  Results: New={comparison['wins_a']} Old={comparison['wins_b']} Draws={comparison['draws']}")
-        print(f"  Win rate: {comparison['win_rate_a']*100:.1f}%")
+        print(f"\n  NNUE vs Heuristic: NNUE={comparison['wins_a']} Heur={comparison['wins_b']} Draws={comparison['draws']}")
+        print(f"  NNUE win rate: {comparison['win_rate_a']*100:.1f}%")
         print(f"  Estimated ELO diff: {comparison['elo_diff']:+d}")
 
-        if comparison['elo_diff'] > 0:
-            print("  [+] New model is STRONGER!")
-        elif comparison['elo_diff'] < -20:
-            print("  [!] New model appears WEAKER - consider reverting")
+        if comparison['elo_diff'] > 50:
+            print("  [+] NNUE is significantly STRONGER than heuristic!")
+        elif comparison['elo_diff'] > 0:
+            print("  [+] NNUE is slightly stronger than heuristic")
+        elif comparison['elo_diff'] > -50:
+            print("  [=] NNUE is roughly equal to heuristic")
         else:
-            print("  [=] Models are roughly equal strength")
+            print("  [!] NNUE is WEAKER than heuristic - needs more training")
+
+        # Optionally also compare against previous NNUE version
+        if old_weights_path:
+            print(f"\n  Also comparing vs previous NNUE...")
+            old_comparison = compare_nnue(
+                str(json_path),
+                str(old_weights_path),
+                num_games=compare_games,
+                depth=compare_depth,
+                verbose=False
+            )
+            print(f"  New vs Old NNUE: New={old_comparison['wins_a']} Old={old_comparison['wins_b']} Draws={old_comparison['draws']}")
+            print(f"  ELO diff vs old: {old_comparison['elo_diff']:+d}")
 
     # Track history
     if track_history:
@@ -885,8 +905,13 @@ def compare_nnue(
             board.make_move(random.choice(moves))
 
         # Play game
+        game_start = time.time()
         move_count = 0
-        while board.check_winner() is None and move_count < 100:
+        while board.check_winner() is None and move_count < 50:
+            # Per-game time limit: 60 seconds
+            if time.time() - game_start > 60.0:
+                break
+
             # Determine which engine plays
             is_white_turn = "White" in repr(board.current_player)
             current_engine = engine_a if (is_white_turn == white_is_a) else engine_b
@@ -896,6 +921,8 @@ def compare_nnue(
                 break
             board.make_move(result.best_move)
             move_count += 1
+
+        game_time = time.time() - game_start
 
         # Score result
         winner = board.check_winner()
@@ -912,8 +939,9 @@ def compare_nnue(
             else:
                 wins_a += 1
 
-        if verbose and (game_idx + 1) % 10 == 0:
-            print(f"  Game {game_idx + 1}/{num_games}: A={wins_a} B={wins_b} D={draws}")
+        if verbose:
+            w = "draw" if winner is None else ("A" if (("White" in repr(winner)) == white_is_a) else "B")
+            print(f"  Game {game_idx + 1}/{num_games}: {w} ({move_count} moves, {game_time:.1f}s) | A={wins_a} B={wins_b} D={draws}", flush=True)
 
     # Calculate stats
     total = wins_a + wins_b + draws
@@ -1018,13 +1046,13 @@ def quick_test():
     print(f"Model parameters: {model.num_parameters:,}")
 
     # Test with empty board
-    empty_board = [[0]*6 for _ in range(6)]
+    empty_board = [[0] * 6 for _ in range(6)]
     x = board_to_tensor(empty_board).unsqueeze(0)
     score = model(x).item()
     print(f"Empty board score: {score:.4f} (expected: ~0)")
 
     # Test with some pieces
-    board = [[0]*6 for _ in range(6)]
+    board = [[0] * 6 for _ in range(6)]
     board[5][2] = 1   # White barrel
     board[0][3] = -1  # Black barrel
     x = board_to_tensor(board).unsqueeze(0)
@@ -1121,6 +1149,10 @@ Examples:
                         help="Number of games for comparison (default: 50)")
     parser.add_argument("--no-history", action="store_true",
                         help="Don't track training history")
+    parser.add_argument("--save-every", type=int, default=500,
+                        help="Save checkpoint every N games during generation (default: 500)")
+    parser.add_argument("--generate-only", action="store_true",
+                        help="Only generate data (no training). Use with --save-data")
     parser.add_argument("--history", action="store_true",
                         help="Show training history and exit")
     parser.add_argument("--compare", type=str, nargs=2, metavar=("NNUE_A", "NNUE_B"),
@@ -1139,12 +1171,12 @@ Examples:
     elif args.history:
         print_training_history(str(Path(args.output) / "nnue_history.json"))
     elif args.compare:
-        print(f"Comparing {args.compare[0]} vs {args.compare[1]}...")
+        print(f"Comparing {args.compare[0]} vs {args.compare[1]} (depth {args.depth})...")
         result = compare_nnue(
             args.compare[0],
             args.compare[1],
             num_games=args.compare_games,
-            depth=6,
+            depth=args.depth,
             verbose=True
         )
         print(f"\nFinal: A={result['wins_a']} B={result['wins_b']} D={result['draws']}")
@@ -1166,7 +1198,9 @@ Examples:
             compare_games=args.compare_games,
             track_history=not args.no_history,
             save_data=args.save_data,
-            load_data=args.load_data
+            load_data=args.load_data,
+            save_every=args.save_every,
+            generate_only=args.generate_only
         )
 
 

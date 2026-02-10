@@ -130,22 +130,33 @@ I stedet for å klone brettet for hvert trekk, bruker vi `UndoInfo` for å angre
 NNUE (Efficiently Updatable Neural Network) er en lett neural network-evaluator inspirert av Stockfish.
 
 ```
-Arkitektur:
-Input (144) → FC(64) → ReLU → FC(32) → ReLU → FC(1) → Tanh
+Arkitektur (standard):
+Input (147) → FC(64) → ReLU → FC(32) → ReLU → FC(1) → Tanh
 
-Input: One-hot encoding av brettet
-       6×6×4 = 144 (4 kanaler: hvit tønne, svart tønne, hvit spann, svart spann)
+Input: 144 base-features (6×6×4 kanaler: hvit tønne, svart tønne, hvit spann, svart spann)
+     + 3 relasjonelle features (fremgang, avstand, senter)
+     = 147 totalt
 
 Output: Score mellom -1 (svart vinner) og +1 (hvit vinner)
 
-Parametre: ~11,000 (veldig lite!)
+Parametre: ~12,000 (veldig lite!)
 ```
 
+Tre arkitekturer er testet:
+| Arkitektur | Parametre | Val Loss |
+|------------|-----------|----------|
+| 147→64→32→1 | ~12K | 0.0120 |
+| 147→32→16→1 | ~5.3K | 0.0137 |
+| 147→16→8→1 | ~2.5K | 0.0157 |
+
 #### SIMD Akselerasjon
-Layer 1 (144→64) er akselerert med SIMD (f32x8) for ~4x raskere evaluering.
+Layer 1 (147→64) er akselerert med SIMD (f32x8) for ~4x raskere evaluering.
 
 #### Inkrementell Oppdatering
-Accumulator-stack cacher layer 1 output. Ved trekk oppdateres kun endrede features (~2-4 per trekk i stedet for 144).
+Accumulator-stack cacher layer 1 output. Ved trekk oppdateres kun endrede features (~2-4 per trekk i stedet for 147).
+
+#### Transponert vektlayout
+Vektene lagres i transponert format for bedre cache-lokalitet under inkrementell oppdatering. Kun `IncrementalNNUE` (float SIMD) brukes - kvantisert inferens er fjernet til fordel for raskere og enklere float-beregning med SIMD.
 
 ### Heuristisk Fallback
 
@@ -161,23 +172,23 @@ Når NNUE ikke er lastet, brukes håndlaget evaluering:
 
 ## Ytelse
 
-Typisk ytelse på moderne CPU (single-threaded):
+Typisk ytelse på moderne CPU (single-threaded, med Aspiration/PVS/LMR/Quiescence):
 
 | Dybde | Tid | Noder | NPS |
 |-------|-----|-------|-----|
-| 4 | 45ms | 38K | 860K |
-| 5 | 96ms | 103K | 1.1M |
-| 6 | 219ms | 306K | 1.4M |
-| 7 | 972ms | 804K | 830K |
-| 8 | 2.7s | 2.0M | 730K |
+| 6 | 76ms | 40K | 535K |
+| 8 | 59ms | 40K | 676K |
+| 10 | 490ms | 369K | 753K |
+| 12 | 2.8s | 2.5M | 908K |
+| 13 | 31s | 24M | 777K |
 
-**Sammenligning med gammel implementasjon:**
+**Sammenligning over tid:**
 
-| Dybde | Gammel | Ny | Speedup |
-|-------|--------|-----|---------|
-| 4 | 1.44s | 45ms | **32x** |
-| 6 | 8.85s | 219ms | **40x** |
-| 8 | 9.59s | 2.75s | **3.5x** |
+| Versjon | Dybde 6 | Dybde 8 | Merknad |
+|---------|---------|---------|---------|
+| Gammel engine | 8.85s | 9.59s | Ren Python-logikk |
+| BitBoard (jan 2025) | 219ms | 2.7s | Rust bitboard, ~40x raskere |
+| Med PVS/LMR (feb 2025) | 76ms | 59ms | Aspiration + LMR + PVS, kan na dybde 12+ |
 
 ---
 
@@ -236,36 +247,81 @@ board.make_move(result.best_move)
 ```
 tønnesjakk/
 ├── src/
-│   └── lib.rs          # Rust-kjerne (~3200 linjer)
-│                       # - BitBoard, BitMove, UndoInfo
-│                       # - BitBoardEngine (søk)
-│                       # - IncrementalNNUE (SIMD-akselerert)
-│                       # - Board, Engine (Python API)
+│   └── lib.rs              # Rust-kjerne (~4000 linjer)
+│                           # - BitBoard, BitMove, UndoInfo
+│                           # - BitBoardEngine (søk med PVS/LMR/etc.)
+│                           # - IncrementalNNUE (float SIMD-akselerert)
+│                           # - Board, Engine (Python API)
 ├── python/
 │   └── tonnesjakk/
 │       ├── __init__.py
-│       ├── nnue.py     # NNUE trening (PyTorch)
+│       ├── nnue.py         # NNUE modell og trening (PyTorch)
 │       └── export_nnue.py
 ├── web/
-│   ├── server.py       # FastAPI backend
-│   └── index.html      # Web-grensesnitt
+│   ├── server.py           # FastAPI backend
+│   └── index.html          # Web-grensesnitt
+├── train_nnue.py           # Hovedskript for NNUE-trening (selvspill + trening)
+├── nnue_weights.json       # Eksporterte NNUE-vekter (standard arkitektur)
+├── SELF_PLAY_PLAN.md       # Plan for self-play forbedringssyklus
 ├── Cargo.toml
 └── pyproject.toml
 ```
 
 ---
 
-## Fremtidige forbedringer
+## Implementerte søkoptimaliseringer
 
-Se [TODO.md](TODO.md) for full liste.
+Alle viktige søkoptimaliseringer er nå implementert:
 
-Høyest prioritet:
-- [ ] **Aspiration Windows** - Smalt søkevindu rundt forventet score
-- [ ] **Principal Variation Search** - Null-window søk for ikke-PV trekk
-- [ ] **Null Move Pruning** - Skip søk når posisjon er overveldende god
-- [ ] **Late Move Reductions** - Reduser dybde for senere trekk
-- [ ] **Quiescence Search** - Fortsett søk i taktiske stillinger
-- [ ] **Parallell søk (Lazy SMP)** - Multi-threaded search
+- [x] **Aspiration Windows** - Smalt søkevindu rundt forventet score
+- [x] **Principal Variation Search (PVS)** - Null-window søk for ikke-PV trekk
+- [x] **Null Move Pruning** - Gi motstander "gratis" trekk for raskere cutoff
+- [x] **Late Move Reductions (LMR)** - Reduser dybde for trekk sent i listen
+- [x] **Quiescence Search** - Fortsett søk i taktiske stillinger (med dybdegrense)
+
+Se [todo.md](todo.md) for neste prioriteringer (NNUE self-play forbedring, Lazy SMP, osv.).
+
+---
+
+## NNUE Trening
+
+### Tren ny modell
+
+```bash
+# Standard trening (147→64→32→1)
+python train_nnue.py --games 10000 --depth 6 --epochs 50
+
+# Alternativ arkitektur
+python train_nnue.py --games 10000 --depth 6 --arch 32 16 --output nnue_32x16
+
+# Generer data i bakgrunnen (lagrer hvert 500. spill, Ctrl+C-trygt)
+python train_nnue.py --games 999999 --save-data training_data.npz --generate-only
+
+# Tren på lagret data
+python train_nnue.py --load-data training_data.npz --epochs 50
+
+# Sammenlign to NNUE-versjoner
+python train_nnue.py --compare nnue_weights.json heuristic --compare-games 100
+```
+
+### Etter trening
+
+```bash
+# Bygg Rust-pakken på nytt
+maturin develop --release
+```
+
+Se [SELF_PLAY_PLAN.md](SELF_PLAY_PLAN.md) for den fullstendige self-play forbedringssyklusen.
+
+---
+
+## Viktige filer
+
+- `src/lib.rs` - Rust-kjerne (~4000 linjer, kun IncrementalNNUE)
+- `python/tonnesjakk/nnue.py` - NNUE modell og trening
+- `train_nnue.py` - Hovedskript for selvspill + trening
+- `web/server.py` - FastAPI backend
+- `nnue_weights.json` - Eksporterte NNUE-vekter
 
 ---
 

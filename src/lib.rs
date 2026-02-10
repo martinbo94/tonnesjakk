@@ -24,15 +24,14 @@ pub const TT_SIZE: usize = 1 << 20; // ~1 million entries
 // NNUE feature sizes
 /// Base features: 6x6 board * 4 piece types = 144
 pub const BASE_FEATURES: usize = NUM_SQUARES * 4;
-/// Relational features:
-///   - White barrel distances to goal (4)
-///   - Black barrel distances to goal (4)
-///   - White/Black barrels scored (2)
-///   - White/Black pail placed (2)
-///   - Current player (1)
-pub const RELATIONAL_FEATURES: usize = 13;
+/// Relational features (only cheap, non-inferable ones):
+///   - White barrels scored (1) - can't infer from position alone
+///   - Black barrels scored (1) - can't infer from position alone
+///   - Current player (1) - not encoded in base features
+pub const RELATIONAL_FEATURES: usize = 3;
 /// Total input features to NNUE
-pub const INPUT_SIZE: usize = BASE_FEATURES + RELATIONAL_FEATURES; // 157
+pub const INPUT_SIZE: usize = BASE_FEATURES + RELATIONAL_FEATURES; // 147
+
 
 // ============================================================================
 // BITBOARD - Rask brettrepresentasjon med 64-bit integers
@@ -72,7 +71,7 @@ const ROW_MASK: [u64; BOARD_SIZE] = {
     masks
 };
 
-/// Naboer for hvert felt (ortogonalt tilstøtende)
+/// Naboer for hvert felt (alle 8 retninger: ortogonalt + diagonalt)
 const ADJACENT: [u64; NUM_SQUARES] = {
     let mut adj = [0u64; NUM_SQUARES];
     let mut sq = 0;
@@ -80,6 +79,7 @@ const ADJACENT: [u64; NUM_SQUARES] = {
         let (row, col) = sq_to_coords(sq);
         let mut mask = 0u64;
 
+        // Orthogonal directions
         // Opp
         if row > 0 {
             mask |= bit(sq - BOARD_SIZE);
@@ -97,19 +97,42 @@ const ADJACENT: [u64; NUM_SQUARES] = {
             mask |= bit(sq + 1);
         }
 
+        // Diagonal directions
+        // Opp-venstre
+        if row > 0 && col > 0 {
+            mask |= bit(sq - BOARD_SIZE - 1);
+        }
+        // Opp-høyre
+        if row > 0 && col < BOARD_SIZE - 1 {
+            mask |= bit(sq - BOARD_SIZE + 1);
+        }
+        // Ned-venstre
+        if row < BOARD_SIZE - 1 && col > 0 {
+            mask |= bit(sq + BOARD_SIZE - 1);
+        }
+        // Ned-høyre
+        if row < BOARD_SIZE - 1 && col < BOARD_SIZE - 1 {
+            mask |= bit(sq + BOARD_SIZE + 1);
+        }
+
         adj[sq] = mask;
         sq += 1;
     }
     adj
 };
 
+/// Number of jump directions (8: orthogonal + diagonal)
+const NUM_JUMP_DIRS: usize = 8;
+
 /// For hvert felt og retning: feltet som hoppes over (-1 hvis ugyldig)
-const JUMP_OVER: [[i8; 4]; NUM_SQUARES] = {
-    let mut table = [[-1i8; 4]; NUM_SQUARES];
+/// Directions: 0=Up, 1=Down, 2=Left, 3=Right, 4=UpLeft, 5=UpRight, 6=DownLeft, 7=DownRight
+const JUMP_OVER: [[i8; NUM_JUMP_DIRS]; NUM_SQUARES] = {
+    let mut table = [[-1i8; NUM_JUMP_DIRS]; NUM_SQUARES];
     let mut sq = 0;
     while sq < NUM_SQUARES {
         let (row, col) = sq_to_coords(sq);
 
+        // Orthogonal directions
         // Opp (dir=0)
         if row >= 1 {
             table[sq][0] = (sq - BOARD_SIZE) as i8;
@@ -127,18 +150,38 @@ const JUMP_OVER: [[i8; 4]; NUM_SQUARES] = {
             table[sq][3] = (sq + 1) as i8;
         }
 
+        // Diagonal directions
+        // Opp-venstre (dir=4)
+        if row >= 1 && col >= 1 {
+            table[sq][4] = (sq - BOARD_SIZE - 1) as i8;
+        }
+        // Opp-høyre (dir=5)
+        if row >= 1 && col < BOARD_SIZE - 1 {
+            table[sq][5] = (sq - BOARD_SIZE + 1) as i8;
+        }
+        // Ned-venstre (dir=6)
+        if row < BOARD_SIZE - 1 && col >= 1 {
+            table[sq][6] = (sq + BOARD_SIZE - 1) as i8;
+        }
+        // Ned-høyre (dir=7)
+        if row < BOARD_SIZE - 1 && col < BOARD_SIZE - 1 {
+            table[sq][7] = (sq + BOARD_SIZE + 1) as i8;
+        }
+
         sq += 1;
     }
     table
 };
 
 /// For hvert felt og retning: landingsfeltet etter hopp (-1 hvis ugyldig)
-const JUMP_LANDING: [[i8; 4]; NUM_SQUARES] = {
-    let mut table = [[-1i8; 4]; NUM_SQUARES];
+/// Directions: 0=Up, 1=Down, 2=Left, 3=Right, 4=UpLeft, 5=UpRight, 6=DownLeft, 7=DownRight
+const JUMP_LANDING: [[i8; NUM_JUMP_DIRS]; NUM_SQUARES] = {
+    let mut table = [[-1i8; NUM_JUMP_DIRS]; NUM_SQUARES];
     let mut sq = 0;
     while sq < NUM_SQUARES {
         let (row, col) = sq_to_coords(sq);
 
+        // Orthogonal directions
         // Opp (dir=0) - trenger 2 rader over
         if row >= 2 {
             table[sq][0] = (sq - 2 * BOARD_SIZE) as i8;
@@ -154,6 +197,24 @@ const JUMP_LANDING: [[i8; 4]; NUM_SQUARES] = {
         // Høyre (dir=3) - trenger 2 kolonner til høyre
         if col < BOARD_SIZE - 2 {
             table[sq][3] = (sq + 2) as i8;
+        }
+
+        // Diagonal directions
+        // Opp-venstre (dir=4) - trenger 2 rader over og 2 kolonner til venstre
+        if row >= 2 && col >= 2 {
+            table[sq][4] = (sq - 2 * BOARD_SIZE - 2) as i8;
+        }
+        // Opp-høyre (dir=5)
+        if row >= 2 && col < BOARD_SIZE - 2 {
+            table[sq][5] = (sq - 2 * BOARD_SIZE + 2) as i8;
+        }
+        // Ned-venstre (dir=6)
+        if row < BOARD_SIZE - 2 && col >= 2 {
+            table[sq][6] = (sq + 2 * BOARD_SIZE - 2) as i8;
+        }
+        // Ned-høyre (dir=7)
+        if row < BOARD_SIZE - 2 && col < BOARD_SIZE - 2 {
+            table[sq][7] = (sq + 2 * BOARD_SIZE + 2) as i8;
         }
 
         sq += 1;
@@ -507,6 +568,10 @@ impl BitBoard {
     }
 
     /// Generer alle lovlige trekk (bitboard-versjon)
+    ///
+    /// New rules: Pail must be moved every turn!
+    /// - First turn: Place pail somewhere (required) + place/move barrel
+    /// - Subsequent turns: Move pail to new location (required) + move barrel
     pub fn generate_moves(&self) -> Vec<BitMove> {
         let mut moves = Vec::with_capacity(64);
         let player = self.current_player;
@@ -525,25 +590,30 @@ impl BitBoard {
         };
 
         let start_row_mask = self.starting_row_mask(player);
+
+        // Empty squares for moves
         let empty = self.empty();
 
-        // Samle pail-opsjoner
-        // Option<u8> hvor None = ingen plassering, Some(sq) = plasser på sq
-        let pail_options: Vec<Option<u8>> = if pail_placed {
-            vec![None]
-        } else {
-            let mut opts = vec![None];
+        // Pail placement: only on first turn when pail not yet placed
+        // Generate pail destinations (empty if already placed)
+        let pail_destinations: Vec<Option<u8>> = if !pail_placed {
+            // First placement: any empty square
+            let mut dests = Vec::with_capacity(32);
             let mut e = empty;
             while e != 0 {
                 let sq = e.trailing_zeros() as u8;
-                opts.push(Some(sq));
+                dests.push(Some(sq));
                 e &= e - 1;
             }
-            opts
+            dests
+        } else {
+            // Pail already placed - no pail move needed
+            vec![None]
         };
 
-        for pail_opt in &pail_options {
-            // Midlertidig occupied med eventuell pail
+        // For each pail destination (or None if already placed), generate barrel moves
+        for pail_opt in &pail_destinations {
+            // Calculate occupied squares with pail in new position (if placing)
             let temp_occupied = if let Some(pail_sq) = pail_opt {
                 self.occupied | bit(*pail_sq as usize)
             } else {
@@ -567,7 +637,7 @@ impl BitBoard {
             while barrels != 0 {
                 let from_sq = barrels.trailing_zeros() as u8;
 
-                // Enkle trekk (ett felt)
+                // Enkle trekk (ett felt) - now 8 directions
                 let adjacent = ADJACENT[from_sq as usize] & temp_empty;
                 let mut adj = adjacent;
                 while adj != 0 {
@@ -592,6 +662,8 @@ impl BitBoard {
     }
 
     /// Finn alle hopp-sekvenser fra et felt (iterativ versjon)
+    /// Supports 8 directions (orthogonal + diagonal)
+    /// Can jump over barrels AND your own pail, but NOT opponent's pail
     fn find_jumps_iterative(
         &self,
         from_sq: u8,
@@ -604,9 +676,20 @@ impl BitBoard {
 
         // Start med alle retninger fra from_sq
         let all_barrels = self.all_barrels();
+        // Opponent's pail blocks jumps, own pail does not
+        let opponent_pail = match self.current_player {
+            Player::White => self.black_pail,
+            Player::Black => self.white_pail,
+        };
+        let own_pail = match self.current_player {
+            Player::White => self.white_pail,
+            Player::Black => self.black_pail,
+        };
+        // Can jump over: barrels OR own pail
+        let jumpable = all_barrels | own_pail;
         let visited_start = bit(from_sq as usize);
 
-        for dir in 0..4 {
+        for dir in 0..NUM_JUMP_DIRS {
             let over = JUMP_OVER[from_sq as usize][dir];
             let landing = JUMP_LANDING[from_sq as usize][dir];
 
@@ -617,8 +700,9 @@ impl BitBoard {
             let over_bit = bit(over as usize);
             let landing_bit = bit(landing as usize);
 
-            // Kan bare hoppe over tønner (ikke tomme felt eller pail)
-            if (all_barrels & over_bit) != 0
+            // Can jump over barrels or own pail, but NOT opponent's pail
+            if (jumpable & over_bit) != 0
+                && (opponent_pail & over_bit) == 0  // Cannot jump over opponent's pail
                 && (temp_occupied & landing_bit) == 0
             {
                 let path = vec![landing as u8];
@@ -634,7 +718,7 @@ impl BitBoard {
 
         // DFS
         while let Some((current, visited, path)) = stack.pop() {
-            for dir in 0..4 {
+            for dir in 0..NUM_JUMP_DIRS {
                 let over = JUMP_OVER[current as usize][dir];
                 let landing = JUMP_LANDING[current as usize][dir];
 
@@ -650,8 +734,9 @@ impl BitBoard {
                     continue;
                 }
 
-                // Kan hoppe?
-                if (all_barrels & over_bit) != 0
+                // Can jump over barrels or own pail, but NOT opponent's pail
+                if (jumpable & over_bit) != 0
+                    && (opponent_pail & over_bit) == 0  // Cannot jump over opponent's pail
                     && (temp_occupied & landing_bit) == 0
                 {
                     let mut new_path = path.clone();
@@ -675,24 +760,25 @@ impl BitBoard {
         let player = self.current_player;
         let goal_row = self.goal_row(player);
 
-        // 1. Plasser pail hvis angitt
+        // 1. Place pail (one-time placement, only when not yet placed)
         if let Some(pail_sq) = mv.pail_pos() {
             let pail_bit = bit(pail_sq as usize);
-            let (row, col) = sq_to_coords(pail_sq as usize);
+            let (pail_row, pail_col) = sq_to_coords(pail_sq as usize);
 
             match player {
                 Player::White => {
-                    self.white_pail |= pail_bit;
+                    debug_assert!(!self.white_pail_placed, "White pail already placed!");
+                    self.white_pail = pail_bit;
                     self.white_pail_placed = true;
-                    // Oppdater hash
-                    self.hash ^= ZOBRIST.pieces[row][col][ZobristKeys::piece_index(Cell::Empty)];
-                    self.hash ^= ZOBRIST.pieces[row][col][ZobristKeys::piece_index(Cell::WhitePail)];
+                    self.hash ^= ZOBRIST.pieces[pail_row][pail_col][ZobristKeys::piece_index(Cell::Empty)];
+                    self.hash ^= ZOBRIST.pieces[pail_row][pail_col][ZobristKeys::piece_index(Cell::WhitePail)];
                 }
                 Player::Black => {
-                    self.black_pail |= pail_bit;
+                    debug_assert!(!self.black_pail_placed, "Black pail already placed!");
+                    self.black_pail = pail_bit;
                     self.black_pail_placed = true;
-                    self.hash ^= ZOBRIST.pieces[row][col][ZobristKeys::piece_index(Cell::Empty)];
-                    self.hash ^= ZOBRIST.pieces[row][col][ZobristKeys::piece_index(Cell::BlackPail)];
+                    self.hash ^= ZOBRIST.pieces[pail_row][pail_col][ZobristKeys::piece_index(Cell::Empty)];
+                    self.hash ^= ZOBRIST.pieces[pail_row][pail_col][ZobristKeys::piece_index(Cell::BlackPail)];
                 }
             }
             self.occupied |= pail_bit;
@@ -909,6 +995,10 @@ pub enum Cell {
 impl Cell {
     fn is_barrel(&self) -> bool {
         matches!(self, Cell::WhiteBarrel | Cell::BlackBarrel)
+    }
+
+    fn is_pail(&self) -> bool {
+        matches!(self, Cell::WhitePail | Cell::BlackPail)
     }
 
     fn is_barrel_of(&self, player: Player) -> bool {
@@ -1190,11 +1280,11 @@ impl Board {
     }
 
     /// Generer alle lovlige trekk for nåværende spiller
-    /// Regler:
-    /// 1. (Valgfritt) Plasser melkespann på ledig rute (hvis ikke allerede plassert)
+    /// Rules:
+    /// 1. (Påkrevd FØRSTE TUR) Plasser melkespann på ledig felt
     /// 2. (Påkrevd) ENTEN:
     ///    a) Plasser ny tønne fra utenfor brettet på ledig felt på startrad
-    ///    b) Flytt eksisterende tønne på brettet
+    ///    b) Flytt eksisterende tønne på brettet (8 directions + jumps)
     fn generate_moves(&self) -> Vec<Move> {
         let mut moves = Vec::new();
         let player = self.current_player;
@@ -1211,31 +1301,33 @@ impl Board {
         let barrels_on_board = self.find_barrels(player);
         let start_row = self.starting_row(player);
 
-        // Samle alle mulige pail-plasseringer (inkludert "ingen plassering")
-        let pail_options: Vec<Option<Position>> = if pail_placed {
-            vec![None]  // Allerede plassert, ingen valg
-        } else {
-            let mut options = vec![None];  // Kan velge å ikke plassere
+        // Generate pail destinations (only when not yet placed - one-time!)
+        let pail_destinations: Vec<Option<Position>> = if !pail_placed {
+            // First placement: any empty square
+            let mut dests = Vec::new();
             for row in 0..BOARD_SIZE {
                 for col in 0..BOARD_SIZE {
                     if self.cells[row][col] == Cell::Empty {
-                        options.push(Some(Position::new(row as i8, col as i8)));
+                        dests.push(Some(Position::new(row as i8, col as i8)));
                     }
                 }
             }
-            options
+            dests
+        } else {
+            // Pail already placed - no pail move needed
+            vec![None]
         };
 
-        for pail_option in &pail_options {
-            // Lag midlertidig brett med eventuell pail-plassering
-            let temp_board = if let Some(pail_pos) = pail_option {
-                let mut b = self.clone();
+        for pail_opt in &pail_destinations {
+            // Create temp board with pail placed (if this is first pail placement)
+            let temp_board = if let Some(pail_dest) = pail_opt {
+                let mut temp = self.clone();
                 let pail_cell = match player {
                     Player::White => Cell::WhitePail,
                     Player::Black => Cell::BlackPail,
                 };
-                b.cells[pail_pos.row as usize][pail_pos.col as usize] = pail_cell;
-                b
+                temp.cells[pail_dest.row as usize][pail_dest.col as usize] = pail_cell;
+                temp
             } else {
                 self.clone()
             };
@@ -1245,7 +1337,7 @@ impl Board {
                 for col in 0..BOARD_SIZE {
                     if temp_board.cells[start_row][col] == Cell::Empty {
                         let to_pos = Position::new(start_row as i8, col as i8);
-                        moves.push(Move::place_barrel(*pail_option, to_pos));
+                        moves.push(Move::place_barrel(*pail_opt, to_pos));
                     }
                 }
             }
@@ -1254,7 +1346,7 @@ impl Board {
             for &barrel_pos in &barrels_on_board {
                 let barrel_moves = temp_board.get_barrel_moves(barrel_pos, player);
                 for path in barrel_moves {
-                    moves.push(Move::move_barrel(*pail_option, barrel_pos, path));
+                    moves.push(Move::move_barrel(*pail_opt, barrel_pos, path));
                 }
             }
         }
@@ -1270,22 +1362,28 @@ impl Board {
             Player::Black => Cell::BlackBarrel,
         };
 
-        // 1. Plasser melkespann hvis angitt
+        // 1. Place pail (one-time placement, only when not yet placed)
         if let Some(pail_pos) = mv.place_pail {
             let pail_cell = match player {
                 Player::White => Cell::WhitePail,
                 Player::Black => Cell::BlackPail,
             };
 
-            let pos = (pail_pos.row as usize, pail_pos.col as usize);
+            // Debug assert: pail should not already be placed
+            debug_assert!(
+                match player {
+                    Player::White => !self.white_pail_placed,
+                    Player::Black => !self.black_pail_placed,
+                },
+                "Pail already placed!"
+            );
 
-            // Oppdater hash
+            // Place pail at position
+            let pos = (pail_pos.row as usize, pail_pos.col as usize);
             self.hash ^= ZOBRIST.pieces[pos.0][pos.1][ZobristKeys::piece_index(Cell::Empty)];
             self.hash ^= ZOBRIST.pieces[pos.0][pos.1][ZobristKeys::piece_index(pail_cell)];
-
             self.cells[pos.0][pos.1] = pail_cell;
 
-            // Marker at melkespannet er plassert
             match player {
                 Player::White => self.white_pail_placed = true,
                 Player::Black => self.black_pail_placed = true,
@@ -1383,11 +1481,16 @@ impl Board {
 // Hjelpefunksjoner (ikke eksponert til Python)
 impl Board {
     /// Finn alle mulige trekk for en tønne (inkludert hopp-sekvenser)
+    /// Supports 8 directions (orthogonal + diagonal)
     fn get_barrel_moves(&self, from: Position, player: Player) -> Vec<Vec<Position>> {
         let mut all_paths = Vec::new();
-        let directions = [(0, 1), (0, -1), (1, 0), (-1, 0)];
+        // 8 directions: orthogonal + diagonal
+        let directions = [
+            (0, 1), (0, -1), (1, 0), (-1, 0),  // orthogonal
+            (1, 1), (1, -1), (-1, 1), (-1, -1) // diagonal
+        ];
 
-        // Enkle trekk (ett felt)
+        // Enkle trekk (ett felt) - now 8 directions
         for (dr, dc) in directions {
             let to = Position::new(from.row + dr, from.col + dc);
             if to.is_valid() {
@@ -1408,6 +1511,7 @@ impl Board {
     }
 
     /// Rekursivt finn alle hopp-sekvenser
+    /// Supports 8 directions, cannot jump over pails
     fn find_jump_sequences(
         &self,
         current: Position,
@@ -1416,7 +1520,17 @@ impl Board {
         current_path: &mut Vec<Position>,
         all_paths: &mut Vec<Vec<Position>>,
     ) {
-        let directions = [(0, 1), (0, -1), (1, 0), (-1, 0)];
+        // 8 directions: orthogonal + diagonal
+        let directions = [
+            (0, 1), (0, -1), (1, 0), (-1, 0),  // orthogonal
+            (1, 1), (1, -1), (-1, 1), (-1, -1) // diagonal
+        ];
+
+        // Opponent's pail blocks jumps
+        let opponent_pail = match player {
+            Player::White => Cell::BlackPail,
+            Player::Black => Cell::WhitePail,
+        };
 
         for (dr, dc) in directions {
             // Sjekk om det er en tønne å hoppe over
@@ -1427,9 +1541,13 @@ impl Board {
                 continue;
             }
 
-            // Kan ikke hoppe over melkespann
+            // Can jump over barrels or OWN pail, but NOT opponent's pail
             if let (Some(over_cell), Some(landing_cell)) = (self.get(over), self.get(landing)) {
-                if over_cell.is_barrel()
+                let can_jump_over = over_cell.is_barrel() || over_cell.is_pail();
+                let is_opponent_pail = over_cell == opponent_pail;
+
+                if can_jump_over
+                    && !is_opponent_pail  // Cannot jump over opponent's pail
                     && landing_cell == Cell::Empty
                     && !visited[landing.row as usize][landing.col as usize]
                 {
@@ -1532,7 +1650,8 @@ impl TranspositionTable {
     fn probe(&mut self, hash: u64) -> Option<&TTEntry> {
         let idx = self.index(hash);
         if let Some(ref entry) = self.entries[idx] {
-            if entry.hash == hash {
+            // Check hash match AND generation (stale entries are invalid)
+            if entry.hash == hash && entry.generation == self.generation {
                 self.hits += 1;
                 return Some(entry);
             }
@@ -1576,12 +1695,11 @@ impl TranspositionTable {
     }
 
     fn clear(&mut self) {
-        for entry in &mut self.entries {
-            *entry = None;
-        }
+        // O(1) clear using generation counter - stale entries ignored by probe()
+        // Wrap generation to invalidate all existing entries
+        self.generation = self.generation.wrapping_add(1);
         self.hits = 0;
         self.misses = 0;
-        self.generation = 0;
     }
 }
 
@@ -1769,6 +1887,16 @@ impl Engine {
     fn has_nnue(&self) -> bool {
         self.inner.nnue.is_some()
     }
+
+    /// Clear NNUE (revert to heuristic evaluation)
+    fn clear_nnue(&mut self) {
+        self.inner.clear_nnue();
+    }
+
+    /// Skip relational features during NNUE evaluation (for benchmarking)
+    fn set_skip_relational(&mut self, skip: bool) {
+        self.inner.skip_relational = skip;
+    }
 }
 
 
@@ -1940,11 +2068,12 @@ impl Default for Accumulator {
 }
 
 impl Accumulator {
-    /// Kopier fra en annen accumulator
+    /// Kopier fra en annen accumulator (only pre_activation - post is recomputed)
     #[inline]
     pub fn copy_from(&mut self, other: &Accumulator) {
+        // Only copy pre_activation - post_activation is recomputed in apply_relu()
         self.pre_activation = other.pre_activation;
-        self.post_activation = other.post_activation;
+        // Skip post_activation copy - saves 256 bytes per push!
     }
 
     /// Anvend ReLU på pre_activation og lagre i post_activation (SIMD-accelerert)
@@ -2053,6 +2182,7 @@ impl AccumulatorStack {
 pub struct IncrementalNNUE {
     // Vekter (delt med standard NNUE)
     fc1_weight: Vec<f32>,  // [hidden1 * input_size] where input_size is 144 or 157
+    fc1_weight_t: Vec<f32>,  // Transposed: [input_size * hidden1] for cache-friendly feature updates
     fc1_bias: Vec<f32>,
     fc2_weight: Vec<f32>,
     fc2_bias: Vec<f32>,
@@ -2076,89 +2206,104 @@ impl IncrementalNNUE {
         // Detect input size from weight dimensions
         // fc1_weight has shape [hidden1, input_size], flattened to [hidden1 * input_size]
         let input_size = fc1_weight.len() / model.hidden1;
+        let hidden1 = model.hidden1;
+
+        // Create transposed weight matrix for cache-friendly feature updates
+        // Original: fc1_weight[neuron * input_size + feature]
+        // Transposed: fc1_weight_t[feature * hidden1 + neuron]
+        let mut fc1_weight_t = vec![0.0f32; input_size * hidden1];
+        for neuron in 0..hidden1 {
+            for feature in 0..input_size {
+                fc1_weight_t[feature * hidden1 + neuron] = fc1_weight[neuron * input_size + feature];
+            }
+        }
 
         Ok(Self {
             fc1_weight,
+            fc1_weight_t,
             fc1_bias: model.weights.fc1_bias,
             fc2_weight,
             fc2_bias: model.weights.fc2_bias,
             fc3_weight,
             fc3_bias: model.weights.fc3_bias[0],
-            hidden1: model.hidden1,
+            hidden1,
             hidden2: model.hidden2,
             input_size,
         })
     }
 
-    /// Compute and add relational features (only for INPUT_SIZE=157 models)
+    /// Compute and add relational features (only cheap, non-inferable features)
     ///
-    /// Relational features (13 total):
-    ///   - White barrel distances to goal (4): closer = higher value
-    ///   - Black barrel distances to goal (4): closer = higher value
-    ///   - White/Black barrels scored (2): normalized by 4
-    ///   - White/Black pail placed (2): 0 or 1
-    ///   - Current player (1): +1 white, -1 black
+    /// Relational features (3 total):
+    ///   - White barrels scored (1): normalized by 4 - can't infer from position
+    ///   - Black barrels scored (1): normalized by 4 - can't infer from position
+    ///   - Current player (1): +1 white, -1 black - not in base features
+    ///
+    /// Removed (can be learned from base features):
+    ///   - Barrel distances (NN can learn row 0/5 are goals)
+    ///   - Pail placed (if pail is on board, it's placed)
+    #[inline]
     fn add_relational_features(&self, bb: &BitBoard, acc: &mut Accumulator) {
         if self.input_size <= BASE_FEATURES {
             return; // Legacy model without relational features
         }
 
-        let input_size = self.input_size;
+        let hidden1 = self.hidden1;
         let base = BASE_FEATURES;
 
-        // Compute relational feature values
-        let mut rel_features = [0.0f32; RELATIONAL_FEATURES];
+        // Only 3 cheap features - no loops, no sorting, just memory reads
+        let rel_features: [f32; 3] = [
+            bb.white_scored as f32 / 4.0,  // [0] White scored (0.0 - 1.0)
+            bb.black_scored as f32 / 4.0,  // [1] Black scored (0.0 - 1.0)
+            match bb.current_player {       // [2] Current player
+                Player::White => 1.0,
+                Player::Black => -1.0,
+            },
+        ];
 
-        // White barrel distances to goal (row 0 is goal, so distance = row)
-        let mut white_dists = Vec::with_capacity(4);
-        let mut barrels = bb.white_barrels;
-        while barrels != 0 {
-            let sq = barrels.trailing_zeros() as usize;
-            let row = sq / BOARD_SIZE;
-            white_dists.push(row as f32 / 5.0);
-            barrels &= barrels - 1;
-        }
-        white_dists.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        for (i, &d) in white_dists.iter().take(4).enumerate() {
-            rel_features[i] = 1.0 - d; // Closer = higher value
-        }
-
-        // Black barrel distances to goal (row 5 is goal, so distance = 5 - row)
-        let mut black_dists = Vec::with_capacity(4);
-        barrels = bb.black_barrels;
-        while barrels != 0 {
-            let sq = barrels.trailing_zeros() as usize;
-            let row = sq / BOARD_SIZE;
-            black_dists.push((5 - row) as f32 / 5.0);
-            barrels &= barrels - 1;
-        }
-        black_dists.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        for (i, &d) in black_dists.iter().take(4).enumerate() {
-            rel_features[4 + i] = 1.0 - d;
-        }
-
-        // Scored barrels (normalized by 4)
-        rel_features[8] = bb.white_scored as f32 / 4.0;
-        rel_features[9] = bb.black_scored as f32 / 4.0;
-
-        // Pails placed
-        rel_features[10] = if bb.white_pail != 0 { 1.0 } else { 0.0 };
-        rel_features[11] = if bb.black_pail != 0 { 1.0 } else { 0.0 };
-
-        // Current player
-        rel_features[12] = match bb.current_player {
-            Player::White => 1.0,
-            Player::Black => -1.0,
-        };
-
-        // Add contribution of relational features to accumulator
+        // Add contribution of relational features to accumulator using transposed weights
         for (feat_idx, &feat_val) in rel_features.iter().enumerate() {
             if feat_val == 0.0 {
                 continue; // Skip zero features
             }
             let weight_idx = base + feat_idx;
-            for i in 0..self.hidden1 {
-                acc.pre_activation[i] += feat_val * self.fc1_weight[i * input_size + weight_idx];
+            let base_idx = weight_idx * hidden1;  // Contiguous weights
+
+            // SIMD loop: process 8 elements at a time
+            let scale_vec = f32x8::splat(feat_val);
+            let mut i = 0;
+            while i + 8 <= hidden1 {
+                let acc_vec = f32x8::new([
+                    acc.pre_activation[i],
+                    acc.pre_activation[i + 1],
+                    acc.pre_activation[i + 2],
+                    acc.pre_activation[i + 3],
+                    acc.pre_activation[i + 4],
+                    acc.pre_activation[i + 5],
+                    acc.pre_activation[i + 6],
+                    acc.pre_activation[i + 7],
+                ]);
+                let weight_vec = f32x8::new([
+                    self.fc1_weight_t[base_idx + i],
+                    self.fc1_weight_t[base_idx + i + 1],
+                    self.fc1_weight_t[base_idx + i + 2],
+                    self.fc1_weight_t[base_idx + i + 3],
+                    self.fc1_weight_t[base_idx + i + 4],
+                    self.fc1_weight_t[base_idx + i + 5],
+                    self.fc1_weight_t[base_idx + i + 6],
+                    self.fc1_weight_t[base_idx + i + 7],
+                ]);
+                let result = acc_vec + scale_vec * weight_vec;
+                let arr = result.to_array();
+                acc.pre_activation[i] = arr[0];
+                acc.pre_activation[i + 1] = arr[1];
+                acc.pre_activation[i + 2] = arr[2];
+                acc.pre_activation[i + 3] = arr[3];
+                acc.pre_activation[i + 4] = arr[4];
+                acc.pre_activation[i + 5] = arr[5];
+                acc.pre_activation[i + 6] = arr[6];
+                acc.pre_activation[i + 7] = arr[7];
+                i += 8;
             }
         }
     }
@@ -2218,13 +2363,15 @@ impl IncrementalNNUE {
         }
     }
 
-    /// Legg til én feature til accumulator (SIMD-accelerert)
+    /// Legg til én feature til accumulator (SIMD-accelerert med transponerte vekter)
     #[inline]
     fn add_feature(&self, acc: &mut Accumulator, feat: usize) {
-        let input_size = self.input_size;
+        let hidden1 = self.hidden1;
+        let base_idx = feat * hidden1;  // Contiguous weights for this feature
         let mut i = 0;
-        // SIMD loop: process 8 elements at a time
-        while i + 8 <= self.hidden1 {
+
+        // SIMD loop: process 8 elements at a time with contiguous memory access
+        while i + 8 <= hidden1 {
             let acc_vec = f32x8::new([
                 acc.pre_activation[i],
                 acc.pre_activation[i + 1],
@@ -2235,15 +2382,16 @@ impl IncrementalNNUE {
                 acc.pre_activation[i + 6],
                 acc.pre_activation[i + 7],
             ]);
+            // Now weights are contiguous in memory!
             let weight_vec = f32x8::new([
-                self.fc1_weight[i * input_size + feat],
-                self.fc1_weight[(i + 1) * input_size + feat],
-                self.fc1_weight[(i + 2) * input_size + feat],
-                self.fc1_weight[(i + 3) * input_size + feat],
-                self.fc1_weight[(i + 4) * input_size + feat],
-                self.fc1_weight[(i + 5) * input_size + feat],
-                self.fc1_weight[(i + 6) * input_size + feat],
-                self.fc1_weight[(i + 7) * input_size + feat],
+                self.fc1_weight_t[base_idx + i],
+                self.fc1_weight_t[base_idx + i + 1],
+                self.fc1_weight_t[base_idx + i + 2],
+                self.fc1_weight_t[base_idx + i + 3],
+                self.fc1_weight_t[base_idx + i + 4],
+                self.fc1_weight_t[base_idx + i + 5],
+                self.fc1_weight_t[base_idx + i + 6],
+                self.fc1_weight_t[base_idx + i + 7],
             ]);
             let result = acc_vec + weight_vec;
             let arr = result.to_array();
@@ -2259,13 +2407,15 @@ impl IncrementalNNUE {
         }
     }
 
-    /// Fjern én feature fra accumulator (SIMD-accelerert)
+    /// Fjern én feature fra accumulator (SIMD-accelerert med transponerte vekter)
     #[inline]
     fn remove_feature(&self, acc: &mut Accumulator, feat: usize) {
-        let input_size = self.input_size;
+        let hidden1 = self.hidden1;
+        let base_idx = feat * hidden1;  // Contiguous weights for this feature
         let mut i = 0;
-        // SIMD loop: process 8 elements at a time
-        while i + 8 <= self.hidden1 {
+
+        // SIMD loop: process 8 elements at a time with contiguous memory access
+        while i + 8 <= hidden1 {
             let acc_vec = f32x8::new([
                 acc.pre_activation[i],
                 acc.pre_activation[i + 1],
@@ -2276,15 +2426,16 @@ impl IncrementalNNUE {
                 acc.pre_activation[i + 6],
                 acc.pre_activation[i + 7],
             ]);
+            // Now weights are contiguous in memory!
             let weight_vec = f32x8::new([
-                self.fc1_weight[i * input_size + feat],
-                self.fc1_weight[(i + 1) * input_size + feat],
-                self.fc1_weight[(i + 2) * input_size + feat],
-                self.fc1_weight[(i + 3) * input_size + feat],
-                self.fc1_weight[(i + 4) * input_size + feat],
-                self.fc1_weight[(i + 5) * input_size + feat],
-                self.fc1_weight[(i + 6) * input_size + feat],
-                self.fc1_weight[(i + 7) * input_size + feat],
+                self.fc1_weight_t[base_idx + i],
+                self.fc1_weight_t[base_idx + i + 1],
+                self.fc1_weight_t[base_idx + i + 2],
+                self.fc1_weight_t[base_idx + i + 3],
+                self.fc1_weight_t[base_idx + i + 4],
+                self.fc1_weight_t[base_idx + i + 5],
+                self.fc1_weight_t[base_idx + i + 6],
+                self.fc1_weight_t[base_idx + i + 7],
             ]);
             let result = acc_vec - weight_vec;
             let arr = result.to_array();
@@ -2500,6 +2651,48 @@ impl IncrementalNNUE {
         (self.evaluate_with_relational(bb, base_acc) * 1000.0) as i32
     }
 
+    /// Evaluate using a reusable working accumulator (avoids allocation per eval)
+    /// This is the fast path - reuses eval_acc instead of creating new Accumulator
+    #[inline]
+    pub fn evaluate_with_reusable_acc(&self, bb: &BitBoard, base_acc: &Accumulator, eval_acc: &mut Accumulator) -> i32 {
+        // Copy pre_activation from base accumulator
+        eval_acc.pre_activation = base_acc.pre_activation;
+
+        // Add relational features (cheap - only 3 features now)
+        if self.input_size > BASE_FEATURES {
+            let input_size = self.input_size;
+            let base = BASE_FEATURES;
+            let rel_features: [f32; 3] = [
+                bb.white_scored as f32 / 4.0,
+                bb.black_scored as f32 / 4.0,
+                match bb.current_player {
+                    Player::White => 1.0,
+                    Player::Black => -1.0,
+                },
+            ];
+            for (feat_idx, &feat_val) in rel_features.iter().enumerate() {
+                if feat_val == 0.0 { continue; }
+                let weight_idx = base + feat_idx;
+                for i in 0..self.hidden1 {
+                    eval_acc.pre_activation[i] += feat_val * self.fc1_weight[i * input_size + weight_idx];
+                }
+            }
+        }
+
+        // Apply ReLU and evaluate
+        eval_acc.apply_relu();
+        (self.evaluate_from_accumulator(eval_acc) * 1000.0) as i32
+    }
+
+    /// Evaluate using only base features (skip relational features for benchmarking)
+    #[inline]
+    pub fn evaluate_base_only_cp(&self, base_acc: &Accumulator) -> i32 {
+        let mut acc = Accumulator::default();
+        acc.pre_activation = base_acc.pre_activation;
+        acc.apply_relu();
+        (self.evaluate_from_accumulator(&acc) * 1000.0) as i32
+    }
+
     /// Inkrementell evaluering: oppdater accumulator og evaluer
     pub fn evaluate_incremental(
         &self,
@@ -2525,6 +2718,7 @@ const EVAL_CACHE_SIZE: usize = 1 << 16; // 65536 entries
 struct EvalCacheEntry {
     hash: u64,
     score: i32,
+    generation: u8,
 }
 
 /// Cache for statiske evalueringer
@@ -2532,6 +2726,7 @@ struct EvalCache {
     entries: Vec<EvalCacheEntry>,
     hits: u64,
     misses: u64,
+    generation: u8,
 }
 
 impl EvalCache {
@@ -2540,6 +2735,7 @@ impl EvalCache {
             entries: vec![EvalCacheEntry::default(); EVAL_CACHE_SIZE],
             hits: 0,
             misses: 0,
+            generation: 0,
         }
     }
 
@@ -2553,7 +2749,8 @@ impl EvalCache {
     fn probe(&mut self, hash: u64) -> Option<i32> {
         let idx = self.index(hash);
         let entry = &self.entries[idx];
-        if entry.hash == hash {
+        // Check hash AND generation
+        if entry.hash == hash && entry.generation == self.generation {
             self.hits += 1;
             Some(entry.score)
         } else {
@@ -2566,14 +2763,12 @@ impl EvalCache {
     #[inline]
     fn store(&mut self, hash: u64, score: i32) {
         let idx = self.index(hash);
-        self.entries[idx] = EvalCacheEntry { hash, score };
+        self.entries[idx] = EvalCacheEntry { hash, score, generation: self.generation };
     }
 
-    /// Tøm cache
+    /// Tøm cache - O(1) using generation counter
     fn clear(&mut self) {
-        for entry in &mut self.entries {
-            *entry = EvalCacheEntry::default();
-        }
+        self.generation = self.generation.wrapping_add(1);
         self.hits = 0;
         self.misses = 0;
     }
@@ -2617,6 +2812,12 @@ pub struct BitBoardEngine {
     // Accumulator stack
     acc_stack: AccumulatorStack,
 
+    // Working accumulator for evaluation (reused to avoid allocations)
+    eval_acc: Accumulator,
+
+    // Skip relational features (for benchmarking)
+    skip_relational: bool,
+
     // Fallback heuristisk vekter
     pub weight_progress: i32,
     pub weight_center_pail: i32,
@@ -2646,6 +2847,8 @@ impl BitBoardEngine {
             history: [[0; NUM_SQUARES]; NUM_SQUARES],
             nnue: None,
             acc_stack: AccumulatorStack::new(),
+            eval_acc: Accumulator::default(),
+            skip_relational: false,
             weight_progress: 100,
             weight_center_pail: 10,
             weight_blocking: 15,
@@ -2685,8 +2888,14 @@ impl BitBoardEngine {
 
     /// Last NNUE-modell
     pub fn load_nnue(&mut self, path: &str) -> Result<(), Box<dyn std::error::Error>> {
-        self.nnue = Some(IncrementalNNUE::load(path)?);
+        let nnue = IncrementalNNUE::load(path)?;
+        self.nnue = Some(nnue);
         Ok(())
+    }
+
+    /// Clear NNUE (revert to heuristic evaluation)
+    pub fn clear_nnue(&mut self) {
+        self.nnue = None;
     }
 
     /// Tøm TT
@@ -2809,22 +3018,51 @@ impl BitBoardEngine {
 
     /// Evaluer posisjon (bruker NNUE hvis tilgjengelig, med caching)
     fn evaluate(&mut self, bb: &BitBoard) -> i32 {
-        if let Some(ref nnue) = self.nnue {
-            // NNUE bruker accumulator som er inkrementelt oppdatert
-            // For models with relational features, add them before evaluation
-            let acc = self.acc_stack.current();
-            nnue.evaluate_with_relational_cp(bb, acc)
-        } else {
-            // Heuristisk eval - bruk cache
-            let hash = bb.hash;
+        let hash = bb.hash;
 
-            // Sjekk cache først
-            if let Some(score) = self.eval_cache.probe(hash) {
-                self.eval_cache_hits += 1;
-                return score;
+        // Check eval cache first (works for both NNUE and heuristic)
+        if let Some(score) = self.eval_cache.probe(hash) {
+            self.eval_cache_hits += 1;
+            return score;
+        }
+
+        // Float NNUE
+        if self.nnue.is_some() {
+            let base_acc = self.acc_stack.current();
+            let pre_activation = base_acc.pre_activation;
+
+            let nnue = self.nnue.as_ref().unwrap();
+            let eval_acc = &mut self.eval_acc;
+
+            eval_acc.pre_activation = pre_activation;
+
+            if !self.skip_relational && nnue.input_size > BASE_FEATURES {
+                let input_size = nnue.input_size;
+                let base = BASE_FEATURES;
+                let rel_features: [f32; 3] = [
+                    bb.white_scored as f32 / 4.0,
+                    bb.black_scored as f32 / 4.0,
+                    match bb.current_player {
+                        Player::White => 1.0,
+                        Player::Black => -1.0,
+                    },
+                ];
+                for (feat_idx, &feat_val) in rel_features.iter().enumerate() {
+                    if feat_val == 0.0 { continue; }
+                    let weight_idx = base + feat_idx;
+                    for i in 0..nnue.hidden1 {
+                        eval_acc.pre_activation[i] += feat_val * nnue.fc1_weight[i * input_size + weight_idx];
+                    }
+                }
             }
 
-            // Beregn og cache
+            eval_acc.apply_relu();
+            let score = (nnue.evaluate_from_accumulator(eval_acc) * 1000.0) as i32;
+
+            self.eval_cache.store(hash, score);
+            score
+        } else {
+            // Heuristisk eval (cache already checked above)
             let score = self.evaluate_heuristic(bb);
             self.eval_cache.store(hash, score);
             score
@@ -2973,7 +3211,7 @@ impl BitBoardEngine {
         self.acc_stack.reset();
         if let Some(ref nnue) = self.nnue {
             let acc = self.acc_stack.current_mut();
-            for i in 0..64 {
+            for i in 0..nnue.hidden1 {
                 acc.pre_activation[i] = nnue.fc1_bias[i];
             }
             nnue.add_features_from_bitboard(bb, acc);
@@ -3089,9 +3327,9 @@ impl BitBoardEngine {
 
                 // Oppdater accumulator
                 if self.nnue.is_some() {
-                    self.acc_stack.push();
                     let nnue = self.nnue.as_ref().unwrap();
                     let deltas = nnue.compute_move_deltas(bb, &mv);
+                    self.acc_stack.push();
                     let acc = self.acc_stack.current_mut();
                     nnue.apply_deltas(acc, &deltas);
                 }
@@ -3117,9 +3355,9 @@ impl BitBoardEngine {
 
                 // Oppdater accumulator
                 if self.nnue.is_some() {
-                    self.acc_stack.push();
                     let nnue = self.nnue.as_ref().unwrap();
                     let deltas = nnue.compute_move_deltas(bb, &mv);
+                    self.acc_stack.push();
                     let acc = self.acc_stack.current_mut();
                     nnue.apply_deltas(acc, &deltas);
                 }
@@ -3290,9 +3528,9 @@ impl BitBoardEngine {
 
             // Oppdater accumulator inkrementelt
             if self.nnue.is_some() {
-                self.acc_stack.push();
                 let nnue = self.nnue.as_ref().unwrap();
                 let deltas = nnue.compute_move_deltas(bb, &mv);
+                self.acc_stack.push();
                 let acc = self.acc_stack.current_mut();
                 nnue.apply_deltas(acc, &deltas);
             }
