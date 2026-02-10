@@ -1619,10 +1619,21 @@ struct TTEntry {
     best_move: Option<Move>,  // Beste trekk (for move ordering)
 }
 
+/// ═══════════════════════════════════════════════════════════════
+/// TT Clustering: 3 entries per bucket
+/// ═══════════════════════════════════════════════════════════════
+/// Instead of 1 entry per hash slot, we store 3 entries per cluster.
+/// This reduces hash collisions and effectively triples the TT capacity.
+/// Replacement uses age+depth priority: priority = depth - age * 8.
+#[derive(Clone)]
+struct TTCluster {
+    entries: [Option<TTEntry>; 3],
+}
+
 /// Transposition Table - cache av evaluerte posisjoner
-/// Bruker depth-preferred replacement med generasjons-aging
+/// Bruker clustered replacement med 3 entries per bucket og age+depth prioritet
 struct TranspositionTable {
-    entries: Vec<Option<TTEntry>>,
+    clusters: Vec<TTCluster>,
     hits: u64,
     misses: u64,
     generation: u8,   // Økes hver gang søket starter
@@ -1631,7 +1642,7 @@ struct TranspositionTable {
 impl TranspositionTable {
     fn new(size: usize) -> Self {
         TranspositionTable {
-            entries: vec![None; size],
+            clusters: vec![TTCluster { entries: [None, None, None] }; size],
             hits: 0,
             misses: 0,
             generation: 0,
@@ -1644,16 +1655,20 @@ impl TranspositionTable {
     }
 
     fn index(&self, hash: u64) -> usize {
-        (hash as usize) % self.entries.len()
+        (hash as usize) % self.clusters.len()
     }
 
     fn probe(&mut self, hash: u64) -> Option<&TTEntry> {
         let idx = self.index(hash);
-        if let Some(ref entry) = self.entries[idx] {
-            // Check hash match AND generation (stale entries are invalid)
-            if entry.hash == hash && entry.generation == self.generation {
-                self.hits += 1;
-                return Some(entry);
+        let cluster = &self.clusters[idx];
+        // Search all 3 entries in the cluster for a hash match.
+        // No generation check — older entries are still useful for move ordering.
+        for entry in &cluster.entries {
+            if let Some(ref e) = entry {
+                if e.hash == hash {
+                    self.hits += 1;
+                    return Some(e);
+                }
             }
         }
         self.misses += 1;
@@ -1662,41 +1677,42 @@ impl TranspositionTable {
 
     fn store(&mut self, hash: u64, depth: u8, score: i32, flag: TTFlag, best_move: Option<Move>) {
         let idx = self.index(hash);
+        let cluster = &mut self.clusters[idx];
 
-        // Depth-preferred replacement strategy med generation tie-breaker
-        let should_replace = match &self.entries[idx] {
-            None => true,
-            Some(existing) => {
-                // Always replace if same position (update with potentially better info)
-                if existing.hash == hash {
-                    true
-                }
-                // Replace old generations (stale entries)
-                else if existing.generation != self.generation {
-                    true
-                }
-                // Replace if new entry has greater or equal depth
-                else {
-                    depth >= existing.depth
+        // Find best slot: prefer empty, then same hash, then lowest priority
+        let mut replace_idx = 0;
+        let mut worst_priority = i32::MAX;
+
+        for i in 0..3 {
+            match &cluster.entries[i] {
+                None => { replace_idx = i; break; }
+                Some(e) if e.hash == hash => { replace_idx = i; break; }
+                Some(e) => {
+                    // Priority = depth - age_penalty
+                    // Old entries (high age) get low priority and are replaced first
+                    let age = self.generation.wrapping_sub(e.generation) as i32;
+                    let priority = e.depth as i32 - age * 8;
+                    if priority < worst_priority {
+                        worst_priority = priority;
+                        replace_idx = i;
+                    }
                 }
             }
-        };
-
-        if should_replace {
-            self.entries[idx] = Some(TTEntry {
-                hash,
-                depth,
-                score,
-                flag,
-                generation: self.generation,
-                best_move,
-            });
         }
+
+        cluster.entries[replace_idx] = Some(TTEntry {
+            hash,
+            depth,
+            score,
+            flag,
+            generation: self.generation,
+            best_move,
+        });
     }
 
     fn clear(&mut self) {
-        // O(1) clear using generation counter - stale entries ignored by probe()
-        // Wrap generation to invalidate all existing entries
+        // O(1) clear using generation counter - stale entries will have low
+        // priority and be replaced first. Probe still works for move ordering.
         self.generation = self.generation.wrapping_add(1);
         self.hits = 0;
         self.misses = 0;
