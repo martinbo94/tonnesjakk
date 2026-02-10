@@ -3441,7 +3441,7 @@ impl BitBoardEngine {
         // drop to quiescence search. If even qsearch can't save the
         // position, prune the entire subtree.
         if depth <= 3 {
-            let razor_margin = 300 + 200 * depth as i32;
+            let razor_margin = 200 + 150 * depth as i32;
             if maximizing && static_eval + razor_margin < alpha {
                 let qscore = self.quiesce(bb, alpha, beta, maximizing, 0);
                 if qscore < alpha {
@@ -3506,7 +3506,7 @@ impl BitBoardEngine {
         // At shallow-to-medium depths, if the static evaluation is far
         // below alpha, we can skip searching most moves (they won't raise
         // alpha). Margins scale super-linearly with depth.
-        const FUTILITY_MARGINS: [i32; 9] = [0, 100, 200, 300, 450, 600, 800, 1050, 1300];
+        const FUTILITY_MARGINS: [i32; 9] = [0, 80, 160, 250, 350, 450, 600, 750, 950];
         let futility_pruning = depth <= 8
             && static_eval.abs() < 90_000 // Not near mate
             && if maximizing {
