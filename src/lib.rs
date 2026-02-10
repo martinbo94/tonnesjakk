@@ -3323,7 +3323,8 @@ impl BitBoardEngine {
             // For minimizing, we use stand_pat as upper bound
         }
 
-        // Finn "taktiske" trekk: tønner som når mål eller er 1 rad unna
+        // Finn "taktiske" trekk: tønner nær mål, eller fremover-trekk ved dist 2
+        // Expanded from dist<=1 to also catch 2-step scoring sequences
         let player = bb.current_player;
 
         let moves = bb.generate_moves();
@@ -3332,13 +3333,32 @@ impl BitBoardEngine {
             .filter(|mv| {
                 let to_sq = mv.barrel_to() as usize;
                 let (to_row, _) = sq_to_coords(to_sq);
-                // Tønne når mål eller er én rad unna
                 let dist_to_goal = if player == Player::White {
                     to_row // White's goal is row 0
                 } else {
                     BOARD_SIZE - 1 - to_row // Black's goal is row 5
                 };
-                dist_to_goal <= 1
+
+                // Always include barrels within 1 step of goal
+                if dist_to_goal <= 1 {
+                    return true;
+                }
+
+                // At distance 2: only include if barrel moved forward toward goal
+                if dist_to_goal == 2 {
+                    if let Some(from_sq) = mv.barrel_from() {
+                        let (from_row, _) = sq_to_coords(from_sq as usize);
+                        let from_dist = if player == Player::White {
+                            from_row
+                        } else {
+                            BOARD_SIZE - 1 - from_row
+                        };
+                        // Only tactical if moving closer to goal
+                        return from_dist > dist_to_goal;
+                    }
+                }
+
+                false
             })
             .collect();
 
