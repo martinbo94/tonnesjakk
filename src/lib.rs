@@ -3447,7 +3447,7 @@ impl BitBoardEngine {
             None
         };
 
-        if let Some((tt_depth, tt_score, tt_flag, tt_mv_opt)) = tt_result {
+        if let Some((tt_depth, tt_score, tt_flag, ref tt_mv_opt)) = tt_result {
             // Now convert the move outside the borrow
             if let Some(ref mv) = tt_mv_opt {
                 tt_move = Some(Self::move_to_bitmove_static(mv));
@@ -3476,6 +3476,63 @@ impl BitBoardEngine {
         // for the next iterative deepening iteration.
         if tt_move.is_none() && depth >= 4 {
             depth -= 1;
+        }
+
+        // ═══════════════════════════════════════════════════════════════
+        // SINGULAR EXTENSIONS
+        // ═══════════════════════════════════════════════════════════════
+        // When TT move is singular (much better than alternatives),
+        // extend the search by 1 ply to resolve critical lines.
+        let mut singular_extension: u8 = 0;
+        if depth >= 6 && tt_move.is_some() {
+            if let Some((tt_depth, tt_score, tt_flag, _)) = tt_result {
+                if tt_depth >= depth.saturating_sub(3) && tt_flag != TTFlag::UpperBound && tt_score.abs() < 90_000 {
+                    // Search all other moves at reduced depth with a narrow window
+                    let singular_beta = tt_score - 50 * depth as i32 / 10;
+
+                    // Do a reduced-depth search excluding the TT move
+                    let moves = bb.generate_moves();
+                    let ordered = self.order_moves(moves, bb.current_player, depth as usize, tt_move.as_ref());
+                    let mut other_best = i32::MIN;
+                    let search_depth = (depth / 2).max(1);
+
+                    for mv in &ordered {
+                        // Skip the TT move
+                        if let Some(ref tmv) = tt_move {
+                            if *mv == *tmv {
+                                continue;
+                            }
+                        }
+
+                        let mut new_bb = *bb;
+                        new_bb.make_move(mv);
+
+                        // Push NNUE accumulator if needed
+                        if self.nnue.is_some() {
+                            let nnue = self.nnue.as_ref().unwrap();
+                            let deltas = nnue.compute_move_deltas(bb, mv);
+                            self.acc_stack.push();
+                            let acc = self.acc_stack.current_mut();
+                            nnue.apply_deltas(acc, &deltas);
+                        }
+
+                        let (score, _) = self.minimax(&new_bb, search_depth, singular_beta - 1, singular_beta, !maximizing);
+
+                        if self.nnue.is_some() {
+                            self.acc_stack.pop();
+                        }
+
+                        other_best = other_best.max(score);
+                        if other_best >= singular_beta {
+                            break; // Not singular
+                        }
+                    }
+
+                    if other_best < singular_beta {
+                        singular_extension = 1;
+                    }
+                }
+            }
         }
 
         // Terminal node
@@ -3637,7 +3694,10 @@ impl BitBoardEngine {
                 // ═══════════════════════════════════════════════════════════════
                 // PVS: Første trekk - fullt vindu (Principal Variation)
                 // ═══════════════════════════════════════════════════════════════
-                let (s, _) = self.minimax(&new_bb, depth - 1, alpha, beta, !maximizing);
+                // Apply singular extension: search 1 ply deeper when the TT
+                // move is much better than all alternatives.
+                let pv_depth = depth - 1 + singular_extension;
+                let (s, _) = self.minimax(&new_bb, pv_depth, alpha, beta, !maximizing);
                 score = s;
             } else {
                 // ═══════════════════════════════════════════════════════════════
