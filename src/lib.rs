@@ -1,5 +1,6 @@
 use pyo3::prelude::*;
 use std::fmt;
+use std::time::{Duration, Instant};
 use wide::f32x8;
 
 // ============================================================================
@@ -1913,6 +1914,24 @@ impl Engine {
     fn set_skip_relational(&mut self, skip: bool) {
         self.inner.skip_relational = skip;
     }
+
+    /// Time-based search: iterative deepening that stops when time runs out.
+    /// Returns SearchResult with the best move from the last fully completed depth.
+    fn search_timed(&mut self, board: &Board, time_ms: u64) -> SearchResult {
+        let bb = BitBoard::from_board(board);
+        let (score, best_bitmove, depth_reached) = self.inner.search_timed(&bb, time_ms);
+        let best_move = best_bitmove.map(|bm| bm.to_move());
+
+        SearchResult {
+            best_move,
+            score,
+            nodes_searched: self.inner.nodes_searched,
+            cutoffs: self.inner.cutoffs,
+            tt_hits: self.inner.tt_hits,
+            quiesce_nodes: self.inner.quiesce_nodes,
+            depth: depth_reached,
+        }
+    }
 }
 
 
@@ -2841,6 +2860,12 @@ pub struct BitBoardEngine {
     // Skip relational features (for benchmarking)
     skip_relational: bool,
 
+    // Time-based search: deadline for when to abort, checked every 1024 nodes
+    deadline: Option<Instant>,
+    nodes_since_check: u32,
+    search_stopped: bool,
+    last_completed_depth: u8,
+
     // LMR reduction table: lmr_table[depth][move_count] = reduction
     // Precomputed using ln(depth) * ln(move_count) / 2.5
     lmr_table: [[u8; 64]; 32],
@@ -2884,6 +2909,10 @@ impl BitBoardEngine {
             acc_stack: AccumulatorStack::new(),
             eval_acc: Accumulator::default(),
             skip_relational: false,
+            deadline: None,
+            nodes_since_check: 0,
+            search_stopped: false,
+            last_completed_depth: 0,
             lmr_table,
             weight_progress: 100,
             weight_center_pail: 10,
@@ -3451,6 +3480,12 @@ impl BitBoardEngine {
         maximizing: bool,
     ) -> (i32, Option<BitMove>) {
         self.nodes_searched += 1;
+
+        // Time check: abort search if deadline exceeded
+        if self.should_stop() {
+            return (0, None);
+        }
+
         let original_alpha = alpha;
         let mut depth = depth; // Make depth mutable for IIR
 
@@ -3869,6 +3904,46 @@ impl BitBoardEngine {
         }
     }
 
+    // ═══════════════════════════════════════════════════════════════
+    // TIME-BASED SEARCH
+    // ═══════════════════════════════════════════════════════════════
+    // Check deadline every 1024 nodes to avoid expensive Instant::now() calls.
+
+    /// Check if the search should stop due to time limit.
+    /// Uses a sticky `search_stopped` flag so that once the deadline is hit,
+    /// all subsequent calls return true immediately without rechecking the clock.
+    /// Only calls Instant::now() every 1024 nodes to minimize overhead.
+    #[inline]
+    fn should_stop(&mut self) -> bool {
+        if self.search_stopped {
+            return true;
+        }
+        if let Some(deadline) = self.deadline {
+            self.nodes_since_check += 1;
+            if self.nodes_since_check >= 1024 {
+                self.nodes_since_check = 0;
+                if Instant::now() >= deadline {
+                    self.search_stopped = true;
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Time-based search: iterative deepening up to max depth, stopping when time runs out.
+    /// Returns the best result from the last fully completed depth iteration.
+    pub fn search_timed(&mut self, bb: &BitBoard, time_ms: u64) -> (i32, Option<BitMove>, u8) {
+        self.deadline = Some(Instant::now() + Duration::from_millis(time_ms));
+        self.nodes_since_check = 0;
+        self.search_stopped = false;
+        let (score, mv) = self.search_iterative(bb, 30);
+        let depth_reached = self.last_completed_depth;
+        self.deadline = None;
+        self.search_stopped = false;
+        (score, mv, depth_reached)
+    }
+
     /// Iterative deepening search med aspiration windows
     pub fn search_iterative(&mut self, bb: &BitBoard, max_depth: u8) -> (i32, Option<BitMove>) {
         let mut best_score = 0;
@@ -3878,21 +3953,34 @@ impl BitBoardEngine {
         let mut total_cutoffs = 0u64;
         let mut total_tt_hits = 0u64;
         let mut prev_score: Option<i32> = None;
+        self.last_completed_depth = 0;
 
         for depth in 1..=max_depth {
+            // Check deadline before starting a new depth iteration
+            if self.deadline.is_some() && self.should_stop() {
+                break; // Use best result from previous completed depth
+            }
+
             // Bruk forrige score for aspiration windows
             let (score, mv) = self.search_with_aspiration(bb, depth, prev_score);
-            prev_score = Some(score);
 
             total_nodes += self.nodes_searched;
             total_quiesce += self.quiesce_nodes;
             total_cutoffs += self.cutoffs;
             total_tt_hits += self.tt_hits;
 
+            // If search was aborted mid-iteration, discard partial results
+            if self.deadline.is_some() && self.should_stop() {
+                break;
+            }
+
+            // This depth completed fully — update best results
+            prev_score = Some(score);
             best_score = score;
             if mv.is_some() {
                 best_move = mv;
             }
+            self.last_completed_depth = depth;
 
             // Stopp tidlig ved vinnersekvens
             if score.abs() > 90_000 {
