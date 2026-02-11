@@ -19,6 +19,7 @@ Usage:
 """
 
 import json
+import math
 import multiprocessing
 import random
 import time
@@ -38,15 +39,21 @@ NUM_PIECE_TYPES = 4  # WhiteBarrel, BlackBarrel, WhitePail, BlackPail
 
 # Feature sizes
 BASE_FEATURES = BOARD_SIZE * BOARD_SIZE * NUM_PIECE_TYPES  # 144 (piece positions)
-# Relational features (only cheap, non-inferable ones):
-#   - White barrels scored = 1 (can't infer from position - scored barrels are removed)
-#   - Black barrels scored = 1 (can't infer from position - scored barrels are removed)
-#   - Current player (1 = white, -1 = black) = 1 (not in base features)
-# Removed (can be learned from base features):
-#   - Barrel distances (NN can learn that row 0/5 are goals)
-#   - Pail placed (if pail on board, it's placed)
-RELATIONAL_FEATURES = 3
-INPUT_SIZE = BASE_FEATURES + RELATIONAL_FEATURES  # 147
+# Relational features (13 total):
+#   [0-3]  White barrel distances to goal (4 values, normalized 0-1, closest first)
+#   [4-7]  Black barrel distances to goal (4 values, normalized 0-1, closest first)
+#   [8]    White barrels scored (normalized 0-1)
+#   [9]    Black barrels scored (normalized 0-1)
+#   [10]   White pail placed (0 or 1)
+#   [11]   Black pail placed (0 or 1)
+#   [12]   Current player (+1 white, -1 black)
+RELATIONAL_FEATURES = 13
+INPUT_SIZE = BASE_FEATURES + RELATIONAL_FEATURES  # 157
+
+# Score normalization: use tanh(score / SCORE_SCALING) instead of linear clip.
+# This prevents information loss for extreme scores.
+# 600 means: +600cp → tanh(1) ≈ 0.76, +1200cp → 0.96, +3000cp → 1.00
+SCORE_SCALING = 600.0
 
 
 # =============================================================================
@@ -109,32 +116,64 @@ def board_to_tensor(
     - Channel 2: White pail
     - Channel 3: Black pail
 
-    Relational features (3) - only cheap, non-inferable features:
-    - White barrels scored (normalized 0-1) - can't infer from position
-    - Black barrels scored (normalized 0-1) - can't infer from position
-    - Current player (+1 white, -1 black) - not in base features
+    Relational features (13):
+    - [0-3]  White barrel distances to goal (normalized 0-1, closest first)
+    - [4-7]  Black barrel distances to goal (normalized 0-1, closest first)
+    - [8]    White barrels scored (normalized 0-1)
+    - [9]    Black barrels scored (normalized 0-1)
+    - [10]   White pail placed (0 or 1)
+    - [11]   Black pail placed (0 or 1)
+    - [12]   Current player (+1 white, -1 black)
     """
     # Base features: piece positions
     base = np.zeros((BOARD_SIZE, BOARD_SIZE, NUM_PIECE_TYPES), dtype=np.float32)
+
+    # Track barrel positions for distance calculation
+    white_barrel_rows = []
+    black_barrel_rows = []
+    white_pail_placed = 0.0
+    black_pail_placed = 0.0
 
     for row in range(BOARD_SIZE):
         for col in range(BOARD_SIZE):
             val = board_array[row][col]
             if val == 1:    # WhiteBarrel
                 base[row, col, 0] = 1.0
+                white_barrel_rows.append(row)
             elif val == -1:  # BlackBarrel
                 base[row, col, 1] = 1.0
+                black_barrel_rows.append(row)
             elif val == 2:   # WhitePail
                 base[row, col, 2] = 1.0
+                white_pail_placed = 1.0
             elif val == -2:  # BlackPail
                 base[row, col, 3] = 1.0
+                black_pail_placed = 1.0
 
-    # Relational features (only 3 cheap features)
-    relational = np.array([
-        white_scored / 4.0,   # [0] White scored (0.0 - 1.0)
-        black_scored / 4.0,   # [1] Black scored (0.0 - 1.0)
-        current_player,       # [2] Current player (+1 white, -1 black)
-    ], dtype=np.float32)
+    # Relational features (13 total)
+    relational = np.zeros(RELATIONAL_FEATURES, dtype=np.float32)
+
+    # White barrel distances to goal (row 0 is goal, so distance = row)
+    # Normalize by max distance (5) and sort so closest first
+    white_dists = sorted([r / 5.0 for r in white_barrel_rows])
+    for i, d in enumerate(white_dists[:4]):
+        relational[i] = 1.0 - d  # Closer to goal = higher value
+
+    # Black barrel distances to goal (row 5 is goal, so distance = 5 - row)
+    black_dists = sorted([(5 - r) / 5.0 for r in black_barrel_rows])
+    for i, d in enumerate(black_dists[:4]):
+        relational[4 + i] = 1.0 - d
+
+    # Scored barrels (normalized by 4, which is max)
+    relational[8] = white_scored / 4.0
+    relational[9] = black_scored / 4.0
+
+    # Pails placed
+    relational[10] = white_pail_placed
+    relational[11] = black_pail_placed
+
+    # Current player
+    relational[12] = current_player
 
     # Combine base and relational features
     features = np.concatenate([base.flatten(), relational])
@@ -296,29 +335,34 @@ class DataGenerator:
             if result.best_move is None:
                 break
 
-            # Save position with search score (skip first few moves - too random)
-            # Use search score instead of game outcome for more precise learning
-            if move_count >= 2:
-                # Determine current player
-                is_white = "White" in repr(board.current_player)
-                current_player = 1 if is_white else -1
-
-                # Normalize search score to -1 to +1 range
-                # Engine scores are in centipawns-like units, typically -10000 to +10000
+            # Save position with search score
+            # Quiet position filtering (Stockfish-inspired):
+            #   - Skip first 4 moves (too influenced by random opening)
+            #   - Skip clearly decided positions (|score| > 3000)
+            if move_count >= 4:
                 raw_score = result.score
-                normalized_score = max(-1.0, min(1.0, raw_score / 10000.0))
 
-                # Flip score perspective to always be from White's viewpoint
-                if not is_white:
-                    normalized_score = -normalized_score
+                # Skip noisy/decided positions
+                if abs(raw_score) <= 3000:
+                    is_white = "White" in repr(board.current_player)
+                    current_player = 1 if is_white else -1
 
-                positions.append(PositionData(
-                    board=board.to_array(),
-                    search_score=normalized_score,
-                    white_scored=board.white_scored,
-                    black_scored=board.black_scored,
-                    current_player=current_player
-                ))
+                    # Sigmoid normalization: tanh(score / SCALING)
+                    # Unlike linear clip, this preserves information for all scores.
+                    # tanh maps (-inf, +inf) to (-1, +1) smoothly.
+                    normalized_score = math.tanh(raw_score / SCORE_SCALING)
+
+                    # Flip score perspective to always be from White's viewpoint
+                    if not is_white:
+                        normalized_score = -normalized_score
+
+                    positions.append(PositionData(
+                        board=board.to_array(),
+                        search_score=normalized_score,
+                        white_scored=board.white_scored,
+                        black_scored=board.black_scored,
+                        current_player=current_player
+                    ))
 
             board.make_move(result.best_move)
             move_count += 1
@@ -345,7 +389,8 @@ class DataGenerator:
         save_every: int = 0,
         save_path: Optional[str] = None,
         config: Optional[Dict] = None,
-        workers: int = 1
+        workers: int = 1,
+        lambda_blend: Optional[float] = None
     ) -> Tuple[torch.Tensor, torch.Tensor, TrainingStats]:
         """
         Generate training dataset from self-play games.
@@ -402,7 +447,7 @@ class DataGenerator:
                 verbose=verbose, save_every=save_every, save_path=save_path,
                 config=config, workers=workers, nnue_path=nnue_path,
                 chunks_X=chunks_X, chunks_y=chunks_y, stats=stats,
-                start_time=start_time
+                start_time=start_time, lambda_blend=lambda_blend
             )
         else:
             self._generate_sequential(
@@ -411,7 +456,7 @@ class DataGenerator:
                 use_search_scores=use_search_scores, augment=augment,
                 verbose=verbose, save_every=save_every, save_path=save_path,
                 config=config, chunks_X=chunks_X, chunks_y=chunks_y,
-                stats=stats, start_time=start_time
+                stats=stats, start_time=start_time, lambda_blend=lambda_blend
             )
 
         if verbose:
@@ -421,7 +466,10 @@ class DataGenerator:
             print(f"  {stats.total_positions:,} total positions" +
                   (" (includes augmentation)" if augment else ""))
             print(f"  Balance ratio: {stats.balance_ratio:.2f} (1.0 = perfect)")
-            print(f"  Labels: {'search scores' if use_search_scores else 'game outcomes'}")
+            if lambda_blend is not None:
+                print(f"  Labels: lambda blend ({lambda_blend:.2f} eval + {1-lambda_blend:.2f} outcome)")
+            else:
+                print(f"  Labels: {'search scores' if use_search_scores else 'game outcomes'}")
 
         # Build final tensors
         if not chunks_X:
@@ -441,7 +489,7 @@ class DataGenerator:
     def _generate_sequential(
         self, num_games, depth, random_opening_moves, use_search_scores,
         augment, verbose, save_every, save_path, config,
-        chunks_X, chunks_y, stats, start_time
+        chunks_X, chunks_y, stats, start_time, lambda_blend=None
     ):
         """Sequential game generation (single process)."""
         pending_X: List[torch.Tensor] = []
@@ -465,7 +513,13 @@ class DataGenerator:
                 stats.draws += 1
 
             for pos_data in result.positions:
-                label = pos_data.search_score if use_search_scores else result.outcome
+                # Lambda blend: mix search scores with game outcomes
+                if lambda_blend is not None:
+                    label = lambda_blend * pos_data.search_score + (1 - lambda_blend) * result.outcome
+                elif use_search_scores:
+                    label = pos_data.search_score
+                else:
+                    label = result.outcome
 
                 tensor = board_to_tensor(
                     pos_data.board,
@@ -514,7 +568,7 @@ class DataGenerator:
     def _generate_parallel(
         self, num_games, depth, random_opening_moves, use_search_scores,
         augment, verbose, save_every, save_path, config, workers, nnue_path,
-        chunks_X, chunks_y, stats, start_time
+        chunks_X, chunks_y, stats, start_time, lambda_blend=None
     ):
         """Parallel game generation using multiprocessing.Pool."""
         batch_size = save_every if save_every > 0 else num_games
@@ -532,7 +586,8 @@ class DataGenerator:
                 if n > 0:
                     worker_args.append((
                         n, depth, random_opening_moves,
-                        use_search_scores, augment, nnue_path
+                        use_search_scores, augment, nnue_path,
+                        lambda_blend
                     ))
 
             # Run batch in parallel
@@ -626,7 +681,7 @@ def _generate_games_worker(args):
     Each worker creates its own DataGenerator with its own Engine instance.
     Returns numpy arrays to avoid torch tensor pickling issues.
     """
-    num_games, depth, random_moves, use_search_scores, augment, nnue_path = args
+    num_games, depth, random_moves, use_search_scores, augment, nnue_path, lambda_blend = args
 
     gen = DataGenerator(nnue_path=nnue_path)
 
@@ -645,7 +700,13 @@ def _generate_games_worker(args):
             draws += 1
 
         for pos_data in result.positions:
-            label = pos_data.search_score if use_search_scores else result.outcome
+            # Lambda blend: mix search scores with game outcomes
+            if lambda_blend is not None:
+                label = lambda_blend * pos_data.search_score + (1 - lambda_blend) * result.outcome
+            elif use_search_scores:
+                label = pos_data.search_score
+            else:
+                label = result.outcome
 
             tensor = board_to_tensor(
                 pos_data.board,
@@ -860,7 +921,10 @@ def train_nnue(
     save_every: int = 0,
     generate_only: bool = False,
     workers: int = 1,
-    no_relational: bool = False
+    no_relational: bool = False,
+    batch_size: int = 128,
+    rescale_labels: Optional[float] = None,
+    lambda_blend: Optional[float] = None
 ) -> Optional[TonnesjakkNNUE]:
     """
     Complete NNUE training pipeline.
@@ -887,7 +951,7 @@ def train_nnue(
     print(f"\nSettings:")
     print(f"  Architecture: {input_size} -> {hidden1} -> {hidden2} -> 1")
     if no_relational:
-        print(f"  Features: {BASE_FEATURES} base (no relational — 16x faster eval)")
+        print(f"  Features: {BASE_FEATURES} base (no relational)")
     else:
         print(f"  Features: {BASE_FEATURES} base + {RELATIONAL_FEATURES} relational")
 
@@ -899,6 +963,12 @@ def train_nnue(
         print(f"  {stats}")
         if loaded_config:
             print(f"  Original config: {loaded_config.get('games', '?')} games, depth {loaded_config.get('depth', '?')}")
+
+        # Rescale labels (e.g. fix /10000 -> /1000 normalization on old data)
+        if rescale_labels is not None and rescale_labels != 1.0:
+            print(f"  Rescaling labels by {rescale_labels}x (old range: [{y.min():.4f}, {y.max():.4f}])")
+            y = torch.clamp(y * rescale_labels, -1.0, 1.0)
+            print(f"  New range: [{y.min():.4f}, {y.max():.4f}], std={y.std():.4f}")
 
         # Slice off relational features if training without them
         if no_relational and X.shape[1] > BASE_FEATURES:
@@ -912,7 +982,12 @@ def train_nnue(
             print(f"  Self-play eval: NNUE ({use_nnue})")
         else:
             print(f"  Self-play eval: Heuristic")
-        print(f"  Labels: {'search scores' if use_search_scores else 'game outcomes'}")
+        if lambda_blend is not None:
+            print(f"  Labels: lambda blend ({lambda_blend:.2f} * search_score + {1-lambda_blend:.2f} * outcome)")
+        else:
+            print(f"  Labels: {'search scores' if use_search_scores else 'game outcomes'}")
+        print(f"  Score normalization: tanh(score / {SCORE_SCALING})")
+        print(f"  Quiet filtering: skip first 4 moves, skip |score| > 3000")
         print(f"  Augmentation: {'enabled (2x data)' if augment else 'disabled'}")
         if workers > 1:
             print(f"  Workers: {workers}")
@@ -931,7 +1006,9 @@ def train_nnue(
             "use_nnue": use_nnue,
             "use_search_scores": use_search_scores,
             "augment": augment,
-            "input_size": INPUT_SIZE
+            "input_size": INPUT_SIZE,
+            "score_scaling": SCORE_SCALING,
+            "lambda_blend": lambda_blend,
         }
         X, y, stats = generator.generate_dataset(
             num_games=num_games,
@@ -942,7 +1019,8 @@ def train_nnue(
             save_every=save_every,
             save_path=save_data,
             config=config,
-            workers=workers
+            workers=workers,
+            lambda_blend=lambda_blend
         )
 
         if generate_only:
@@ -962,7 +1040,8 @@ def train_nnue(
         hidden1=hidden1,
         hidden2=hidden2,
         input_size=input_size,
-        epochs=epochs
+        epochs=epochs,
+        batch_size=batch_size
     )
 
     # Step 3: Export
@@ -1351,6 +1430,8 @@ Examples:
                         help="Hidden layer sizes (default: 64 32)")
     parser.add_argument("--epochs", type=int, default=50,
                         help="Training epochs (default: 50)")
+    parser.add_argument("--batch-size", type=int, default=128,
+                        help="Training batch size (default: 128, try 1024 for faster training)")
     parser.add_argument("--output", type=str, default=".",
                         help="Output directory (default: current)")
     parser.add_argument("--use-nnue", type=str, default=None,
@@ -1379,6 +1460,10 @@ Examples:
                         help="Show training history and exit")
     parser.add_argument("--no-relational", action="store_true",
                         help="Train without relational features (144 inputs instead of 147)")
+    parser.add_argument("--rescale-labels", type=float, default=None,
+                        help="Multiply labels by this factor (e.g. 10 to fix /10000 -> /1000 normalization)")
+    parser.add_argument("--lambda", type=float, default=None, dest="lambda_blend",
+                        help="Lambda blend: mix search scores and game outcomes (0.85 = 85%% eval + 15%% outcome)")
     parser.add_argument("--compare", type=str, nargs=2, metavar=("NNUE_A", "NNUE_B"),
                         help="Compare two NNUE versions (use 'heuristic' for no NNUE)")
     parser.add_argument("--compare-timed", type=str, nargs=3, metavar=("MS", "NNUE_A", "NNUE_B"),
@@ -1440,7 +1525,10 @@ Examples:
             save_every=args.save_every,
             generate_only=args.generate_only,
             workers=args.workers,
-            no_relational=args.no_relational
+            no_relational=args.no_relational,
+            batch_size=args.batch_size,
+            rescale_labels=args.rescale_labels,
+            lambda_blend=args.lambda_blend
         )
 
 

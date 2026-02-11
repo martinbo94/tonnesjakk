@@ -25,13 +25,17 @@ pub const TT_SIZE: usize = 1 << 20; // ~1 million entries
 // NNUE feature sizes
 /// Base features: 6x6 board * 4 piece types = 144
 pub const BASE_FEATURES: usize = NUM_SQUARES * 4;
-/// Relational features (only cheap, non-inferable ones):
-///   - White barrels scored (1) - can't infer from position alone
-///   - Black barrels scored (1) - can't infer from position alone
-///   - Current player (1) - not encoded in base features
-pub const RELATIONAL_FEATURES: usize = 3;
+/// Relational features (13 total):
+///   [0-3]  White barrel distances to goal (normalized 0-1, closest first)
+///   [4-7]  Black barrel distances to goal (normalized 0-1, closest first)
+///   [8]    White barrels scored (normalized 0-1)
+///   [9]    Black barrels scored (normalized 0-1)
+///   [10]   White pail placed (0 or 1)
+///   [11]   Black pail placed (0 or 1)
+///   [12]   Current player (+1 white, -1 black)
+pub const RELATIONAL_FEATURES: usize = 13;
 /// Total input features to NNUE
-pub const INPUT_SIZE: usize = BASE_FEATURES + RELATIONAL_FEATURES; // 147
+pub const INPUT_SIZE: usize = BASE_FEATURES + RELATIONAL_FEATURES; // 157
 
 
 // ============================================================================
@@ -2213,7 +2217,7 @@ impl AccumulatorStack {
 ///
 /// Supports two architectures:
 ///   - Legacy (144 features): Base position features only
-///   - Enhanced (157 features): Base + relational features
+///   - Enhanced (157 features): Base + 13 relational features (distances, scored, pails, player)
 pub struct IncrementalNNUE {
     // Vekter (delt med standard NNUE)
     fc1_weight: Vec<f32>,  // [hidden1 * input_size] where input_size is 144 or 157
@@ -2267,16 +2271,71 @@ impl IncrementalNNUE {
         })
     }
 
-    /// Compute and add relational features (only cheap, non-inferable features)
+    /// Compute 13 relational features from a BitBoard position.
     ///
-    /// Relational features (3 total):
-    ///   - White barrels scored (1): normalized by 4 - can't infer from position
-    ///   - Black barrels scored (1): normalized by 4 - can't infer from position
-    ///   - Current player (1): +1 white, -1 black - not in base features
-    ///
-    /// Removed (can be learned from base features):
-    ///   - Barrel distances (NN can learn row 0/5 are goals)
-    ///   - Pail placed (if pail is on board, it's placed)
+    /// Features (13 total):
+    ///   [0-3]  White barrel distances to goal (normalized 0-1, closest first)
+    ///   [4-7]  Black barrel distances to goal (normalized 0-1, closest first)
+    ///   [8]    White barrels scored (normalized 0-1)
+    ///   [9]    Black barrels scored (normalized 0-1)
+    ///   [10]   White pail placed (0 or 1)
+    ///   [11]   Black pail placed (0 or 1)
+    ///   [12]   Current player (+1 white, -1 black)
+    #[inline]
+    fn compute_relational_features(bb: &BitBoard) -> [f32; 13] {
+        let mut features = [0.0f32; 13];
+
+        // White barrel distances to goal (row 0 is goal, distance = row)
+        // Sort ascending by distance, then feature = 1.0 - normalized_dist
+        let mut white_dists = [0.0f32; 4];
+        let mut n_white = 0usize;
+        let mut barrels = bb.white_barrels;
+        while barrels != 0 && n_white < 4 {
+            let sq = barrels.trailing_zeros() as usize;
+            let row = sq / 6;
+            white_dists[n_white] = row as f32 / 5.0;
+            n_white += 1;
+            barrels &= barrels - 1;
+        }
+        white_dists[..n_white].sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
+        for i in 0..n_white {
+            features[i] = 1.0 - white_dists[i];
+        }
+
+        // Black barrel distances to goal (row 5 is goal, distance = 5 - row)
+        let mut black_dists = [0.0f32; 4];
+        let mut n_black = 0usize;
+        barrels = bb.black_barrels;
+        while barrels != 0 && n_black < 4 {
+            let sq = barrels.trailing_zeros() as usize;
+            let row = sq / 6;
+            black_dists[n_black] = (5 - row) as f32 / 5.0;
+            n_black += 1;
+            barrels &= barrels - 1;
+        }
+        black_dists[..n_black].sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
+        for i in 0..n_black {
+            features[4 + i] = 1.0 - black_dists[i];
+        }
+
+        // Scored barrels (normalized by 4)
+        features[8] = bb.white_scored as f32 / 4.0;
+        features[9] = bb.black_scored as f32 / 4.0;
+
+        // Pails placed
+        features[10] = if bb.white_pail != 0 { 1.0 } else { 0.0 };
+        features[11] = if bb.black_pail != 0 { 1.0 } else { 0.0 };
+
+        // Current player
+        features[12] = match bb.current_player {
+            Player::White => 1.0,
+            Player::Black => -1.0,
+        };
+
+        features
+    }
+
+    /// Add relational features to accumulator using SIMD-optimized transposed weights.
     #[inline]
     fn add_relational_features(&self, bb: &BitBoard, acc: &mut Accumulator) {
         if self.input_size <= BASE_FEATURES {
@@ -2285,16 +2344,7 @@ impl IncrementalNNUE {
 
         let hidden1 = self.hidden1;
         let base = BASE_FEATURES;
-
-        // Only 3 cheap features - no loops, no sorting, just memory reads
-        let rel_features: [f32; 3] = [
-            bb.white_scored as f32 / 4.0,  // [0] White scored (0.0 - 1.0)
-            bb.black_scored as f32 / 4.0,  // [1] Black scored (0.0 - 1.0)
-            match bb.current_player {       // [2] Current player
-                Player::White => 1.0,
-                Player::Black => -1.0,
-            },
-        ];
+        let rel_features = Self::compute_relational_features(bb);
 
         // Add contribution of relational features to accumulator using transposed weights
         for (feat_idx, &feat_val) in rel_features.iter().enumerate() {
@@ -2302,7 +2352,7 @@ impl IncrementalNNUE {
                 continue; // Skip zero features
             }
             let weight_idx = base + feat_idx;
-            let base_idx = weight_idx * hidden1;  // Contiguous weights
+            let base_idx = weight_idx * hidden1;  // Contiguous in transposed layout
 
             // SIMD loop: process 8 elements at a time
             let scale_vec = f32x8::splat(feat_val);
@@ -2693,26 +2743,8 @@ impl IncrementalNNUE {
         // Copy pre_activation from base accumulator
         eval_acc.pre_activation = base_acc.pre_activation;
 
-        // Add relational features (cheap - only 3 features now)
-        if self.input_size > BASE_FEATURES {
-            let input_size = self.input_size;
-            let base = BASE_FEATURES;
-            let rel_features: [f32; 3] = [
-                bb.white_scored as f32 / 4.0,
-                bb.black_scored as f32 / 4.0,
-                match bb.current_player {
-                    Player::White => 1.0,
-                    Player::Black => -1.0,
-                },
-            ];
-            for (feat_idx, &feat_val) in rel_features.iter().enumerate() {
-                if feat_val == 0.0 { continue; }
-                let weight_idx = base + feat_idx;
-                for i in 0..self.hidden1 {
-                    eval_acc.pre_activation[i] += feat_val * self.fc1_weight[i * input_size + weight_idx];
-                }
-            }
-        }
+        // Add relational features using SIMD-optimized path
+        self.add_relational_features(bb, eval_acc);
 
         // Apply ReLU and evaluate
         eval_acc.apply_relu();
@@ -3103,23 +3135,7 @@ impl BitBoardEngine {
             eval_acc.pre_activation = pre_activation;
 
             if !self.skip_relational && nnue.input_size > BASE_FEATURES {
-                let input_size = nnue.input_size;
-                let base = BASE_FEATURES;
-                let rel_features: [f32; 3] = [
-                    bb.white_scored as f32 / 4.0,
-                    bb.black_scored as f32 / 4.0,
-                    match bb.current_player {
-                        Player::White => 1.0,
-                        Player::Black => -1.0,
-                    },
-                ];
-                for (feat_idx, &feat_val) in rel_features.iter().enumerate() {
-                    if feat_val == 0.0 { continue; }
-                    let weight_idx = base + feat_idx;
-                    for i in 0..nnue.hidden1 {
-                        eval_acc.pre_activation[i] += feat_val * nnue.fc1_weight[i * input_size + weight_idx];
-                    }
-                }
+                nnue.add_relational_features(bb, eval_acc);
             }
 
             eval_acc.apply_relu();
