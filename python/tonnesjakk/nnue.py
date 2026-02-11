@@ -19,6 +19,7 @@ Usage:
 """
 
 import json
+import multiprocessing
 import random
 import time
 import argparse
@@ -57,20 +58,21 @@ class TonnesjakkNNUE(nn.Module):
     NNUE-inspired network for Tonnesjakk.
 
     Architecture options:
-        - 144 -> 64 -> 32 -> 1  (default, ~11K params)
-        - 144 -> 128 -> 32 -> 1 (wider, ~21K params)
-        - 144 -> 64 -> 16 -> 1  (narrower, ~10K params)
+        - 144 -> 64 -> 32 -> 1  (no relational, ~11K params)
+        - 147 -> 64 -> 32 -> 1  (with relational, ~11K params)
+        - 147 -> 128 -> 32 -> 1 (wider, ~21K params)
 
     The first layer is most important - it learns piece-square relationships.
     """
 
-    def __init__(self, hidden1: int = 64, hidden2: int = 32):
+    def __init__(self, hidden1: int = 64, hidden2: int = 32, input_size: int = INPUT_SIZE):
         super().__init__()
         self.hidden1 = hidden1
         self.hidden2 = hidden2
+        self.input_size = input_size
 
         self.net = nn.Sequential(
-            nn.Linear(INPUT_SIZE, hidden1),
+            nn.Linear(input_size, hidden1),
             nn.ReLU(),
             nn.Linear(hidden1, hidden2),
             nn.ReLU(),
@@ -144,8 +146,8 @@ def flip_board_horizontal(board_array: List[List[int]]) -> List[List[int]]:
     return [[board_array[r][5 - c] for c in range(6)] for r in range(6)]
 
 
-def board_to_tensor_simple(board_array: List[List[int]]) -> torch.Tensor:
-    """Simple version for backward compatibility (base features only)."""
+def board_to_tensor_base_only(board_array: List[List[int]]) -> torch.Tensor:
+    """Base features only (144-dim). No relational features, no padding."""
     x = np.zeros((BOARD_SIZE, BOARD_SIZE, NUM_PIECE_TYPES), dtype=np.float32)
     for row in range(BOARD_SIZE):
         for col in range(BOARD_SIZE):
@@ -158,9 +160,14 @@ def board_to_tensor_simple(board_array: List[List[int]]) -> torch.Tensor:
                 x[row, col, 2] = 1.0
             elif val == -2:
                 x[row, col, 3] = 1.0
+    return torch.from_numpy(x.flatten())
+
+
+def board_to_tensor_simple(board_array: List[List[int]]) -> torch.Tensor:
+    """Simple version for backward compatibility (base features only, padded to 147)."""
+    features = board_to_tensor_base_only(board_array)
     # Pad with zeros for relational features
-    features = np.concatenate([x.flatten(), np.zeros(RELATIONAL_FEATURES, dtype=np.float32)])
-    return torch.from_numpy(features)
+    return torch.cat([features, torch.zeros(RELATIONAL_FEATURES)])
 
 
 # =============================================================================
@@ -237,6 +244,7 @@ class DataGenerator:
         # Single reusable engine - avoids memory issues with multiple engine instances
         self._engine = Engine()
         self._using_nnue = False
+        self._nnue_path = nnue_path
 
         if nnue_path is not None:
             try:
@@ -336,10 +344,13 @@ class DataGenerator:
         verbose: bool = True,
         save_every: int = 0,
         save_path: Optional[str] = None,
-        config: Optional[Dict] = None
+        config: Optional[Dict] = None,
+        workers: int = 1
     ) -> Tuple[torch.Tensor, torch.Tensor, TrainingStats]:
         """
         Generate training dataset from self-play games.
+
+        Automatically resumes from save_path if it exists, appending new data.
 
         Args:
             num_games: Number of games to play
@@ -351,76 +362,57 @@ class DataGenerator:
             save_every: Save checkpoint every N games (0 = disabled)
             save_path: Path for checkpoint saves (required if save_every > 0)
             config: Config dict to store alongside the checkpoint
+            workers: Number of parallel worker processes (1 = sequential)
 
         Returns:
             (X, y, stats) - input tensors, labels, and statistics
         """
-        all_X = []
-        all_y = []
+        chunks_X: List[torch.Tensor] = []
+        chunks_y: List[torch.Tensor] = []
         stats = TrainingStats()
 
-        start_time = time.time()
-        last_save_time = start_time
-
-        for game_num in range(num_games):
-            result = self.play_game(depth, random_opening_moves)
-
-            # Update statistics
-            if result.outcome > 0.5:
-                stats.white_wins += 1
-            elif result.outcome < -0.5:
-                stats.black_wins += 1
-            else:
-                stats.draws += 1
-
-            # Process each position with search scores and context
-            for pos_data in result.positions:
-                # Use search score (more precise) or game outcome (smoother)
-                label = pos_data.search_score if use_search_scores else result.outcome
-
-                # Original position
-                tensor = board_to_tensor(
-                    pos_data.board,
-                    white_scored=pos_data.white_scored,
-                    black_scored=pos_data.black_scored,
-                    current_player=pos_data.current_player
-                )
-                all_X.append(tensor)
-                all_y.append(label)
-
-                # Augmented (horizontally flipped) position - exploits board symmetry
-                if augment:
-                    flipped_board = flip_board_horizontal(pos_data.board)
-                    flipped_tensor = board_to_tensor(
-                        flipped_board,
-                        white_scored=pos_data.white_scored,
-                        black_scored=pos_data.black_scored,
-                        current_player=pos_data.current_player
-                    )
-                    all_X.append(flipped_tensor)
-                    all_y.append(label)  # Same label (score doesn't change with flip)
-
-            stats.total_positions = len(all_X)
-
-            # Progress reporting - every 50 games for visibility
-            if verbose and (game_num + 1) % 50 == 0:
-                elapsed = time.time() - start_time
-                gps = (game_num + 1) / elapsed
-                eta = (num_games - game_num - 1) / gps
-                aug_note = " (2x augmented)" if augment else ""
-                print(f"  Game {game_num + 1:5d}/{num_games} "
-                      f"({gps:.1f}/s, ETA {eta/60:.1f}m) | "
-                      f"{stats} | {stats.total_positions:,} positions{aug_note}", flush=True)
-
-            # Periodic checkpoint save
-            if save_every > 0 and save_path and (game_num + 1) % save_every == 0:
-                save_start = time.time()
-                X_tmp = torch.stack(all_X)
-                y_tmp = torch.tensor(all_y, dtype=torch.float32).unsqueeze(1)
-                self.save_dataset(X_tmp, y_tmp, stats, save_path, config)
-                save_elapsed = time.time() - save_start
+        # Resume from existing file if present
+        if save_path and Path(save_path).exists():
+            try:
+                prev_X, prev_y, prev_stats, prev_config = self.load_dataset(save_path)
+                chunks_X.append(prev_X)
+                chunks_y.append(prev_y)
+                stats.white_wins = prev_stats.white_wins
+                stats.black_wins = prev_stats.black_wins
+                stats.draws = prev_stats.draws
+                stats.total_positions = prev_stats.total_positions
                 if verbose:
-                    print(f"  >> Checkpoint saved ({stats.total_positions:,} positions, {save_elapsed:.1f}s)", flush=True)
+                    prev_games = prev_stats.white_wins + prev_stats.black_wins + prev_stats.draws
+                    print(f"  Resuming from {save_path}: {len(prev_X):,} positions from {prev_games} games")
+            except Exception as e:
+                if verbose:
+                    print(f"  Could not resume from {save_path}: {e}")
+
+        nnue_path = None
+        if self._using_nnue:
+            nnue_path = getattr(self, '_nnue_path', None)
+
+        start_time = time.time()
+
+        if workers > 1:
+            self._generate_parallel(
+                num_games=num_games, depth=depth,
+                random_opening_moves=random_opening_moves,
+                use_search_scores=use_search_scores, augment=augment,
+                verbose=verbose, save_every=save_every, save_path=save_path,
+                config=config, workers=workers, nnue_path=nnue_path,
+                chunks_X=chunks_X, chunks_y=chunks_y, stats=stats,
+                start_time=start_time
+            )
+        else:
+            self._generate_sequential(
+                num_games=num_games, depth=depth,
+                random_opening_moves=random_opening_moves,
+                use_search_scores=use_search_scores, augment=augment,
+                verbose=verbose, save_every=save_every, save_path=save_path,
+                config=config, chunks_X=chunks_X, chunks_y=chunks_y,
+                stats=stats, start_time=start_time
+            )
 
         if verbose:
             elapsed = time.time() - start_time
@@ -431,9 +423,12 @@ class DataGenerator:
             print(f"  Balance ratio: {stats.balance_ratio:.2f} (1.0 = perfect)")
             print(f"  Labels: {'search scores' if use_search_scores else 'game outcomes'}")
 
-        # Convert to tensors
-        X = torch.stack(all_X)
-        y = torch.tensor(all_y, dtype=torch.float32).unsqueeze(1)
+        # Build final tensors
+        if not chunks_X:
+            X, y = torch.zeros(0, INPUT_SIZE), torch.zeros(0, 1)
+        else:
+            X = torch.cat(chunks_X, dim=0)
+            y = torch.cat(chunks_y, dim=0)
 
         # Final save
         if save_path:
@@ -442,6 +437,139 @@ class DataGenerator:
                 print(f"  Saved dataset to: {save_path}")
 
         return X, y, stats
+
+    def _generate_sequential(
+        self, num_games, depth, random_opening_moves, use_search_scores,
+        augment, verbose, save_every, save_path, config,
+        chunks_X, chunks_y, stats, start_time
+    ):
+        """Sequential game generation (single process)."""
+        pending_X: List[torch.Tensor] = []
+        pending_y: List[float] = []
+
+        def _compact_pending():
+            if pending_X:
+                chunks_X.append(torch.stack(pending_X))
+                chunks_y.append(torch.tensor(pending_y, dtype=torch.float32).unsqueeze(1))
+                pending_X.clear()
+                pending_y.clear()
+
+        for game_num in range(num_games):
+            result = self.play_game(depth, random_opening_moves)
+
+            if result.outcome > 0.5:
+                stats.white_wins += 1
+            elif result.outcome < -0.5:
+                stats.black_wins += 1
+            else:
+                stats.draws += 1
+
+            for pos_data in result.positions:
+                label = pos_data.search_score if use_search_scores else result.outcome
+
+                tensor = board_to_tensor(
+                    pos_data.board,
+                    white_scored=pos_data.white_scored,
+                    black_scored=pos_data.black_scored,
+                    current_player=pos_data.current_player
+                )
+                pending_X.append(tensor)
+                pending_y.append(label)
+
+                if augment:
+                    flipped_board = flip_board_horizontal(pos_data.board)
+                    flipped_tensor = board_to_tensor(
+                        flipped_board,
+                        white_scored=pos_data.white_scored,
+                        black_scored=pos_data.black_scored,
+                        current_player=pos_data.current_player
+                    )
+                    pending_X.append(flipped_tensor)
+                    pending_y.append(label)
+
+            stats.total_positions = sum(c.shape[0] for c in chunks_X) + len(pending_X)
+
+            if verbose and (game_num + 1) % 50 == 0:
+                elapsed = time.time() - start_time
+                gps = (game_num + 1) / elapsed
+                eta = (num_games - game_num - 1) / gps
+                aug_note = " (2x augmented)" if augment else ""
+                print(f"  Game {game_num + 1:5d}/{num_games} "
+                      f"({gps:.1f}/s, ETA {eta/60:.1f}m) | "
+                      f"{stats} | {stats.total_positions:,} positions{aug_note}", flush=True)
+
+            if save_every > 0 and save_path and (game_num + 1) % save_every == 0:
+                _compact_pending()
+                save_start = time.time()
+                X_all = torch.cat(chunks_X, dim=0) if chunks_X else torch.zeros(0, INPUT_SIZE)
+                y_all = torch.cat(chunks_y, dim=0) if chunks_y else torch.zeros(0, 1)
+                self.save_dataset(X_all, y_all, stats, save_path, config)
+                save_elapsed = time.time() - save_start
+                if verbose:
+                    print(f"  >> Checkpoint saved ({stats.total_positions:,} positions, {save_elapsed:.1f}s)", flush=True)
+
+        # Compact any remaining pending tensors
+        _compact_pending()
+
+    def _generate_parallel(
+        self, num_games, depth, random_opening_moves, use_search_scores,
+        augment, verbose, save_every, save_path, config, workers, nnue_path,
+        chunks_X, chunks_y, stats, start_time
+    ):
+        """Parallel game generation using multiprocessing.Pool."""
+        batch_size = save_every if save_every > 0 else num_games
+        games_done = 0
+
+        while games_done < num_games:
+            batch = min(batch_size, num_games - games_done)
+
+            # Split batch across workers
+            per_worker = batch // workers
+            remainder = batch % workers
+            worker_args = []
+            for w in range(workers):
+                n = per_worker + (1 if w < remainder else 0)
+                if n > 0:
+                    worker_args.append((
+                        n, depth, random_opening_moves,
+                        use_search_scores, augment, nnue_path
+                    ))
+
+            # Run batch in parallel
+            with multiprocessing.Pool(processes=len(worker_args)) as pool:
+                results = pool.map(_generate_games_worker, worker_args)
+
+            # Merge results from all workers
+            for X_np, y_np, ww, bw, dw in results:
+                if len(X_np) > 0:
+                    chunks_X.append(torch.tensor(X_np, dtype=torch.float32))
+                    chunks_y.append(torch.tensor(y_np, dtype=torch.float32).unsqueeze(1))
+                stats.white_wins += ww
+                stats.black_wins += bw
+                stats.draws += dw
+
+            games_done += batch
+            stats.total_positions = sum(c.shape[0] for c in chunks_X)
+
+            # Progress + checkpoint
+            elapsed = time.time() - start_time
+            gps = games_done / elapsed
+            eta = (num_games - games_done) / gps if gps > 0 else 0
+            aug_note = " (2x augmented)" if augment else ""
+
+            if verbose:
+                print(f"  Game {games_done:5d}/{num_games} "
+                      f"({gps:.1f}/s, ETA {eta/60:.1f}m, {workers}w) | "
+                      f"{stats} | {stats.total_positions:,} positions{aug_note}", flush=True)
+
+            if save_every > 0 and save_path:
+                save_start = time.time()
+                X_all = torch.cat(chunks_X, dim=0) if chunks_X else torch.zeros(0, INPUT_SIZE)
+                y_all = torch.cat(chunks_y, dim=0) if chunks_y else torch.zeros(0, 1)
+                self.save_dataset(X_all, y_all, stats, save_path, config)
+                save_elapsed = time.time() - save_start
+                if verbose:
+                    print(f"  >> Checkpoint saved ({stats.total_positions:,} positions, {save_elapsed:.1f}s)", flush=True)
 
     def save_dataset(
         self,
@@ -488,6 +616,68 @@ class DataGenerator:
 
 
 # =============================================================================
+# Multiprocessing worker (top-level for pickling on Windows)
+# =============================================================================
+
+def _generate_games_worker(args):
+    """Worker function for parallel game generation.
+
+    Must be top-level (not a method) so it's picklable on Windows (spawn).
+    Each worker creates its own DataGenerator with its own Engine instance.
+    Returns numpy arrays to avoid torch tensor pickling issues.
+    """
+    num_games, depth, random_moves, use_search_scores, augment, nnue_path = args
+
+    gen = DataGenerator(nnue_path=nnue_path)
+
+    all_X = []
+    all_y = []
+    white_wins = black_wins = draws = 0
+
+    for _ in range(num_games):
+        result = gen.play_game(depth, random_moves)
+
+        if result.outcome > 0.5:
+            white_wins += 1
+        elif result.outcome < -0.5:
+            black_wins += 1
+        else:
+            draws += 1
+
+        for pos_data in result.positions:
+            label = pos_data.search_score if use_search_scores else result.outcome
+
+            tensor = board_to_tensor(
+                pos_data.board,
+                white_scored=pos_data.white_scored,
+                black_scored=pos_data.black_scored,
+                current_player=pos_data.current_player
+            )
+            all_X.append(tensor)
+            all_y.append(label)
+
+            if augment:
+                flipped_board = flip_board_horizontal(pos_data.board)
+                flipped_tensor = board_to_tensor(
+                    flipped_board,
+                    white_scored=pos_data.white_scored,
+                    black_scored=pos_data.black_scored,
+                    current_player=pos_data.current_player
+                )
+                all_X.append(flipped_tensor)
+                all_y.append(label)
+
+    if all_X:
+        X_np = torch.stack(all_X).numpy()
+        y_np = np.array(all_y, dtype=np.float32)
+    else:
+        X_np = np.zeros((0, INPUT_SIZE), dtype=np.float32)
+        y_np = np.zeros(0, dtype=np.float32)
+
+    return X_np, y_np, white_wins, black_wins, draws
+
+
+# =============================================================================
 # Training
 # =============================================================================
 
@@ -496,6 +686,7 @@ def train_model(
     y: torch.Tensor,
     hidden1: int = 64,
     hidden2: int = 32,
+    input_size: int = INPUT_SIZE,
     epochs: int = 50,
     batch_size: int = 128,
     learning_rate: float = 0.001,
@@ -506,10 +697,11 @@ def train_model(
     Train the NNUE model.
 
     Args:
-        X: Input tensor (N, 144)
+        X: Input tensor (N, input_size)
         y: Labels (N, 1)
         hidden1: First hidden layer size
         hidden2: Second hidden layer size
+        input_size: Number of input features (144 base or 147 with relational)
         epochs: Number of training epochs
         batch_size: Mini-batch size
         learning_rate: Adam learning rate
@@ -536,9 +728,9 @@ def train_model(
         print(f"  Validation set: {len(X_val):,} positions")
 
     # Create model
-    model = TonnesjakkNNUE(hidden1, hidden2)
+    model = TonnesjakkNNUE(hidden1, hidden2, input_size=input_size)
     if verbose:
-        print(f"  Model: {INPUT_SIZE} -> {hidden1} -> {hidden2} -> 1 "
+        print(f"  Model: {input_size} -> {hidden1} -> {hidden2} -> 1 "
               f"({model.num_parameters:,} parameters)")
 
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
@@ -592,9 +784,9 @@ def train_model(
         else:
             marker = ""
 
-        if verbose and ((epoch + 1) % 10 == 0 or epoch == 0):
+        if verbose:
             print(f"  Epoch {epoch+1:3d}/{epochs}: "
-                  f"train={train_loss:.4f}, val={val_loss:.4f}{marker}")
+                  f"train={train_loss:.4f}, val={val_loss:.4f}{marker}", flush=True)
 
     # Restore best model
     if best_model_state is not None:
@@ -666,7 +858,9 @@ def train_nnue(
     save_data: Optional[str] = None,
     load_data: Optional[str] = None,
     save_every: int = 0,
-    generate_only: bool = False
+    generate_only: bool = False,
+    workers: int = 1,
+    no_relational: bool = False
 ) -> Optional[TonnesjakkNNUE]:
     """
     Complete NNUE training pipeline.
@@ -683,21 +877,33 @@ def train_nnue(
     - save_data: Save generated positions to file for reuse
     - load_data: Load positions from file instead of generating
     """
+    # Determine input size based on relational feature mode
+    input_size = BASE_FEATURES if no_relational else INPUT_SIZE
+    rel_count = 0 if no_relational else RELATIONAL_FEATURES
+
     print("=" * 60)
     print("NNUE TRAINING FOR TONNESJAKK")
     print("=" * 60)
     print(f"\nSettings:")
-    print(f"  Architecture: {INPUT_SIZE} -> {hidden1} -> {hidden2} -> 1")
-    print(f"  Features: {BASE_FEATURES} base + {RELATIONAL_FEATURES} relational")
+    print(f"  Architecture: {input_size} -> {hidden1} -> {hidden2} -> 1")
+    if no_relational:
+        print(f"  Features: {BASE_FEATURES} base (no relational — 16x faster eval)")
+    else:
+        print(f"  Features: {BASE_FEATURES} base + {RELATIONAL_FEATURES} relational")
 
     # Step 1: Generate or load data
     if load_data:
         print(f"\n[1/3] Loading training data from {load_data}...")
         X, y, stats, loaded_config = DataGenerator.load_dataset(load_data)
-        print(f"  Loaded {len(X):,} positions")
+        print(f"  Loaded {len(X):,} positions (features: {X.shape[1]})")
         print(f"  {stats}")
         if loaded_config:
             print(f"  Original config: {loaded_config.get('games', '?')} games, depth {loaded_config.get('depth', '?')}")
+
+        # Slice off relational features if training without them
+        if no_relational and X.shape[1] > BASE_FEATURES:
+            print(f"  Slicing features {X.shape[1]} -> {BASE_FEATURES} (dropping relational)")
+            X = X[:, :BASE_FEATURES]
     else:
         print(f"  Games: {num_games:,}")
         print(f"  Search depth: {depth}")
@@ -708,8 +914,10 @@ def train_nnue(
             print(f"  Self-play eval: Heuristic")
         print(f"  Labels: {'search scores' if use_search_scores else 'game outcomes'}")
         print(f"  Augmentation: {'enabled (2x data)' if augment else 'disabled'}")
-        if save_every > 0 and save_data:
-            print(f"  Checkpoint: every {save_every} games -> {save_data}")
+        if workers > 1:
+            print(f"  Workers: {workers}")
+        if save_data:
+            print(f"  Save to: {save_data}" + (f" (every {save_every} games)" if save_every > 0 else ""))
         if generate_only:
             print(f"  Mode: GENERATE ONLY (no training)")
 
@@ -733,7 +941,8 @@ def train_nnue(
             augment=augment,
             save_every=save_every,
             save_path=save_data,
-            config=config
+            config=config,
+            workers=workers
         )
 
         if generate_only:
@@ -752,6 +961,7 @@ def train_nnue(
         X, y,
         hidden1=hidden1,
         hidden2=hidden2,
+        input_size=input_size,
         epochs=epochs
     )
 
@@ -836,7 +1046,8 @@ def train_nnue(
             "used_nnue": use_nnue is not None,
             "search_scores": use_search_scores,
             "augment": augment,
-            "input_size": INPUT_SIZE
+            "input_size": input_size,
+            "no_relational": no_relational
         }
         add_training_result(generation, config, comparison, str(history_path))
         print(f"\n  Training history saved (generation {generation})")
@@ -861,6 +1072,7 @@ def compare_nnue(
     nnue_b: str,
     num_games: int = 100,
     depth: int = 6,
+    time_ms: int = 0,
     verbose: bool = True
 ) -> Dict:
     """
@@ -870,7 +1082,8 @@ def compare_nnue(
         nnue_a: Path to first NNUE weights (or "heuristic" for no NNUE)
         nnue_b: Path to second NNUE weights (or "heuristic" for no NNUE)
         num_games: Number of games to play
-        depth: Search depth
+        depth: Search depth (used when time_ms=0)
+        time_ms: Time per move in milliseconds (0 = use fixed depth instead)
 
     Returns:
         Dict with results: wins_a, wins_b, draws, win_rate_a, elo_diff
@@ -884,6 +1097,10 @@ def compare_nnue(
         engine_a.load_nnue(nnue_a)
     if nnue_b != "heuristic":
         engine_b.load_nnue(nnue_b)
+
+    mode_str = f"{time_ms}ms/move" if time_ms > 0 else f"depth {depth}"
+    if verbose:
+        print(f"  Mode: {mode_str}")
 
     wins_a = 0
     wins_b = 0
@@ -916,7 +1133,10 @@ def compare_nnue(
             is_white_turn = "White" in repr(board.current_player)
             current_engine = engine_a if (is_white_turn == white_is_a) else engine_b
 
-            result = current_engine.search(board, depth)
+            if time_ms > 0:
+                result = current_engine.search_timed(board, time_ms)
+            else:
+                result = current_engine.search(board, depth)
             if result.best_move is None:
                 break
             board.make_move(result.best_move)
@@ -1112,11 +1332,11 @@ def main():
         epilog="""
 Examples:
   python -m tonnesjakk.nnue                    # Default training (10K games)
-  python -m tonnesjakk.nnue --games 10000 --depth 8 --save-data data.npz  # Save positions
   python -m tonnesjakk.nnue --load-data data.npz --epochs 100  # Reuse positions
+  python -m tonnesjakk.nnue --load-data data.npz --no-relational  # Train without relational features
   python -m tonnesjakk.nnue --use-nnue nnue_weights.json  # Self-improvement loop
-  python -m tonnesjakk.nnue --history          # Show training history
-  python -m tonnesjakk.nnue --compare nnue_weights.json heuristic  # Compare versions
+  python -m tonnesjakk.nnue --compare a.json b.json --depth 6  # Equal-depth comparison
+  python -m tonnesjakk.nnue --compare-timed 500 a.json b.json  # Equal-time comparison (500ms/move)
         """
     )
 
@@ -1153,10 +1373,16 @@ Examples:
                         help="Save checkpoint every N games during generation (default: 500)")
     parser.add_argument("--generate-only", action="store_true",
                         help="Only generate data (no training). Use with --save-data")
+    parser.add_argument("--workers", type=int, default=1,
+                        help="Number of parallel worker processes (default: 1)")
     parser.add_argument("--history", action="store_true",
                         help="Show training history and exit")
+    parser.add_argument("--no-relational", action="store_true",
+                        help="Train without relational features (144 inputs instead of 147)")
     parser.add_argument("--compare", type=str, nargs=2, metavar=("NNUE_A", "NNUE_B"),
                         help="Compare two NNUE versions (use 'heuristic' for no NNUE)")
+    parser.add_argument("--compare-timed", type=str, nargs=3, metavar=("MS", "NNUE_A", "NNUE_B"),
+                        help="Equal-time comparison: MS per move (use 'heuristic' for no NNUE)")
     parser.add_argument("--test", action="store_true",
                         help="Run quick test")
     parser.add_argument("--benchmark", action="store_true",
@@ -1170,6 +1396,18 @@ Examples:
         benchmark()
     elif args.history:
         print_training_history(str(Path(args.output) / "nnue_history.json"))
+    elif args.compare_timed:
+        ms, nnue_a, nnue_b = int(args.compare_timed[0]), args.compare_timed[1], args.compare_timed[2]
+        print(f"Comparing {nnue_a} vs {nnue_b} ({ms}ms/move, {args.compare_games} games)...")
+        result = compare_nnue(
+            nnue_a, nnue_b,
+            num_games=args.compare_games,
+            time_ms=ms,
+            verbose=True
+        )
+        print(f"\nFinal: A={result['wins_a']} B={result['wins_b']} D={result['draws']}")
+        print(f"Win rate A: {result['win_rate_a']*100:.1f}%")
+        print(f"ELO difference: {result['elo_diff']:+d} (A vs B)")
     elif args.compare:
         print(f"Comparing {args.compare[0]} vs {args.compare[1]} (depth {args.depth})...")
         result = compare_nnue(
@@ -1200,7 +1438,9 @@ Examples:
             save_data=args.save_data,
             load_data=args.load_data,
             save_every=args.save_every,
-            generate_only=args.generate_only
+            generate_only=args.generate_only,
+            workers=args.workers,
+            no_relational=args.no_relational
         )
 
 
