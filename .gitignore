@@ -26,12 +26,21 @@ Cargo.lock
 .DS_Store
 Thumbs.db
 
-# Training artifacts (optional - uncomment to track)
-# nnue_weights.json
-# nnue_weights_gen*.json
-# nnue_model.pt
-# nnue_history.json
-# *.npz
+# Training artifacts
+nnue_weights*.json
+*.pt
+*.npz
+
+# Project docs (kept locally only)
+CLAUDE.md
+ENGINE_IMPROVEMENTS.md
+AGENT_SWARM_INSTRUCTIONS.md
+debug.md
+todo.md
+plan_*.md
+
+# Claude Code settings
+.claude/
 
 # Logs
 *.log
