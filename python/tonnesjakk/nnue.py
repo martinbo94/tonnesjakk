@@ -39,7 +39,7 @@ NUM_PIECE_TYPES = 4  # WhiteBarrel, BlackBarrel, WhitePail, BlackPail
 
 # Feature sizes
 BASE_FEATURES = BOARD_SIZE * BOARD_SIZE * NUM_PIECE_TYPES  # 144 (piece positions)
-# Relational features (13 total):
+# Relational features (20 total):
 #   [0-3]  White barrel distances to goal (4 values, normalized 0-1, closest first)
 #   [4-7]  Black barrel distances to goal (4 values, normalized 0-1, closest first)
 #   [8]    White barrels scored (normalized 0-1)
@@ -47,8 +47,15 @@ BASE_FEATURES = BOARD_SIZE * BOARD_SIZE * NUM_PIECE_TYPES  # 144 (piece position
 #   [10]   White pail placed (0 or 1)
 #   [11]   Black pail placed (0 or 1)
 #   [12]   Current player (+1 white, -1 black)
-RELATIONAL_FEATURES = 13
-INPUT_SIZE = BASE_FEATURES + RELATIONAL_FEATURES  # 157
+#   [13]   White immediate threats (barrels 1 step from scoring, /4)
+#   [14]   Black immediate threats (barrels 1 step from scoring, /4)
+#   [15]   Score differential (white_scored - black_scored) / 4, range -1 to +1
+#   [16]   White barrels on board / 4
+#   [17]   Black barrels on board / 4
+#   [18]   White pail blocking count / 4
+#   [19]   Black pail blocking count / 4
+RELATIONAL_FEATURES = 20
+INPUT_SIZE = BASE_FEATURES + RELATIONAL_FEATURES  # 164
 
 # Score normalization: use tanh(score / SCORE_SCALING) instead of linear clip.
 # This prevents information loss for extreme scores.
@@ -116,7 +123,7 @@ def board_to_tensor(
     - Channel 2: White pail
     - Channel 3: Black pail
 
-    Relational features (13):
+    Relational features (20):
     - [0-3]  White barrel distances to goal (normalized 0-1, closest first)
     - [4-7]  Black barrel distances to goal (normalized 0-1, closest first)
     - [8]    White barrels scored (normalized 0-1)
@@ -124,43 +131,49 @@ def board_to_tensor(
     - [10]   White pail placed (0 or 1)
     - [11]   Black pail placed (0 or 1)
     - [12]   Current player (+1 white, -1 black)
+    - [13]   White immediate threats (barrels 1 step from scoring, /4)
+    - [14]   Black immediate threats (barrels 1 step from scoring, /4)
+    - [15]   Score differential (white_scored - black_scored) / 4
+    - [16]   White barrels on board / 4
+    - [17]   Black barrels on board / 4
+    - [18]   White pail blocking count / 4
+    - [19]   Black pail blocking count / 4
     """
     # Base features: piece positions
     base = np.zeros((BOARD_SIZE, BOARD_SIZE, NUM_PIECE_TYPES), dtype=np.float32)
 
-    # Track barrel positions for distance calculation
-    white_barrel_rows = []
-    black_barrel_rows = []
-    white_pail_placed = 0.0
-    black_pail_placed = 0.0
+    # Track barrel positions for distance and blocking calculation
+    white_barrel_positions = []  # (row, col)
+    black_barrel_positions = []  # (row, col)
+    white_pail_pos = None
+    black_pail_pos = None
 
     for row in range(BOARD_SIZE):
         for col in range(BOARD_SIZE):
             val = board_array[row][col]
             if val == 1:    # WhiteBarrel
                 base[row, col, 0] = 1.0
-                white_barrel_rows.append(row)
+                white_barrel_positions.append((row, col))
             elif val == -1:  # BlackBarrel
                 base[row, col, 1] = 1.0
-                black_barrel_rows.append(row)
+                black_barrel_positions.append((row, col))
             elif val == 2:   # WhitePail
                 base[row, col, 2] = 1.0
-                white_pail_placed = 1.0
+                white_pail_pos = (row, col)
             elif val == -2:  # BlackPail
                 base[row, col, 3] = 1.0
-                black_pail_placed = 1.0
+                black_pail_pos = (row, col)
 
-    # Relational features (13 total)
+    # Relational features (20 total)
     relational = np.zeros(RELATIONAL_FEATURES, dtype=np.float32)
 
     # White barrel distances to goal (row 0 is goal, so distance = row)
-    # Normalize by max distance (5) and sort so closest first
-    white_dists = sorted([r / 5.0 for r in white_barrel_rows])
+    white_dists = sorted([r / 5.0 for r, c in white_barrel_positions])
     for i, d in enumerate(white_dists[:4]):
         relational[i] = 1.0 - d  # Closer to goal = higher value
 
     # Black barrel distances to goal (row 5 is goal, so distance = 5 - row)
-    black_dists = sorted([(5 - r) / 5.0 for r in black_barrel_rows])
+    black_dists = sorted([(5 - r) / 5.0 for r, c in black_barrel_positions])
     for i, d in enumerate(black_dists[:4]):
         relational[4 + i] = 1.0 - d
 
@@ -169,11 +182,41 @@ def board_to_tensor(
     relational[9] = black_scored / 4.0
 
     # Pails placed
-    relational[10] = white_pail_placed
-    relational[11] = black_pail_placed
+    relational[10] = 1.0 if white_pail_pos is not None else 0.0
+    relational[11] = 1.0 if black_pail_pos is not None else 0.0
 
     # Current player
     relational[12] = current_player
+
+    # Immediate threats (barrels 1 step from scoring)
+    white_threats = sum(1 for r, c in white_barrel_positions if r == 1)
+    black_threats = sum(1 for r, c in black_barrel_positions if r == 4)
+    relational[13] = white_threats / 4.0
+    relational[14] = black_threats / 4.0
+
+    # Score differential
+    relational[15] = (white_scored - black_scored) / 4.0
+
+    # Barrels on board
+    relational[16] = len(white_barrel_positions) / 4.0
+    relational[17] = len(black_barrel_positions) / 4.0
+
+    # Pail blocking counts
+    white_pail_blocks = 0
+    if white_pail_pos is not None:
+        pr, pc = white_pail_pos
+        for br, bc in black_barrel_positions:
+            if pc == bc and pr > br:  # Pail ahead of black barrel (blocking toward row 5)
+                white_pail_blocks += 1
+    relational[18] = white_pail_blocks / 4.0
+
+    black_pail_blocks = 0
+    if black_pail_pos is not None:
+        pr, pc = black_pail_pos
+        for br, bc in white_barrel_positions:
+            if pc == bc and pr < br:  # Pail ahead of white barrel (blocking toward row 0)
+                black_pail_blocks += 1
+    relational[19] = black_pail_blocks / 4.0
 
     # Combine base and relational features
     features = np.concatenate([base.flatten(), relational])
@@ -417,18 +460,32 @@ class DataGenerator:
         stats = TrainingStats()
 
         # Resume from existing file if present
+        streaming = save_path and save_path.endswith('.bin')
         if save_path and Path(save_path).exists():
             try:
-                prev_X, prev_y, prev_stats, prev_config = self.load_dataset(save_path)
-                chunks_X.append(prev_X)
-                chunks_y.append(prev_y)
-                stats.white_wins = prev_stats.white_wins
-                stats.black_wins = prev_stats.black_wins
-                stats.draws = prev_stats.draws
-                stats.total_positions = prev_stats.total_positions
-                if verbose:
-                    prev_games = prev_stats.white_wins + prev_stats.black_wins + prev_stats.draws
-                    print(f"  Resuming from {save_path}: {len(prev_X):,} positions from {prev_games} games")
+                if streaming:
+                    meta_path = save_path.replace('.bin', '_meta.json')
+                    if Path(meta_path).exists():
+                        with open(meta_path, 'r') as f:
+                            meta = json.load(f)
+                        stats.white_wins = meta.get('white_wins', 0)
+                        stats.black_wins = meta.get('black_wins', 0)
+                        stats.draws = meta.get('draws', 0)
+                        stats.total_positions = meta.get('total_positions', 0)
+                        prev_games = stats.white_wins + stats.black_wins + stats.draws
+                        if verbose:
+                            print(f"  Resuming from {save_path}: {stats.total_positions:,} positions from {prev_games} games")
+                else:
+                    prev_X, prev_y, prev_stats, prev_config = self.load_dataset(save_path)
+                    chunks_X.append(prev_X)
+                    chunks_y.append(prev_y)
+                    stats.white_wins = prev_stats.white_wins
+                    stats.black_wins = prev_stats.black_wins
+                    stats.draws = prev_stats.draws
+                    stats.total_positions = prev_stats.total_positions
+                    if verbose:
+                        prev_games = prev_stats.white_wins + prev_stats.black_wins + prev_stats.draws
+                        print(f"  Resuming from {save_path}: {len(prev_X):,} positions from {prev_games} games")
             except Exception as e:
                 if verbose:
                     print(f"  Could not resume from {save_path}: {e}")
@@ -472,14 +529,21 @@ class DataGenerator:
                 print(f"  Labels: {'search scores' if use_search_scores else 'game outcomes'}")
 
         # Build final tensors
-        if not chunks_X:
+        streaming = save_path and save_path.endswith('.bin')
+        if streaming:
+            # Data is already on disk — return empty tensors
+            # Caller should use load_streaming_dataset() for training
+            X, y = torch.zeros(0, INPUT_SIZE), torch.zeros(0, 1)
+            if verbose:
+                print(f"  Saved dataset to: {save_path} (streaming)")
+        elif not chunks_X:
             X, y = torch.zeros(0, INPUT_SIZE), torch.zeros(0, 1)
         else:
             X = torch.cat(chunks_X, dim=0)
             y = torch.cat(chunks_y, dim=0)
 
-        # Final save
-        if save_path:
+        # Final save (non-streaming only)
+        if save_path and not streaming:
             self.save_dataset(X, y, stats, save_path, config)
             if verbose:
                 print(f"  Saved dataset to: {save_path}")
@@ -570,9 +634,25 @@ class DataGenerator:
         augment, verbose, save_every, save_path, config, workers, nnue_path,
         chunks_X, chunks_y, stats, start_time, lambda_blend=None
     ):
-        """Parallel game generation using multiprocessing.Pool."""
+        """Parallel game generation using multiprocessing.Pool.
+
+        Uses streaming mode when save_path ends with .bin — writes positions
+        directly to flat binary files to avoid accumulating all data in RAM.
+        Falls back to in-memory mode for .npz paths (legacy behavior).
+        """
+        streaming = save_path and save_path.endswith('.bin')
         batch_size = save_every if save_every > 0 else num_games
         games_done = 0
+
+        # Streaming mode: write to flat binary files
+        if streaming:
+            x_path = save_path
+            y_path = save_path.replace('.bin', '_y.bin')
+            meta_path = save_path.replace('.bin', '_meta.json')
+
+            # Open files for appending (resume support: existing data stays)
+            x_file = open(x_path, 'ab')
+            y_file = open(y_path, 'ab')
 
         while games_done < num_games:
             batch = min(batch_size, num_games - games_done)
@@ -597,14 +677,21 @@ class DataGenerator:
             # Merge results from all workers
             for X_np, y_np, ww, bw, dw in results:
                 if len(X_np) > 0:
-                    chunks_X.append(torch.tensor(X_np, dtype=torch.float32))
-                    chunks_y.append(torch.tensor(y_np, dtype=torch.float32).unsqueeze(1))
+                    if streaming:
+                        # Write directly to disk, don't accumulate in RAM
+                        X_np.astype(np.float32).tofile(x_file)
+                        y_np.astype(np.float32).tofile(y_file)
+                    else:
+                        chunks_X.append(torch.tensor(X_np, dtype=torch.float32))
+                        chunks_y.append(torch.tensor(y_np, dtype=torch.float32).unsqueeze(1))
+                    stats.total_positions += len(X_np)
                 stats.white_wins += ww
                 stats.black_wins += bw
                 stats.draws += dw
 
             games_done += batch
-            stats.total_positions = sum(c.shape[0] for c in chunks_X)
+            if not streaming:
+                stats.total_positions = sum(c.shape[0] for c in chunks_X)
 
             # Progress + checkpoint
             elapsed = time.time() - start_time
@@ -618,13 +705,47 @@ class DataGenerator:
                       f"{stats} | {stats.total_positions:,} positions{aug_note}", flush=True)
 
             if save_every > 0 and save_path:
-                save_start = time.time()
-                X_all = torch.cat(chunks_X, dim=0) if chunks_X else torch.zeros(0, INPUT_SIZE)
-                y_all = torch.cat(chunks_y, dim=0) if chunks_y else torch.zeros(0, 1)
-                self.save_dataset(X_all, y_all, stats, save_path, config)
-                save_elapsed = time.time() - save_start
-                if verbose:
-                    print(f"  >> Checkpoint saved ({stats.total_positions:,} positions, {save_elapsed:.1f}s)", flush=True)
+                if streaming:
+                    save_start = time.time()
+                    x_file.flush()
+                    y_file.flush()
+                    # Save metadata
+                    meta = {
+                        "total_positions": stats.total_positions,
+                        "input_size": INPUT_SIZE,
+                        "white_wins": stats.white_wins,
+                        "black_wins": stats.black_wins,
+                        "draws": stats.draws,
+                        "config": config,
+                    }
+                    with open(meta_path, 'w') as f:
+                        json.dump(meta, f)
+                    save_elapsed = time.time() - save_start
+                    if verbose:
+                        print(f"  >> Checkpoint flushed ({stats.total_positions:,} positions, {save_elapsed:.1f}s)", flush=True)
+                else:
+                    save_start = time.time()
+                    X_all = torch.cat(chunks_X, dim=0) if chunks_X else torch.zeros(0, INPUT_SIZE)
+                    y_all = torch.cat(chunks_y, dim=0) if chunks_y else torch.zeros(0, 1)
+                    self.save_dataset(X_all, y_all, stats, save_path, config)
+                    save_elapsed = time.time() - save_start
+                    if verbose:
+                        print(f"  >> Checkpoint saved ({stats.total_positions:,} positions, {save_elapsed:.1f}s)", flush=True)
+
+        if streaming:
+            x_file.close()
+            y_file.close()
+            # Final metadata save
+            meta = {
+                "total_positions": stats.total_positions,
+                "input_size": INPUT_SIZE,
+                "white_wins": stats.white_wins,
+                "black_wins": stats.black_wins,
+                "draws": stats.draws,
+                "config": config,
+            }
+            with open(meta_path, 'w') as f:
+                json.dump(meta, f)
 
     def save_dataset(
         self,
@@ -648,7 +769,7 @@ class DataGenerator:
 
     @staticmethod
     def load_dataset(path: str) -> Tuple[torch.Tensor, torch.Tensor, TrainingStats, Optional[Dict]]:
-        """Load dataset from file."""
+        """Load dataset from file (.npz format, loads into RAM)."""
         data = np.load(path, allow_pickle=True)
         X = torch.tensor(data['X'], dtype=torch.float32)
         y = torch.tensor(data['y'], dtype=torch.float32)
@@ -667,6 +788,30 @@ class DataGenerator:
             except:
                 pass
 
+        return X, y, stats, config
+
+    @staticmethod
+    def load_streaming_dataset(bin_path: str) -> Tuple[np.memmap, np.memmap, TrainingStats, Optional[Dict]]:
+        """Load dataset from flat binary files using memory-mapping (low RAM)."""
+        meta_path = bin_path.replace('.bin', '_meta.json')
+        y_path = bin_path.replace('.bin', '_y.bin')
+
+        with open(meta_path, 'r') as f:
+            meta = json.load(f)
+
+        n = meta['total_positions']
+        input_size = meta.get('input_size', INPUT_SIZE)
+
+        X = np.memmap(bin_path, dtype=np.float32, mode='r', shape=(n, input_size))
+        y = np.memmap(y_path, dtype=np.float32, mode='r', shape=(n,))
+
+        stats = TrainingStats()
+        stats.white_wins = meta.get('white_wins', 0)
+        stats.black_wins = meta.get('black_wins', 0)
+        stats.draws = meta.get('draws', 0)
+        stats.total_positions = n
+
+        config = meta.get('config', None)
         return X, y, stats, config
 
 
@@ -743,8 +888,8 @@ def _generate_games_worker(args):
 # =============================================================================
 
 def train_model(
-    X: torch.Tensor,
-    y: torch.Tensor,
+    X,  # torch.Tensor or np.memmap
+    y,  # torch.Tensor or np.memmap
     hidden1: int = 64,
     hidden2: int = 32,
     input_size: int = INPUT_SIZE,
@@ -757,12 +902,15 @@ def train_model(
     """
     Train the NNUE model.
 
+    Supports both in-memory tensors and memory-mapped numpy arrays.
+    When using mmap, loads only one batch at a time into RAM.
+
     Args:
-        X: Input tensor (N, input_size)
-        y: Labels (N, 1)
+        X: Input data (N, input_size) — torch.Tensor or np.memmap
+        y: Labels (N,) or (N, 1) — torch.Tensor or np.memmap
         hidden1: First hidden layer size
         hidden2: Second hidden layer size
-        input_size: Number of input features (144 base or 147 with relational)
+        input_size: Number of input features
         epochs: Number of training epochs
         batch_size: Mini-batch size
         learning_rate: Adam learning rate
@@ -772,21 +920,22 @@ def train_model(
     Returns:
         (model, history) - trained model and training history
     """
-    # Split data
+    streaming = isinstance(X, np.memmap)
     n = len(X)
-    indices = list(range(n))
-    random.shuffle(indices)
+
+    # Split into train/val using indices (works for both tensor and mmap)
+    indices = np.arange(n)
+    np.random.shuffle(indices)
     split = int((1 - validation_split) * n)
 
     train_idx = indices[:split]
     val_idx = indices[split:]
 
-    X_train, y_train = X[train_idx], y[train_idx]
-    X_val, y_val = X[val_idx], y[val_idx]
-
     if verbose:
-        print(f"  Training set: {len(X_train):,} positions")
-        print(f"  Validation set: {len(X_val):,} positions")
+        print(f"  Training set: {len(train_idx):,} positions")
+        print(f"  Validation set: {len(val_idx):,} positions")
+        if streaming:
+            print(f"  Mode: streaming (memory-mapped, low RAM)")
 
     # Create model
     model = TonnesjakkNNUE(hidden1, hidden2, input_size=input_size)
@@ -801,21 +950,35 @@ def train_model(
     best_val_loss = float('inf')
     best_model_state = None
 
+    # Pre-load validation set (small enough to fit in RAM)
+    if streaming:
+        X_val = torch.tensor(np.array(X[val_idx]), dtype=torch.float32)
+        y_val_np = np.array(y[val_idx])
+        y_val = torch.tensor(y_val_np, dtype=torch.float32).unsqueeze(1) if y_val_np.ndim == 1 else torch.tensor(y_val_np, dtype=torch.float32)
+    else:
+        X_val, y_val = X[val_idx], y[val_idx]
+
     for epoch in range(epochs):
         model.train()
 
-        # Shuffle training data
-        perm = torch.randperm(len(X_train))
-        X_train_shuffled = X_train[perm]
-        y_train_shuffled = y_train[perm]
+        # Shuffle training indices
+        np.random.shuffle(train_idx)
 
         # Mini-batch training
         total_loss = 0.0
         num_batches = 0
 
-        for i in range(0, len(X_train), batch_size):
-            batch_X = X_train_shuffled[i: i + batch_size]
-            batch_y = y_train_shuffled[i: i + batch_size]
+        for i in range(0, len(train_idx), batch_size):
+            batch_idx = train_idx[i: i + batch_size]
+
+            if streaming:
+                # Load just this batch from mmap
+                batch_X = torch.tensor(np.array(X[batch_idx]), dtype=torch.float32)
+                batch_y_np = np.array(y[batch_idx])
+                batch_y = torch.tensor(batch_y_np, dtype=torch.float32).unsqueeze(1) if batch_y_np.ndim == 1 else torch.tensor(batch_y_np, dtype=torch.float32)
+            else:
+                batch_X = X[batch_idx]
+                batch_y = y[batch_idx]
 
             optimizer.zero_grad()
             pred = model(batch_X)
@@ -958,8 +1121,12 @@ def train_nnue(
     # Step 1: Generate or load data
     if load_data:
         print(f"\n[1/3] Loading training data from {load_data}...")
-        X, y, stats, loaded_config = DataGenerator.load_dataset(load_data)
-        print(f"  Loaded {len(X):,} positions (features: {X.shape[1]})")
+        if load_data.endswith('.bin'):
+            X, y, stats, loaded_config = DataGenerator.load_streaming_dataset(load_data)
+            print(f"  Loaded {len(X):,} positions (memory-mapped, features: {X.shape[1]})")
+        else:
+            X, y, stats, loaded_config = DataGenerator.load_dataset(load_data)
+            print(f"  Loaded {len(X):,} positions (features: {X.shape[1]})")
         print(f"  {stats}")
         if loaded_config:
             print(f"  Original config: {loaded_config.get('games', '?')} games, depth {loaded_config.get('depth', '?')}")
@@ -1027,6 +1194,12 @@ def train_nnue(
             print(f"\nGeneration complete. Data saved to: {save_data}")
             print("Run with --load-data to train on this data.")
             return None
+
+        # If streaming mode was used, load data via mmap for training
+        if save_data and save_data.endswith('.bin') and len(X) == 0:
+            print(f"\n  Loading generated data via memory-map...")
+            X, y, stats, _ = DataGenerator.load_streaming_dataset(save_data)
+            print(f"  Loaded {len(X):,} positions (memory-mapped)")
 
     # Check balance
     if stats.balance_ratio < 0.5 or stats.balance_ratio > 2.0:

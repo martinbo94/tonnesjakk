@@ -25,7 +25,7 @@ pub const TT_SIZE: usize = 1 << 20; // ~1 million entries
 // NNUE feature sizes
 /// Base features: 6x6 board * 4 piece types = 144
 pub const BASE_FEATURES: usize = NUM_SQUARES * 4;
-/// Relational features (13 total):
+/// Relational features (20 total):
 ///   [0-3]  White barrel distances to goal (normalized 0-1, closest first)
 ///   [4-7]  Black barrel distances to goal (normalized 0-1, closest first)
 ///   [8]    White barrels scored (normalized 0-1)
@@ -33,9 +33,16 @@ pub const BASE_FEATURES: usize = NUM_SQUARES * 4;
 ///   [10]   White pail placed (0 or 1)
 ///   [11]   Black pail placed (0 or 1)
 ///   [12]   Current player (+1 white, -1 black)
-pub const RELATIONAL_FEATURES: usize = 13;
+///   [13]   White immediate threats (barrels 1 step from scoring, /4)
+///   [14]   Black immediate threats (barrels 1 step from scoring, /4)
+///   [15]   Score differential (white_scored - black_scored) / 4, range -1 to +1
+///   [16]   White barrels on board / 4
+///   [17]   Black barrels on board / 4
+///   [18]   White pail blocking count / 4
+///   [19]   Black pail blocking count / 4
+pub const RELATIONAL_FEATURES: usize = 20;
 /// Total input features to NNUE
-pub const INPUT_SIZE: usize = BASE_FEATURES + RELATIONAL_FEATURES; // 157
+pub const INPUT_SIZE: usize = BASE_FEATURES + RELATIONAL_FEATURES; // 164
 
 
 // ============================================================================
@@ -2282,18 +2289,22 @@ impl IncrementalNNUE {
     ///   [11]   Black pail placed (0 or 1)
     ///   [12]   Current player (+1 white, -1 black)
     #[inline]
-    fn compute_relational_features(bb: &BitBoard) -> [f32; 13] {
-        let mut features = [0.0f32; 13];
+    fn compute_relational_features(bb: &BitBoard) -> [f32; 20] {
+        let mut features = [0.0f32; 20];
 
         // White barrel distances to goal (row 0 is goal, distance = row)
         // Sort ascending by distance, then feature = 1.0 - normalized_dist
         let mut white_dists = [0.0f32; 4];
+        let mut white_rows = [0usize; 4];
         let mut n_white = 0usize;
+        let mut white_threats = 0u32;
         let mut barrels = bb.white_barrels;
         while barrels != 0 && n_white < 4 {
             let sq = barrels.trailing_zeros() as usize;
             let row = sq / 6;
             white_dists[n_white] = row as f32 / 5.0;
+            white_rows[n_white] = row;
+            if row == 1 { white_threats += 1; } // 1 step from row 0 goal
             n_white += 1;
             barrels &= barrels - 1;
         }
@@ -2304,18 +2315,39 @@ impl IncrementalNNUE {
 
         // Black barrel distances to goal (row 5 is goal, distance = 5 - row)
         let mut black_dists = [0.0f32; 4];
+        let mut black_rows = [0usize; 4];
+        let mut black_cols = [0usize; 4];
         let mut n_black = 0usize;
+        let mut black_threats = 0u32;
         barrels = bb.black_barrels;
         while barrels != 0 && n_black < 4 {
             let sq = barrels.trailing_zeros() as usize;
             let row = sq / 6;
+            let col = sq % 6;
             black_dists[n_black] = (5 - row) as f32 / 5.0;
+            black_rows[n_black] = row;
+            black_cols[n_black] = col;
+            if row == 4 { black_threats += 1; } // 1 step from row 5 goal
             n_black += 1;
             barrels &= barrels - 1;
         }
         black_dists[..n_black].sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
         for i in 0..n_black {
             features[4 + i] = 1.0 - black_dists[i];
+        }
+
+        // We also need white barrel columns for blocking computation
+        let mut white_cols = [0usize; 4];
+        {
+            let mut i = 0usize;
+            let mut b = bb.white_barrels;
+            while b != 0 && i < 4 {
+                let sq = b.trailing_zeros() as usize;
+                white_rows[i] = sq / 6;
+                white_cols[i] = sq % 6;
+                i += 1;
+                b &= b - 1;
+            }
         }
 
         // Scored barrels (normalized by 4)
@@ -2331,6 +2363,44 @@ impl IncrementalNNUE {
             Player::White => 1.0,
             Player::Black => -1.0,
         };
+
+        // Immediate threats (barrels 1 step from scoring)
+        features[13] = white_threats as f32 / 4.0;
+        features[14] = black_threats as f32 / 4.0;
+
+        // Score differential
+        features[15] = (bb.white_scored as f32 - bb.black_scored as f32) / 4.0;
+
+        // Barrels on board
+        features[16] = n_white as f32 / 4.0;
+        features[17] = n_black as f32 / 4.0;
+
+        // Pail blocking counts
+        let mut white_pail_blocks = 0u32;
+        if bb.white_pail != 0 {
+            let pail_sq = bb.white_pail.trailing_zeros() as usize;
+            let pail_row = pail_sq / 6;
+            let pail_col = pail_sq % 6;
+            for i in 0..n_black {
+                if pail_col == black_cols[i] && pail_row > black_rows[i] {
+                    white_pail_blocks += 1;
+                }
+            }
+        }
+        features[18] = white_pail_blocks as f32 / 4.0;
+
+        let mut black_pail_blocks = 0u32;
+        if bb.black_pail != 0 {
+            let pail_sq = bb.black_pail.trailing_zeros() as usize;
+            let pail_row = pail_sq / 6;
+            let pail_col = pail_sq % 6;
+            for i in 0..n_white {
+                if pail_col == white_cols[i] && pail_row < white_rows[i] {
+                    black_pail_blocks += 1;
+                }
+            }
+        }
+        features[19] = black_pail_blocks as f32 / 4.0;
 
         features
     }

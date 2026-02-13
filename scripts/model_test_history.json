@@ -3386,5 +3386,613 @@
         "wall_time": 23.71
       }
     ]
+  },
+  {
+    "timestamp": "2026-02-12 20:37:34",
+    "model": "nnue_weights.json",
+    "opponent": "heuristic",
+    "settings": {
+      "games": 30,
+      "time_ms": 100
+    },
+    "results": {
+      "wins": 0,
+      "losses": 30,
+      "draws": 0,
+      "win_rate": 0.0,
+      "elo_diff": -400,
+      "elo_ci_lo": -400,
+      "elo_ci_hi": -357
+    },
+    "engine_stats": {
+      "model": {
+        "avg_depth": 4.96,
+        "avg_nodes_per_move": 10616,
+        "total_nodes": 5032077,
+        "avg_nps": 22790
+      },
+      "opponent": {
+        "avg_depth": 8.83,
+        "avg_nodes_per_move": 32209,
+        "total_nodes": 15782434,
+        "avg_nps": 71479
+      }
+    },
+    "games": [
+      {
+        "winner": "opponent",
+        "moves": 28,
+        "model_avg_depth": 5.7,
+        "opponent_avg_depth": 7.3,
+        "model_nodes": 32145,
+        "opponent_nodes": 301670,
+        "wall_time": 43.15
+      },
+      {
+        "winner": "opponent",
+        "moves": 31,
+        "model_avg_depth": 3.9,
+        "opponent_avg_depth": 7.6,
+        "model_nodes": 412426,
+        "opponent_nodes": 307593,
+        "wall_time": 6.45
+      },
+      {
+        "winner": "opponent",
+        "moves": 32,
+        "model_avg_depth": 4.6,
+        "opponent_avg_depth": 8.0,
+        "model_nodes": 48736,
+        "opponent_nodes": 421811,
+        "wall_time": 23.66
+      },
+      {
+        "winner": "opponent",
+        "moves": 27,
+        "model_avg_depth": 3.8,
+        "opponent_avg_depth": 9.7,
+        "model_nodes": 240019,
+        "opponent_nodes": 617539,
+        "wall_time": 3.61
+      },
+      {
+        "winner": "opponent",
+        "moves": 34,
+        "model_avg_depth": 6.7,
+        "opponent_avg_depth": 7.2,
+        "model_nodes": 87449,
+        "opponent_nodes": 463649,
+        "wall_time": 29.31
+      },
+      {
+        "winner": "opponent",
+        "moves": 27,
+        "model_avg_depth": 5.6,
+        "opponent_avg_depth": 12.0,
+        "model_nodes": 680549,
+        "opponent_nodes": 854692,
+        "wall_time": 2.68
+      },
+      {
+        "winner": "opponent",
+        "moves": 30,
+        "model_avg_depth": 3.9,
+        "opponent_avg_depth": 9.1,
+        "model_nodes": 96861,
+        "opponent_nodes": 480277,
+        "wall_time": 25.14
+      },
+      {
+        "winner": "opponent",
+        "moves": 27,
+        "model_avg_depth": 3.5,
+        "opponent_avg_depth": 11.0,
+        "model_nodes": 124433,
+        "opponent_nodes": 668262,
+        "wall_time": 4.64
+      },
+      {
+        "winner": "opponent",
+        "moves": 34,
+        "model_avg_depth": 7.6,
+        "opponent_avg_depth": 8.1,
+        "model_nodes": 210278,
+        "opponent_nodes": 474625,
+        "wall_time": 9.97
+      },
+      {
+        "winner": "opponent",
+        "moves": 35,
+        "model_avg_depth": 3.6,
+        "opponent_avg_depth": 7.9,
+        "model_nodes": 205536,
+        "opponent_nodes": 481230,
+        "wall_time": 8.28
+      },
+      {
+        "winner": "opponent",
+        "moves": 26,
+        "model_avg_depth": 8.6,
+        "opponent_avg_depth": 13.6,
+        "model_nodes": 101847,
+        "opponent_nodes": 593703,
+        "wall_time": 28.3
+      },
+      {
+        "winner": "opponent",
+        "moves": 27,
+        "model_avg_depth": 3.7,
+        "opponent_avg_depth": 8.2,
+        "model_nodes": 280141,
+        "opponent_nodes": 311379,
+        "wall_time": 21.93
+      },
+      {
+        "winner": "opponent",
+        "moves": 23,
+        "model_avg_depth": 5.9,
+        "opponent_avg_depth": 8.2,
+        "model_nodes": 53855,
+        "opponent_nodes": 343059,
+        "wall_time": 3.86
+      },
+      {
+        "winner": "opponent",
+        "moves": 35,
+        "model_avg_depth": 3.5,
+        "opponent_avg_depth": 7.7,
+        "model_nodes": 134055,
+        "opponent_nodes": 465299,
+        "wall_time": 23.86
+      },
+      {
+        "winner": "opponent",
+        "moves": 28,
+        "model_avg_depth": 7.0,
+        "opponent_avg_depth": 9.8,
+        "model_nodes": 50671,
+        "opponent_nodes": 521339,
+        "wall_time": 7.19
+      },
+      {
+        "winner": "opponent",
+        "moves": 34,
+        "model_avg_depth": 3.6,
+        "opponent_avg_depth": 7.6,
+        "model_nodes": 89253,
+        "opponent_nodes": 340450,
+        "wall_time": 21.14
+      },
+      {
+        "winner": "opponent",
+        "moves": 36,
+        "model_avg_depth": 4.3,
+        "opponent_avg_depth": 10.9,
+        "model_nodes": 115366,
+        "opponent_nodes": 952452,
+        "wall_time": 10.59
+      },
+      {
+        "winner": "opponent",
+        "moves": 32,
+        "model_avg_depth": 3.7,
+        "opponent_avg_depth": 6.9,
+        "model_nodes": 163467,
+        "opponent_nodes": 394899,
+        "wall_time": 6.32
+      },
+      {
+        "winner": "opponent",
+        "moves": 31,
+        "model_avg_depth": 6.1,
+        "opponent_avg_depth": 7.9,
+        "model_nodes": 61129,
+        "opponent_nodes": 323143,
+        "wall_time": 15.71
+      },
+      {
+        "winner": "opponent",
+        "moves": 39,
+        "model_avg_depth": 3.9,
+        "opponent_avg_depth": 9.4,
+        "model_nodes": 207580,
+        "opponent_nodes": 687410,
+        "wall_time": 21.94
+      },
+      {
+        "winner": "opponent",
+        "moves": 30,
+        "model_avg_depth": 6.8,
+        "opponent_avg_depth": 10.3,
+        "model_nodes": 39420,
+        "opponent_nodes": 677222,
+        "wall_time": 6.17
+      },
+      {
+        "winner": "opponent",
+        "moves": 42,
+        "model_avg_depth": 4.0,
+        "opponent_avg_depth": 6.4,
+        "model_nodes": 166771,
+        "opponent_nodes": 547762,
+        "wall_time": 12.41
+      },
+      {
+        "winner": "opponent",
+        "moves": 36,
+        "model_avg_depth": 6.4,
+        "opponent_avg_depth": 11.6,
+        "model_nodes": 86463,
+        "opponent_nodes": 751144,
+        "wall_time": 36.38
+      },
+      {
+        "winner": "opponent",
+        "moves": 31,
+        "model_avg_depth": 3.6,
+        "opponent_avg_depth": 6.8,
+        "model_nodes": 142968,
+        "opponent_nodes": 182704,
+        "wall_time": 9.85
+      },
+      {
+        "winner": "opponent",
+        "moves": 33,
+        "model_avg_depth": 3.8,
+        "opponent_avg_depth": 9.2,
+        "model_nodes": 255785,
+        "opponent_nodes": 880395,
+        "wall_time": 10.29
+      },
+      {
+        "winner": "opponent",
+        "moves": 45,
+        "model_avg_depth": 3.8,
+        "opponent_avg_depth": 10.0,
+        "model_nodes": 239431,
+        "opponent_nodes": 976853,
+        "wall_time": 6.86
+      },
+      {
+        "winner": "opponent",
+        "moves": 25,
+        "model_avg_depth": 8.0,
+        "opponent_avg_depth": 7.5,
+        "model_nodes": 23993,
+        "opponent_nodes": 237278,
+        "wall_time": 10.23
+      },
+      {
+        "winner": "opponent",
+        "moves": 31,
+        "model_avg_depth": 4.7,
+        "opponent_avg_depth": 7.9,
+        "model_nodes": 364151,
+        "opponent_nodes": 353687,
+        "wall_time": 6.63
+      },
+      {
+        "winner": "opponent",
+        "moves": 27,
+        "model_avg_depth": 4.8,
+        "opponent_avg_depth": 9.3,
+        "model_nodes": 31431,
+        "opponent_nodes": 436800,
+        "wall_time": 12.99
+      },
+      {
+        "winner": "opponent",
+        "moves": 48,
+        "model_avg_depth": 3.4,
+        "opponent_avg_depth": 7.7,
+        "model_nodes": 285868,
+        "opponent_nodes": 734108,
+        "wall_time": 12.04
+      }
+    ]
+  },
+  {
+    "timestamp": "2026-02-12 20:49:01",
+    "model": "nnue_weights.json",
+    "opponent": "heuristic",
+    "settings": {
+      "games": 30,
+      "time_ms": 200
+    },
+    "results": {
+      "wins": 0,
+      "losses": 30,
+      "draws": 0,
+      "win_rate": 0.0,
+      "elo_diff": -400,
+      "elo_ci_lo": -400,
+      "elo_ci_hi": -357
+    },
+    "engine_stats": {
+      "model": {
+        "avg_depth": 5.67,
+        "avg_nodes_per_move": 13203,
+        "total_nodes": 5716813,
+        "avg_nps": 16651
+      },
+      "opponent": {
+        "avg_depth": 9.42,
+        "avg_nodes_per_move": 59321,
+        "total_nodes": 26516506,
+        "avg_nps": 77234
+      }
+    },
+    "games": [
+      {
+        "winner": "opponent",
+        "moves": 26,
+        "model_avg_depth": 6.3,
+        "opponent_avg_depth": 8.3,
+        "model_nodes": 40287,
+        "opponent_nodes": 576226,
+        "wall_time": 13.7
+      },
+      {
+        "winner": "opponent",
+        "moves": 27,
+        "model_avg_depth": 3.8,
+        "opponent_avg_depth": 8.5,
+        "model_nodes": 302713,
+        "opponent_nodes": 626306,
+        "wall_time": 10.99
+      },
+      {
+        "winner": "opponent",
+        "moves": 36,
+        "model_avg_depth": 6.6,
+        "opponent_avg_depth": 9.6,
+        "model_nodes": 96179,
+        "opponent_nodes": 1163219,
+        "wall_time": 66.81
+      },
+      {
+        "winner": "opponent",
+        "moves": 27,
+        "model_avg_depth": 4.8,
+        "opponent_avg_depth": 9.2,
+        "model_nodes": 476885,
+        "opponent_nodes": 840651,
+        "wall_time": 12.72
+      },
+      {
+        "winner": "opponent",
+        "moves": 25,
+        "model_avg_depth": 6.7,
+        "opponent_avg_depth": 9.8,
+        "model_nodes": 48669,
+        "opponent_nodes": 885344,
+        "wall_time": 20.49
+      },
+      {
+        "winner": "opponent",
+        "moves": 26,
+        "model_avg_depth": 4.2,
+        "opponent_avg_depth": 9.2,
+        "model_nodes": 128557,
+        "opponent_nodes": 668216,
+        "wall_time": 7.06
+      },
+      {
+        "winner": "opponent",
+        "moves": 38,
+        "model_avg_depth": 6.7,
+        "opponent_avg_depth": 9.3,
+        "model_nodes": 100528,
+        "opponent_nodes": 1014899,
+        "wall_time": 55.24
+      },
+      {
+        "winner": "opponent",
+        "moves": 26,
+        "model_avg_depth": 5.8,
+        "opponent_avg_depth": 8.3,
+        "model_nodes": 699988,
+        "opponent_nodes": 683533,
+        "wall_time": 6.2
+      },
+      {
+        "winner": "opponent",
+        "moves": 38,
+        "model_avg_depth": 6.1,
+        "opponent_avg_depth": 9.5,
+        "model_nodes": 47968,
+        "opponent_nodes": 1417606,
+        "wall_time": 84.13
+      },
+      {
+        "winner": "opponent",
+        "moves": 31,
+        "model_avg_depth": 4.4,
+        "opponent_avg_depth": 10.1,
+        "model_nodes": 187119,
+        "opponent_nodes": 1010620,
+        "wall_time": 25.73
+      },
+      {
+        "winner": "opponent",
+        "moves": 34,
+        "model_avg_depth": 6.9,
+        "opponent_avg_depth": 11.1,
+        "model_nodes": 85524,
+        "opponent_nodes": 1480517,
+        "wall_time": 16.12
+      },
+      {
+        "winner": "opponent",
+        "moves": 27,
+        "model_avg_depth": 4.2,
+        "opponent_avg_depth": 9.1,
+        "model_nodes": 421596,
+        "opponent_nodes": 785438,
+        "wall_time": 8.93
+      },
+      {
+        "winner": "opponent",
+        "moves": 31,
+        "model_avg_depth": 5.5,
+        "opponent_avg_depth": 10.3,
+        "model_nodes": 29235,
+        "opponent_nodes": 1056089,
+        "wall_time": 33.7
+      },
+      {
+        "winner": "opponent",
+        "moves": 33,
+        "model_avg_depth": 3.6,
+        "opponent_avg_depth": 9.7,
+        "model_nodes": 119430,
+        "opponent_nodes": 1273000,
+        "wall_time": 10.2
+      },
+      {
+        "winner": "opponent",
+        "moves": 35,
+        "model_avg_depth": 8.5,
+        "opponent_avg_depth": 9.3,
+        "model_nodes": 181394,
+        "opponent_nodes": 911325,
+        "wall_time": 33.01
+      },
+      {
+        "winner": "opponent",
+        "moves": 23,
+        "model_avg_depth": 4.0,
+        "opponent_avg_depth": 10.4,
+        "model_nodes": 158221,
+        "opponent_nodes": 768836,
+        "wall_time": 6.37
+      },
+      {
+        "winner": "opponent",
+        "moves": 24,
+        "model_avg_depth": 6.8,
+        "opponent_avg_depth": 9.3,
+        "model_nodes": 38255,
+        "opponent_nodes": 714277,
+        "wall_time": 8.54
+      },
+      {
+        "winner": "opponent",
+        "moves": 32,
+        "model_avg_depth": 3.5,
+        "opponent_avg_depth": 8.8,
+        "model_nodes": 108294,
+        "opponent_nodes": 764944,
+        "wall_time": 31.96
+      },
+      {
+        "winner": "opponent",
+        "moves": 26,
+        "model_avg_depth": 8.4,
+        "opponent_avg_depth": 10.2,
+        "model_nodes": 35314,
+        "opponent_nodes": 674671,
+        "wall_time": 7.47
+      },
+      {
+        "winner": "opponent",
+        "moves": 27,
+        "model_avg_depth": 4.1,
+        "opponent_avg_depth": 9.0,
+        "model_nodes": 232086,
+        "opponent_nodes": 710572,
+        "wall_time": 12.73
+      },
+      {
+        "winner": "opponent",
+        "moves": 30,
+        "model_avg_depth": 9.5,
+        "opponent_avg_depth": 8.3,
+        "model_nodes": 208532,
+        "opponent_nodes": 558090,
+        "wall_time": 18.04
+      },
+      {
+        "winner": "opponent",
+        "moves": 28,
+        "model_avg_depth": 4.1,
+        "opponent_avg_depth": 9.9,
+        "model_nodes": 89612,
+        "opponent_nodes": 886931,
+        "wall_time": 6.88
+      },
+      {
+        "winner": "opponent",
+        "moves": 36,
+        "model_avg_depth": 7.1,
+        "opponent_avg_depth": 9.6,
+        "model_nodes": 35341,
+        "opponent_nodes": 1269404,
+        "wall_time": 45.87
+      },
+      {
+        "winner": "opponent",
+        "moves": 31,
+        "model_avg_depth": 3.7,
+        "opponent_avg_depth": 9.1,
+        "model_nodes": 193052,
+        "opponent_nodes": 833984,
+        "wall_time": 9.38
+      },
+      {
+        "winner": "opponent",
+        "moves": 29,
+        "model_avg_depth": 7.1,
+        "opponent_avg_depth": 8.5,
+        "model_nodes": 66054,
+        "opponent_nodes": 657407,
+        "wall_time": 41.34
+      },
+      {
+        "winner": "opponent",
+        "moves": 25,
+        "model_avg_depth": 3.9,
+        "opponent_avg_depth": 10.1,
+        "model_nodes": 173631,
+        "opponent_nodes": 704543,
+        "wall_time": 8.26
+      },
+      {
+        "winner": "opponent",
+        "moves": 30,
+        "model_avg_depth": 6.5,
+        "opponent_avg_depth": 10.6,
+        "model_nodes": 108025,
+        "opponent_nodes": 1081999,
+        "wall_time": 9.5
+      },
+      {
+        "winner": "opponent",
+        "moves": 28,
+        "model_avg_depth": 4.2,
+        "opponent_avg_depth": 8.5,
+        "model_nodes": 193251,
+        "opponent_nodes": 789573,
+        "wall_time": 10.27
+      },
+      {
+        "winner": "opponent",
+        "moves": 23,
+        "model_avg_depth": 7.5,
+        "opponent_avg_depth": 9.1,
+        "model_nodes": 65771,
+        "opponent_nodes": 759494,
+        "wall_time": 59.42
+      },
+      {
+        "winner": "opponent",
+        "moves": 28,
+        "model_avg_depth": 5.4,
+        "opponent_avg_depth": 10.2,
+        "model_nodes": 1045302,
+        "opponent_nodes": 948792,
+        "wall_time": 5.6
+      }
+    ]
   }
 ]
