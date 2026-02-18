@@ -58,40 +58,53 @@ A small neural network trained on millions of self-play positions. More on this 
 
 [NNUE](https://www.chessprogramming.org/NNUE) (Efficiently Updatable Neural Network) is a technique pioneered in Shogi engines and adopted by Stockfish in 2020. The key insight: a small neural network can be dramatically faster than a large one if you design it so the first layer only needs **incremental updates** when a move is made.
 
-### Architecture
+### Architecture: HalfPail NNUE
+
+The current NNUE uses a **dual-perspective** architecture inspired by Stockfish's HalfKP. Instead of encoding the board as a flat feature vector, it uses the pail position as a "bucket" to specialize the network:
 
 ```
-Input (157 features) → Linear(64) → ReLU → Linear(32) → ReLU → Linear(1) → Tanh
-                                                                              ↓
-                                                                        Score: [-1, +1]
+Sparse features (3996 per perspective)
+     ↓ EmbeddingBag(3996, 128)
+     ↓ ReLU
+     ↓
+  concat(white_128, black_128, dense_6) = 262 features
+     ↓ Linear(262, 32)
+     ↓ ReLU
+     ↓ Linear(32, 1)
+     ↓ Tanh
+     ↓
+Score: [-1, +1]
 ```
 
-The network has ~12,000 parameters — tiny by modern standards. This is intentional: the network is evaluated millions of times per second during search, so every microsecond matters.
+The network has **~520,000 parameters**. The sparse first layer uses `EmbeddingBag` — only the active features (typically 3-4 per perspective) are looked up, making it efficient despite the large feature space.
 
 ### Features (What the Network Sees)
 
-The 157 input features encode the board state:
+**Sparse features (3996 per perspective):**
+Each perspective (white/black) encodes pieces relative to the pail position. The pail serves as a "bucket" (37 possible states: 36 squares + no pail placed), and for each bucket, there are 36 squares × 3 piece types = 108 features. Total: 37 × 108 = 3996. Piece types are: friendly barrel, enemy barrel, enemy pail.
 
-| Features | Count | Description |
-|----------|-------|-------------|
-| Board planes | 144 | 6x6 grid with 4 binary channels (white barrel, black barrel, white pail, black pail present at each square) |
-| Barrel distances | 8 | How close each barrel is to scoring (4 per side, sorted, normalized 0-1) |
-| Scored barrels | 2 | How many barrels each side has scored (normalized to 0-1) |
-| Pails placed | 2 | Whether each side has placed their pail (0 or 1) |
-| Current player | 1 | Who moves next (+1 white, -1 black) |
+**Dense features (6):**
+| Feature | Description |
+|---------|-------------|
+| White scored | Barrels scored by white (normalized) |
+| Black scored | Barrels scored by black (normalized) |
+| White pail placed | Whether white has placed their pail (0 or 1) |
+| Black pail placed | Whether black has placed their pail (0 or 1) |
+| White barrels on board | Count of white barrels currently on the board |
+| Black barrels on board | Count of black barrels currently on the board |
 
-The board planes give the network raw spatial information, while the relational features provide pre-computed strategic summaries (like "how close is the nearest barrel to scoring?").
+The dual-perspective design means the network sees the position from both sides simultaneously, which helps it evaluate asymmetric positions more accurately.
 
 ### Incremental Updates (Why NNUE is Fast)
 
-The first layer (`157 → 64`) is the bottleneck — it's a 157x64 matrix multiply. But here's the trick: when a piece moves from square A to square B, only ~2-4 of the 157 input features change. Instead of recomputing the entire first layer, we:
+The first layer is the bottleneck — it maps 3996 sparse features to 128 hidden units. But here's the trick: when a piece moves from square A to square B, only ~2-4 sparse feature indices change per perspective. Instead of recomputing the entire embedding, we:
 
-1. Subtract the contribution of features that turned off
-2. Add the contribution of features that turned on
+1. Subtract the embedding vectors for features that turned off
+2. Add the embedding vectors for features that turned on
 
-This turns an O(157 * 64) operation into an O(4 * 64) operation — roughly **40x faster**. The engine maintains an "accumulator stack" that caches the first-layer output and can be efficiently updated on make/unmake move.
+This turns the first-layer computation from a full lookup into a small incremental update. The engine maintains a "dual accumulator stack" that caches both perspectives and can be efficiently updated on make/unmake move.
 
-The relational features (13 values like barrel distances) can't be incrementally updated since they depend on global board state, so these are recomputed each evaluation and injected via a separate SIMD-accelerated path.
+The 6 dense features depend on global board state and are recomputed each evaluation.
 
 ### SIMD Acceleration
 
@@ -158,7 +171,7 @@ Standard supervised learning: MSE loss, Adam optimizer, ~50 epochs. The trained 
 └──────────────────────────────────────────────────────┘
 ```
 
-The Rust engine (~4,000 lines) handles everything performance-critical: board representation, move generation, search, and NNUE inference. Python handles the training pipeline and the web UI. The two communicate through [PyO3](https://pyo3.rs/) bindings, compiled with [maturin](https://github.com/PyO3/maturin).
+The Rust engine (~5,750 lines) handles everything performance-critical: board representation, move generation, search, and NNUE inference. Python handles the training pipeline and the web UI. The two communicate through [PyO3](https://pyo3.rs/) bindings, compiled with [maturin](https://github.com/PyO3/maturin).
 
 ### Board Representation: Bitboards
 
@@ -203,7 +216,7 @@ from tonnesjakk import Board, Engine
 
 board = Board()
 engine = Engine()
-engine.load_nnue("nnue_weights_gen1.json")
+engine.load_nnue("nnue_halfpail/nnue_weights.json")
 
 result = engine.search(board, depth=7)
 print(f"Best move: {result.best_move}, Score: {result.score}")
@@ -213,42 +226,38 @@ board.make_move(result.best_move)
 ### Train a New NNUE
 
 ```bash
-# Generate self-play data and train (20K games, depth 7, 8 parallel workers)
-python -m tonnesjakk.nnue --games 20000 --depth 7 --lambda 0.85 --workers 8
+# Generate self-play data (streaming mode, 8 parallel workers)
+python -m tonnesjakk.nnue --games 250000 --depth 7 --lambda 1.0 --workers 8 --save-data training_d7.bin --save-every 5000
 
-# Save training data for later reuse
-python -m tonnesjakk.nnue --games 20000 --depth 7 --lambda 0.85 --workers 8 --save-data training.npz
-
-# Train on existing data
-python -m tonnesjakk.nnue --load-data training.npz --epochs 50
+# Train HalfPail NNUE on existing data
+python -m tonnesjakk.nnue --load-data training_consolidator_d9.bin --epochs 50 --halfpail
 
 # Compare NNUE vs heuristic (time-limited, more realistic)
-python scripts/test_model.py nnue_weights.json --time-ms 200 --games 50
+python scripts/test_model.py nnue_halfpail/nnue_weights.json --time-ms 200 --games 50
 
 # Compare at fixed depth
-python -m tonnesjakk.nnue --compare nnue_weights.json heuristic --compare-games 100 --depth 7
+python -m tonnesjakk.nnue --compare nnue_halfpail/nnue_weights.json heuristic --compare-games 50 --depth 5
 ```
 
 ## Performance
 
 On a modern CPU (single-threaded):
 
-| Metric | Heuristic eval | NNUE eval |
-|--------|---------------|-----------|
-| Nodes/sec | ~500K | ~100K |
-| Typical depth in 1s | 10-12 | 7-9 |
+| Metric | Heuristic eval | HalfPail NNUE |
+|--------|---------------|---------------|
+| Nodes/sec | ~500K | ~54K (undertrained) |
+| Typical depth in 1s | 10-12 | 5-7 |
 
-The NNUE is ~5x slower per node but compensates with better positional understanding, leading to more efficient pruning and stronger play at equal time controls.
+The HalfPail NNUE is currently undertrained (5 epochs). Poor eval quality causes inefficient pruning, which reduces effective NPS. Extended training should improve both eval quality and search efficiency simultaneously.
 
 ## Project Structure
 
 ```
 tonnesjakk/
-├── src/lib.rs                    # Rust engine (~4,000 lines)
+├── src/lib.rs                    # Rust engine (~5,750 lines)
 ├── python/tonnesjakk/
 │   ├── nnue.py                   # NNUE training pipeline (PyTorch)
-│   ├── __init__.py               # Python package init
-│   └── export_nnue.py            # Weight export utilities
+│   └── __init__.py               # Python package init
 ├── web/
 │   ├── server.py                 # FastAPI web backend
 │   └── index.html                # Browser-based game UI
@@ -256,8 +265,10 @@ tonnesjakk/
 │   ├── test_model.py             # Time-based model comparison
 │   ├── bench_engine.py           # Engine speed benchmarks
 │   └── diagnose_wdl.py           # Per-move NNUE diagnostic tool
-├── train_nnue.py                 # Convenience wrapper for training
-├── nnue_weights_gen1.json        # Trained NNUE weights
+├── nnue_halfpail/
+│   ├── nnue_weights.json         # Trained HalfPail NNUE weights
+│   └── nnue_model.pt             # PyTorch model checkpoint
+├── training_consolidator_d9.bin  # 70M positions at depth 9
 ├── ENGINE_IMPROVEMENTS.md        # Search optimization roadmap
 ├── CLAUDE.md                     # AI assistant project context
 ├── Cargo.toml                    # Rust dependencies

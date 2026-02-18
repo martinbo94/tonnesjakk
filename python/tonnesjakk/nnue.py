@@ -33,6 +33,14 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 
+# Try to import Rust-accelerated HalfPail decoders
+try:
+    from tonnesjakk import decode_halfpail as _rust_decode_halfpail
+    from tonnesjakk import decode_halfpail_batch as _rust_decode_batch
+except ImportError:
+    _rust_decode_halfpail = None
+    _rust_decode_batch = None
+
 # Constants
 BOARD_SIZE = 6
 NUM_PIECE_TYPES = 4  # WhiteBarrel, BlackBarrel, WhitePail, BlackPail
@@ -61,6 +69,728 @@ INPUT_SIZE = BASE_FEATURES + RELATIONAL_FEATURES  # 164
 # This prevents information loss for extreme scores.
 # 600 means: +600cp → tanh(1) ≈ 0.76, +1200cp → 0.96, +3000cp → 1.00
 SCORE_SCALING = 600.0
+
+# HalfPail feature architecture constants
+# Inspired by Stockfish's HalfKP: piece positions contextualized by pail position.
+# Each perspective sees: bucket (pail position) × square × piece_type_reduced
+HALFPAIL_BUCKETS = 37       # 36 pail squares + 1 for "no pail placed"
+HALFPAIL_PIECE_TYPES = 3    # 0=friendly barrel, 1=enemy barrel, 2=enemy pail
+NUM_SQUARES = BOARD_SIZE * BOARD_SIZE  # 36
+HALFPAIL_FEATURES_PER_BUCKET = NUM_SQUARES * HALFPAIL_PIECE_TYPES  # 36 * 3 = 108
+HALFPAIL_FEATURES = HALFPAIL_BUCKETS * HALFPAIL_FEATURES_PER_BUCKET  # 37 * 108 = 3996
+HALFPAIL_DENSE = 20         # Dense features: all 20 relational features from training data
+
+
+# =============================================================================
+# HalfPail Feature Computation
+# =============================================================================
+
+def decode_board_from_dense164(row: np.ndarray) -> dict:
+    """Decode piece positions and game state from a 164-feature dense row.
+
+    The first 144 features are one-hot piece positions (36 squares × 4 piece types).
+    The remaining 20 are relational features from which we extract scored counts,
+    pail placement flags, current player, and barrels on board.
+
+    Returns:
+        dict with keys: white_barrels (list of sq), black_barrels, white_pail (sq or None),
+        black_pail (sq or None), white_scored, black_scored, current_player (+1/-1),
+        white_barrels_on_board, black_barrels_on_board
+    """
+    base = row[:144].reshape(36, 4)
+
+    white_barrels = []
+    black_barrels = []
+    white_pail = None
+    black_pail = None
+
+    for sq in range(36):
+        if base[sq, 0] > 0.5:
+            white_barrels.append(sq)
+        if base[sq, 1] > 0.5:
+            black_barrels.append(sq)
+        if base[sq, 2] > 0.5:
+            white_pail = sq
+        if base[sq, 3] > 0.5:
+            black_pail = sq
+
+    # Extract from relational features (indices 144+)
+    rel = row[144:]
+    white_scored = round(rel[8] * 4.0)   # feature[8] = white_scored / 4
+    black_scored = round(rel[9] * 4.0)   # feature[9] = black_scored / 4
+    current_player = 1.0 if rel[12] > 0 else -1.0  # feature[12] = +1 or -1
+
+    return {
+        'white_barrels': white_barrels,
+        'black_barrels': black_barrels,
+        'white_pail': white_pail,
+        'black_pail': black_pail,
+        'white_scored': int(white_scored),
+        'black_scored': int(black_scored),
+        'current_player': current_player,
+        'white_barrels_on_board': len(white_barrels),
+        'black_barrels_on_board': len(black_barrels),
+    }
+
+
+def halfpail_feature_index(bucket: int, sq: int, piece_type: int) -> int:
+    """Compute HalfPail sparse feature index.
+
+    Args:
+        bucket: pail square (0-35) or 36 if no pail placed
+        sq: piece square (0-35)
+        piece_type: 0=friendly barrel, 1=enemy barrel, 2=enemy pail
+
+    Returns:
+        Index in range [0, 3996)
+    """
+    return bucket * HALFPAIL_FEATURES_PER_BUCKET + sq * HALFPAIL_PIECE_TYPES + piece_type
+
+
+def board_to_halfpail_indices(board_dict: dict) -> tuple:
+    """Compute HalfPail sparse feature indices for both perspectives.
+
+    For each perspective (white/black):
+    - bucket = own pail square (or 36 if not placed)
+    - Encode all pieces EXCEPT own pail:
+        Type 0: own barrels ("friendly")
+        Type 1: opponent's barrels ("enemy")
+        Type 2: opponent's pail ("enemy pail")
+
+    Also computes the 6 dense features.
+
+    Returns:
+        (white_indices, black_indices, dense_6)
+        where indices are lists of ints in [0, 3996)
+        and dense_6 is a list of 6 floats
+    """
+    wb = board_dict['white_barrels']
+    bb = board_dict['black_barrels']
+    wp = board_dict['white_pail']
+    bp = board_dict['black_pail']
+    ws = board_dict['white_scored']
+    bs = board_dict['black_scored']
+
+    # White perspective: bucket = white pail position
+    w_bucket = wp if wp is not None else 36
+    white_indices = []
+    for sq in wb:
+        white_indices.append(halfpail_feature_index(w_bucket, sq, 0))  # friendly barrel
+    for sq in bb:
+        white_indices.append(halfpail_feature_index(w_bucket, sq, 1))  # enemy barrel
+    if bp is not None:
+        white_indices.append(halfpail_feature_index(w_bucket, bp, 2))  # enemy pail
+
+    # Black perspective: bucket = black pail position
+    b_bucket = bp if bp is not None else 36
+    black_indices = []
+    for sq in bb:
+        black_indices.append(halfpail_feature_index(b_bucket, sq, 0))  # friendly barrel
+    for sq in wb:
+        black_indices.append(halfpail_feature_index(b_bucket, sq, 1))  # enemy barrel
+    if wp is not None:
+        black_indices.append(halfpail_feature_index(b_bucket, wp, 2))  # enemy pail
+
+    # Dense features (6 values)
+    dense = [
+        ws / 4.0,                              # white_scored / 4
+        bs / 4.0,                              # black_scored / 4
+        (ws - bs) / 4.0,                       # score_differential / 4
+        board_dict['current_player'],           # +1 or -1
+        board_dict['white_barrels_on_board'] / 4.0,  # white barrels on board / 4
+        board_dict['black_barrels_on_board'] / 4.0,  # black barrels on board / 4
+    ]
+
+    return white_indices, black_indices, dense
+
+
+def test_halfpail_decoding(n_positions: int = 100):
+    """Round-trip test: generate positions → encode 164 → decode → compute HalfPail indices.
+
+    Verifies that board decoding and index computation work correctly.
+    """
+    from tonnesjakk import Board, Engine
+    import random
+
+    print(f"Testing HalfPail decoding on {n_positions} positions...")
+    engine = Engine()
+    errors = 0
+
+    for i in range(n_positions):
+        board = Board()
+        # Play random moves to get diverse positions
+        for _ in range(random.randint(0, 20)):
+            moves = board.generate_moves()
+            if not moves or board.check_winner():
+                break
+            board.make_move(random.choice(moves))
+
+        if board.check_winner():
+            continue
+
+        # Encode to 164-dim tensor
+        board_array = board.to_array()
+        is_white = "White" in repr(board.current_player)
+        current_player = 1 if is_white else -1
+        tensor = board_to_tensor(
+            board_array,
+            white_scored=board.white_scored,
+            black_scored=board.black_scored,
+            current_player=current_player
+        )
+        row = tensor.numpy()
+
+        # Decode back
+        decoded = decode_board_from_dense164(row)
+
+        # Verify piece positions match
+        expected_wb = []
+        expected_bb_list = []
+        expected_wp = None
+        expected_bp = None
+        for r in range(6):
+            for c in range(6):
+                sq = r * 6 + c
+                val = board_array[r][c]
+                if val == 1:
+                    expected_wb.append(sq)
+                elif val == -1:
+                    expected_bb_list.append(sq)
+                elif val == 2:
+                    expected_wp = sq
+                elif val == -2:
+                    expected_bp = sq
+
+        if sorted(decoded['white_barrels']) != sorted(expected_wb):
+            print(f"  ERROR at pos {i}: white barrels mismatch")
+            errors += 1
+            continue
+        if sorted(decoded['black_barrels']) != sorted(expected_bb_list):
+            print(f"  ERROR at pos {i}: black barrels mismatch")
+            errors += 1
+            continue
+        if decoded['white_pail'] != expected_wp:
+            print(f"  ERROR at pos {i}: white pail mismatch")
+            errors += 1
+            continue
+        if decoded['black_pail'] != expected_bp:
+            print(f"  ERROR at pos {i}: black pail mismatch")
+            errors += 1
+            continue
+
+        # Compute HalfPail indices
+        w_idx, b_idx, dense = board_to_halfpail_indices(decoded)
+
+        # Verify index ranges
+        for idx in w_idx + b_idx:
+            if idx < 0 or idx >= HALFPAIL_FEATURES:
+                print(f"  ERROR at pos {i}: index {idx} out of range [0, {HALFPAIL_FEATURES})")
+                errors += 1
+                break
+
+        # Verify dense features
+        if len(dense) != HALFPAIL_DENSE:
+            print(f"  ERROR at pos {i}: dense has {len(dense)} features, expected {HALFPAIL_DENSE}")
+            errors += 1
+
+        # Verify active feature count is reasonable (barrels + pails on board)
+        n_pieces = len(decoded['white_barrels']) + len(decoded['black_barrels'])
+        if decoded['white_pail'] is not None:
+            n_pieces += 1
+        if decoded['black_pail'] is not None:
+            n_pieces += 1
+        # Each perspective encodes all pieces except own pail
+        # White perspective: own barrels + enemy barrels + enemy pail (if placed)
+        expected_w = len(decoded['white_barrels']) + len(decoded['black_barrels'])
+        if decoded['black_pail'] is not None:
+            expected_w += 1
+        if len(w_idx) != expected_w:
+            print(f"  ERROR at pos {i}: white has {len(w_idx)} indices, expected {expected_w}")
+            errors += 1
+
+    if errors == 0:
+        print(f"  All {n_positions} positions passed!")
+    else:
+        print(f"  {errors} errors found!")
+    return errors == 0
+
+
+# =============================================================================
+# HalfPail Neural Network
+# =============================================================================
+
+class HalfPailNNUE(nn.Module):
+    """
+    HalfPail NNUE with dual-perspective sparse features.
+
+    Architecture:
+        White sparse indices → EmbeddingBag(3996, H1, sum) + bias → ReLU → acc_white
+        Black sparse indices → EmbeddingBag(3996, H1, sum) + bias → ReLU → acc_black
+                                    (shared weights)
+        concat(acc_white, acc_black, dense_20) → FC2(2*H1+20, H2) → ReLU → FC3(H2, 1) → Tanh
+    """
+
+    def __init__(self, hidden1: int = 128, hidden2: int = 32):
+        super().__init__()
+        self.hidden1 = hidden1
+        self.hidden2 = hidden2
+        self.num_perspective_features = HALFPAIL_FEATURES  # 3996
+        self.dense_size = HALFPAIL_DENSE  # 6
+
+        # Shared perspective embedding (FC1 equivalent)
+        # EmbeddingBag with mode='sum' acts like sparse matrix multiplication
+        self.embedding = nn.EmbeddingBag(
+            num_embeddings=HALFPAIL_FEATURES,
+            embedding_dim=hidden1,
+            mode='sum',
+        )
+        self.fc1_bias = nn.Parameter(torch.zeros(hidden1))
+
+        # FC2: takes concat of both accumulators + dense features
+        fc2_input = 2 * hidden1 + HALFPAIL_DENSE
+        self.fc2 = nn.Linear(fc2_input, hidden2)
+        self.fc3 = nn.Linear(hidden2, 1)
+
+        # Initialize
+        nn.init.xavier_uniform_(self.embedding.weight)
+        nn.init.xavier_uniform_(self.fc2.weight)
+        nn.init.zeros_(self.fc2.bias)
+        nn.init.xavier_uniform_(self.fc3.weight)
+        nn.init.zeros_(self.fc3.bias)
+
+    def forward(self, white_indices, white_offsets, black_indices, black_offsets, dense):
+        """
+        Forward pass with packed EmbeddingBag inputs.
+
+        Args:
+            white_indices: packed 1D tensor of white perspective feature indices
+            white_offsets: start offset for each sample in white_indices
+            black_indices: packed 1D tensor of black perspective feature indices
+            black_offsets: start offset for each sample in black_indices
+            dense: [batch_size, 20] dense features
+        """
+        # Shared embedding for both perspectives
+        acc_white = self.embedding(white_indices, white_offsets) + self.fc1_bias
+        acc_white = torch.relu(acc_white)
+
+        acc_black = self.embedding(black_indices, black_offsets) + self.fc1_bias
+        acc_black = torch.relu(acc_black)
+
+        # Concatenate: [acc_white, acc_black, dense]
+        combined = torch.cat([acc_white, acc_black, dense], dim=1)
+
+        # FC2 → ReLU → FC3 → Tanh
+        h = torch.relu(self.fc2(combined))
+        out = torch.tanh(self.fc3(h))
+        return out
+
+    @property
+    def num_parameters(self) -> int:
+        return sum(p.numel() for p in self.parameters())
+
+
+class HalfPailDataset(torch.utils.data.Dataset):
+    """Dataset that decodes 164-dim dense features to HalfPail sparse indices on-the-fly.
+
+    Wraps existing memmap or numpy array of shape (N, 164) with labels (N,).
+    Supports multi-worker DataLoader on Windows (spawn) by lazily re-opening
+    memmap files in each worker process instead of pickling the arrays.
+    """
+
+    def __init__(self, X, y, start: int = 0, end: int = None):
+        """
+        Args:
+            X: features array (N, 164) - numpy array or memmap (full, unsliced)
+            y: labels array (N,) or (N, 1)
+            start: start index for this subset
+            end: end index for this subset (None = len(X))
+        """
+        self._start = start
+        self._end = end if end is not None else len(X)
+        self.n = self._end - self._start
+        # Store memmap metadata for lazy re-opening in worker processes
+        if isinstance(X, np.memmap):
+            self._x_path = X.filename
+            self._x_shape = (len(X), X.shape[1]) if X.ndim == 2 else (len(X),)
+            self._y_path = y.filename
+            self._y_shape = (len(y),)
+            self._is_memmap = True
+            self.X = None
+            self.y = None
+        else:
+            self._is_memmap = False
+            self.X = X
+            self.y = y
+
+    def __getstate__(self):
+        """Exclude memmap arrays from pickling (for Windows spawn workers)."""
+        state = self.__dict__.copy()
+        if self._is_memmap:
+            state['X'] = None
+            state['y'] = None
+        return state
+
+    def _ensure_open(self):
+        """Lazily re-open memmap files (called in worker processes)."""
+        if self._is_memmap and self.X is None:
+            self.X = np.memmap(self._x_path, dtype=np.float32, mode='r', shape=self._x_shape)
+            self.y = np.memmap(self._y_path, dtype=np.float32, mode='r', shape=self._y_shape)
+
+    def __len__(self):
+        return self.n
+
+    def __getitem__(self, idx):
+        self._ensure_open()
+        real_idx = self._start + idx
+        row = np.array(self.X[real_idx], dtype=np.float32)
+        label = float(self.y[real_idx]) if self.y.ndim == 1 else float(self.y[real_idx, 0])
+
+        if _rust_decode_halfpail is not None:
+            w_idx, b_idx, dense = _rust_decode_halfpail(row.tolist())
+        else:
+            board = decode_board_from_dense164(row)
+            w_idx, b_idx, dense = board_to_halfpail_indices(board)
+
+        return (
+            torch.tensor(w_idx, dtype=torch.long),
+            torch.tensor(b_idx, dtype=torch.long),
+            torch.tensor(dense, dtype=torch.float32),
+            torch.tensor([label], dtype=torch.float32),
+        )
+
+
+def halfpail_collate_fn(batch):
+    """Custom collate function for HalfPailDataset.
+
+    Packs variable-length index lists into the format EmbeddingBag expects:
+    a single 1D tensor of indices and a 1D tensor of offsets.
+    """
+    all_w_idx = []
+    all_b_idx = []
+    w_offsets = [0]
+    b_offsets = [0]
+    dense_list = []
+    label_list = []
+
+    for w_idx, b_idx, dense, label in batch:
+        all_w_idx.append(w_idx)
+        all_b_idx.append(b_idx)
+        w_offsets.append(w_offsets[-1] + len(w_idx))
+        b_offsets.append(b_offsets[-1] + len(b_idx))
+        dense_list.append(dense)
+        label_list.append(label)
+
+    white_indices = torch.cat(all_w_idx) if all_w_idx else torch.tensor([], dtype=torch.long)
+    black_indices = torch.cat(all_b_idx) if all_b_idx else torch.tensor([], dtype=torch.long)
+    white_offsets = torch.tensor(w_offsets[:-1], dtype=torch.long)
+    black_offsets = torch.tensor(b_offsets[:-1], dtype=torch.long)
+    dense = torch.stack(dense_list)
+    labels = torch.stack(label_list)
+
+    return white_indices, white_offsets, black_indices, black_offsets, dense, labels
+
+
+class ChunkedBatchSampler(torch.utils.data.Sampler):
+    """Yields batches of contiguous indices with shuffled chunk order.
+
+    Instead of globally shuffling indices (terrible for memmap I/O),
+    divides the dataset into large contiguous chunks, shuffles the chunk order,
+    and yields batch_size-sized slices from each chunk sequentially.
+    """
+
+    def __init__(self, dataset_size: int, batch_size: int, chunk_size: int, shuffle: bool = True):
+        self.dataset_size = dataset_size
+        self.batch_size = batch_size
+        self.chunk_size = chunk_size
+        self.shuffle = shuffle
+
+    def __iter__(self):
+        n_chunks = (self.dataset_size + self.chunk_size - 1) // self.chunk_size
+        chunk_order = np.arange(n_chunks)
+        if self.shuffle:
+            np.random.shuffle(chunk_order)
+
+        for ci in chunk_order:
+            chunk_start = ci * self.chunk_size
+            chunk_end = min(chunk_start + self.chunk_size, self.dataset_size)
+            # Yield batch_size slices of contiguous indices within this chunk
+            for bs in range(chunk_start, chunk_end, self.batch_size):
+                yield list(range(bs, min(bs + self.batch_size, chunk_end)))
+
+    def __len__(self):
+        return (self.dataset_size + self.batch_size - 1) // self.batch_size
+
+
+def _rust_batch_decode_chunk(X_chunk, y_chunk):
+    """Decode a contiguous chunk of rows using Rust batch decoder.
+
+    Returns tensors ready for model forward pass, same format as halfpail_collate_fn.
+    """
+    # Convert to flat Python lists for Rust extraction (fastest measured path)
+    flat_x = np.ascontiguousarray(X_chunk, dtype=np.float32).ravel().tolist()
+    flat_y = np.ascontiguousarray(y_chunk, dtype=np.float32).ravel().tolist()
+
+    w_idx, w_off, b_idx, b_off, dense_flat, labels_flat = _rust_decode_batch(flat_x, flat_y)
+
+    n = len(w_off)
+    return (
+        torch.tensor(w_idx, dtype=torch.long),
+        torch.tensor(w_off, dtype=torch.long),
+        torch.tensor(b_idx, dtype=torch.long),
+        torch.tensor(b_off, dtype=torch.long),
+        torch.tensor(dense_flat, dtype=torch.float32).view(n, HALFPAIL_DENSE),
+        torch.tensor(labels_flat, dtype=torch.float32).unsqueeze(1),
+    )
+
+
+def train_halfpail_model(
+    X,  # np.ndarray or np.memmap, shape (N, 164)
+    y,  # np.ndarray or np.memmap, shape (N,) or (N, 1)
+    hidden1: int = 128,
+    hidden2: int = 32,
+    epochs: int = 200,
+    batch_size: int = 4096,
+    learning_rate: float = 0.003,
+    validation_split: float = 0.1,
+    verbose: bool = True,
+    loss_fn: str = "wdl-ce",
+    num_workers: int = 0,
+    resume_from: Optional[str] = None,
+) -> tuple:
+    """Train a HalfPail NNUE model.
+
+    Uses Rust batch decoding for fast on-the-fly feature computation.
+    Falls back to Python DataLoader if Rust batch decoder is unavailable.
+
+    Returns:
+        (model, history)
+    """
+    n = len(X)
+    split = int((1 - validation_split) * n)
+    train_n = split
+    y_flat = y.ravel() if y.ndim > 1 else y
+
+    use_rust_batch = _rust_decode_batch is not None
+
+    model = HalfPailNNUE(hidden1, hidden2)
+    if resume_from:
+        state = torch.load(resume_from, map_location="cpu", weights_only=True)
+        model.load_state_dict(state)
+        if verbose:
+            print(f"  Resumed from: {resume_from}")
+    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+
+    # Cosine annealing: LR decays from initial to ~0 over all epochs
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=learning_rate * 0.01)
+
+    if loss_fn == "wdl-ce":
+        criterion = wdl_cross_entropy
+    else:
+        criterion = nn.MSELoss()
+
+    history = {'train_loss': [], 'val_loss': []}
+    best_val_loss = float('inf')
+    best_model_state = None
+
+    if verbose:
+        fc2_input = 2 * hidden1 + HALFPAIL_DENSE
+        print(f"  Training set: {train_n:,} positions")
+        print(f"  Validation set: {n - split:,} positions")
+        mode = "Rust batch decode (contiguous reads)" if use_rust_batch else "Python DataLoader"
+        print(f"  Mode: HalfPail dual-perspective sparse features")
+        print(f"  Decoder: {mode}")
+        print(f"  Loss: {loss_fn}")
+        print(f"  LR: {learning_rate} (cosine annealing -> {learning_rate * 0.01:.6f})")
+        print(f"  Architecture: EmbeddingBag({HALFPAIL_FEATURES}, {hidden1}) shared")
+        print(f"    FC2: {fc2_input} -> {hidden2}, FC3: {hidden2} -> 1")
+        print(f"  Parameters: {model.num_parameters:,}")
+
+    if use_rust_batch:
+        # Fast path: contiguous chunk reads + Rust batch decode (no DataLoader needed)
+        n_chunks = (train_n + batch_size - 1) // batch_size
+        chunk_order = np.arange(n_chunks)
+
+        val_n = n - split
+        val_n_chunks = (val_n + batch_size - 1) // batch_size
+
+        train_start = time.time()
+        for epoch in range(epochs):
+            epoch_start = time.time()
+            model.train()
+            np.random.shuffle(chunk_order)  # shuffle chunk ORDER, not indices
+            total_loss = 0.0
+            num_batches = 0
+
+            for ci in chunk_order:
+                start = ci * batch_size
+                end = min(start + batch_size, train_n)
+                # Contiguous read from memmap + Rust batch decode
+                w_idx, w_off, b_idx, b_off, dense, labels = _rust_batch_decode_chunk(
+                    X[start:end], y_flat[start:end]
+                )
+
+                optimizer.zero_grad()
+                pred = model(w_idx, w_off, b_idx, b_off, dense)
+                loss = criterion(pred, labels)
+                loss.backward()
+                optimizer.step()
+                total_loss += loss.item()
+                num_batches += 1
+
+            train_loss = total_loss / max(num_batches, 1)
+
+            # Validation (chunked to avoid OOM)
+            model.eval()
+            val_loss_total = 0.0
+            val_batches = 0
+            with torch.no_grad():
+                for vi in range(val_n_chunks):
+                    vs = split + vi * batch_size
+                    ve = min(vs + batch_size, n)
+                    w_idx, w_off, b_idx, b_off, dense, labels = _rust_batch_decode_chunk(
+                        X[vs:ve], y_flat[vs:ve]
+                    )
+                    pred = model(w_idx, w_off, b_idx, b_off, dense)
+                    val_loss_total += criterion(pred, labels).item() * (ve - vs)
+                    val_batches += (ve - vs)
+            val_loss = val_loss_total / max(val_batches, 1)
+
+            history['train_loss'].append(train_loss)
+            history['val_loss'].append(val_loss)
+
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                best_model_state = {k: v.clone() for k, v in model.state_dict().items()}
+                marker = " *"
+            else:
+                marker = ""
+
+            scheduler.step()
+
+            if verbose:
+                current_lr = optimizer.param_groups[0]['lr']
+                epoch_time = time.time() - epoch_start
+                elapsed = time.time() - train_start
+                eta = epoch_time * (epochs - epoch - 1)
+                print(f"  Epoch {epoch+1:3d}/{epochs}: "
+                      f"train={train_loss:.4f}, val={val_loss:.4f} "
+                      f"lr={current_lr:.6f} "
+                      f"({epoch_time:.0f}s, total {elapsed:.0f}s, ETA {eta/60:.0f}m){marker}", flush=True)
+    else:
+        # Fallback: Python DataLoader with per-sample decode
+        train_dataset = HalfPailDataset(X, y, start=0, end=split)
+        val_dataset = HalfPailDataset(X, y, start=split, end=n)
+
+        chunk_size = batch_size * max(num_workers, 1) * 4
+        train_sampler = ChunkedBatchSampler(len(train_dataset), batch_size, chunk_size, shuffle=True)
+
+        train_loader = torch.utils.data.DataLoader(
+            train_dataset,
+            batch_sampler=train_sampler,
+            collate_fn=halfpail_collate_fn,
+            num_workers=num_workers,
+            pin_memory=torch.cuda.is_available(),
+        )
+        val_loader = torch.utils.data.DataLoader(
+            val_dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            collate_fn=halfpail_collate_fn,
+            num_workers=num_workers,
+            pin_memory=torch.cuda.is_available(),
+        )
+
+        train_start = time.time()
+        for epoch in range(epochs):
+            epoch_start = time.time()
+            model.train()
+            total_loss = 0.0
+            num_batches = 0
+
+            for w_idx, w_off, b_idx, b_off, dense, labels in train_loader:
+                optimizer.zero_grad()
+                pred = model(w_idx, w_off, b_idx, b_off, dense)
+                loss = criterion(pred, labels)
+                loss.backward()
+                optimizer.step()
+                total_loss += loss.item()
+                num_batches += 1
+
+            train_loss = total_loss / max(num_batches, 1)
+
+            model.eval()
+            val_loss_total = 0.0
+            val_batches = 0
+            with torch.no_grad():
+                for w_idx, w_off, b_idx, b_off, dense, labels in val_loader:
+                    pred = model(w_idx, w_off, b_idx, b_off, dense)
+                    val_loss_total += criterion(pred, labels).item()
+                    val_batches += 1
+
+            val_loss = val_loss_total / max(val_batches, 1)
+
+            history['train_loss'].append(train_loss)
+            history['val_loss'].append(val_loss)
+
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                best_model_state = {k: v.clone() for k, v in model.state_dict().items()}
+                marker = " *"
+            else:
+                marker = ""
+
+            scheduler.step()
+
+            if verbose:
+                current_lr = optimizer.param_groups[0]['lr']
+                epoch_time = time.time() - epoch_start
+                elapsed = time.time() - train_start
+                eta = epoch_time * (epochs - epoch - 1)
+                print(f"  Epoch {epoch+1:3d}/{epochs}: "
+                      f"train={train_loss:.4f}, val={val_loss:.4f} "
+                      f"lr={current_lr:.6f} "
+                      f"({epoch_time:.0f}s, total {elapsed:.0f}s, ETA {eta/60:.0f}m){marker}", flush=True)
+
+    if best_model_state is not None:
+        model.load_state_dict(best_model_state)
+
+    if verbose:
+        print(f"  Best validation loss: {best_val_loss:.4f}")
+
+    return model, history
+
+
+def export_halfpail_json(model: HalfPailNNUE, output_path: str):
+    """Export HalfPail NNUE weights to JSON for Rust inference.
+
+    The JSON includes a "halfpail": true marker so the Rust engine
+    can detect the model format and load accordingly.
+    """
+    state = model.state_dict()
+
+    weights = {
+        "fc1_weight": state['embedding.weight'].tolist(),  # [3996][H1]
+        "fc1_bias": state['fc1_bias'].tolist(),             # [H1]
+        "fc2_weight": state['fc2.weight'].tolist(),         # [H2][2*H1+20]
+        "fc2_bias": state['fc2.bias'].tolist(),             # [H2]
+        "fc3_weight": state['fc3.weight'].tolist(),         # [1][H2]
+        "fc3_bias": state['fc3.bias'].tolist(),             # [1]
+    }
+
+    output = {
+        "halfpail": True,
+        "hidden1": model.hidden1,
+        "hidden2": model.hidden2,
+        "num_perspective_features": model.num_perspective_features,
+        "dense_size": model.dense_size,
+        "weights": weights,
+    }
+
+    with open(output_path, "w") as f:
+        json.dump(output, f)
+
+    file_size = Path(output_path).stat().st_size
+    print(f"Exported HalfPail model to {output_path} ({file_size / 1024 / 1024:.1f} MB)")
 
 
 # =============================================================================
@@ -887,17 +1617,37 @@ def _generate_games_worker(args):
 # Training
 # =============================================================================
 
+def wdl_cross_entropy(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """
+    Cross-entropy loss in Win-Draw-Loss probability space.
+
+    Converts tanh-space values [-1, 1] to WDL probabilities [0, 1]
+    and applies binary cross-entropy. This penalizes confident wrong
+    predictions much harder than MSE, forcing the network to learn
+    correct position ordering rather than outputting safe near-zero values.
+
+    Inspired by Stockfish NNUE training (nnue-pytorch).
+    """
+    eps = 1e-7
+    # Convert from tanh space [-1, 1] to WDL probability space [0, 1]
+    p = torch.clamp((pred + 1) / 2, eps, 1 - eps)
+    t = torch.clamp((target + 1) / 2, eps, 1 - eps)
+    # Binary cross-entropy
+    return -torch.mean(t * torch.log(p) + (1 - t) * torch.log(1 - p))
+
+
 def train_model(
     X,  # torch.Tensor or np.memmap
     y,  # torch.Tensor or np.memmap
     hidden1: int = 64,
     hidden2: int = 32,
     input_size: int = INPUT_SIZE,
-    epochs: int = 50,
-    batch_size: int = 128,
+    epochs: int = 200,
+    batch_size: int = 4096,
     learning_rate: float = 0.001,
     validation_split: float = 0.1,
-    verbose: bool = True
+    verbose: bool = True,
+    loss_fn: str = "wdl-ce"
 ) -> Tuple[TonnesjakkNNUE, Dict]:
     """
     Train the NNUE model.
@@ -916,6 +1666,7 @@ def train_model(
         learning_rate: Adam learning rate
         validation_split: Fraction for validation
         verbose: Print progress
+        loss_fn: Loss function - "mse" or "wdl-ce" (cross-entropy in WDL space)
 
     Returns:
         (model, history) - trained model and training history
@@ -923,94 +1674,156 @@ def train_model(
     streaming = isinstance(X, np.memmap)
     n = len(X)
 
-    # Split into train/val using indices (works for both tensor and mmap)
-    indices = np.arange(n)
-    np.random.shuffle(indices)
-    split = int((1 - validation_split) * n)
-
-    train_idx = indices[:split]
-    val_idx = indices[split:]
-
-    if verbose:
-        print(f"  Training set: {len(train_idx):,} positions")
-        print(f"  Validation set: {len(val_idx):,} positions")
-        if streaming:
-            print(f"  Mode: streaming (memory-mapped, low RAM)")
-
     # Create model
     model = TonnesjakkNNUE(hidden1, hidden2, input_size=input_size)
-    if verbose:
-        print(f"  Model: {input_size} -> {hidden1} -> {hidden2} -> 1 "
-              f"({model.num_parameters:,} parameters)")
-
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
-    criterion = nn.MSELoss()
+    if loss_fn == "wdl-ce":
+        criterion = wdl_cross_entropy
+    else:
+        criterion = nn.MSELoss()
 
     history = {'train_loss': [], 'val_loss': []}
     best_val_loss = float('inf')
     best_model_state = None
 
-    # Pre-load validation set (small enough to fit in RAM)
     if streaming:
-        X_val = torch.tensor(np.array(X[val_idx]), dtype=torch.float32)
-        y_val_np = np.array(y[val_idx])
+        # Streaming mode: use contiguous slices to avoid random memmap access.
+        # Data from many independent games is already well-shuffled, so a
+        # contiguous train/val split is fine.
+        split = int((1 - validation_split) * n)
+        train_n = split
+
+        if verbose:
+            print(f"  Training set: {train_n:,} positions")
+            print(f"  Validation set: {n - split:,} positions")
+            print(f"  Mode: streaming (memory-mapped, contiguous reads)")
+            print(f"  Loss: {loss_fn} ({'WDL cross-entropy' if loss_fn == 'wdl-ce' else 'mean squared error'})")
+            print(f"  Model: {input_size} -> {hidden1} -> {hidden2} -> 1 "
+                  f"({model.num_parameters:,} parameters)")
+
+        # Load validation set as one contiguous sequential read
+        X_val = torch.tensor(np.array(X[split:n]), dtype=torch.float32)
+        y_val_np = np.array(y[split:n])
         y_val = torch.tensor(y_val_np, dtype=torch.float32).unsqueeze(1) if y_val_np.ndim == 1 else torch.tensor(y_val_np, dtype=torch.float32)
+
+        # Pre-compute chunk layout for training
+        n_chunks = (train_n + batch_size - 1) // batch_size
+        chunk_order = np.arange(n_chunks)
+
+        train_start = time.time()
+        for epoch in range(epochs):
+            epoch_start = time.time()
+            model.train()
+            np.random.shuffle(chunk_order)  # shuffle chunk ORDER, not indices
+
+            total_loss = 0.0
+            num_batches = 0
+
+            for ci in chunk_order:
+                start = ci * batch_size
+                end = min(start + batch_size, train_n)
+                # Contiguous sequential read from memmap (fast)
+                batch_X = torch.tensor(np.array(X[start:end]), dtype=torch.float32)
+                batch_y_np = np.array(y[start:end])
+                batch_y = torch.tensor(batch_y_np, dtype=torch.float32).unsqueeze(1) if batch_y_np.ndim == 1 else torch.tensor(batch_y_np, dtype=torch.float32)
+
+                optimizer.zero_grad()
+                pred = model(batch_X)
+                loss = criterion(pred, batch_y)
+                loss.backward()
+                optimizer.step()
+
+                total_loss += loss.item()
+                num_batches += 1
+
+            # -- end of streaming epoch: validate and log --
+            train_loss = total_loss / num_batches
+            model.eval()
+            with torch.no_grad():
+                val_pred = model(X_val)
+                val_loss = criterion(val_pred, y_val).item()
+
+            history['train_loss'].append(train_loss)
+            history['val_loss'].append(val_loss)
+
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                best_model_state = model.state_dict().copy()
+                marker = " *"
+            else:
+                marker = ""
+
+            if verbose:
+                epoch_time = time.time() - epoch_start
+                elapsed = time.time() - train_start
+                eta = epoch_time * (epochs - epoch - 1)
+                print(f"  Epoch {epoch+1:3d}/{epochs}: "
+                      f"train={train_loss:.4f}, val={val_loss:.4f} "
+                      f"({epoch_time:.0f}s, total {elapsed:.0f}s, ETA {eta/60:.0f}m){marker}", flush=True)
     else:
+        # In-memory mode: random index shuffling is fine
+        indices = np.arange(n)
+        np.random.shuffle(indices)
+        split = int((1 - validation_split) * n)
+        train_idx = indices[:split]
+        val_idx = indices[split:]
+
+        if verbose:
+            print(f"  Training set: {len(train_idx):,} positions")
+            print(f"  Validation set: {len(val_idx):,} positions")
+            print(f"  Loss: {loss_fn} ({'WDL cross-entropy' if loss_fn == 'wdl-ce' else 'mean squared error'})")
+            print(f"  Model: {input_size} -> {hidden1} -> {hidden2} -> 1 "
+                  f"({model.num_parameters:,} parameters)")
+
         X_val, y_val = X[val_idx], y[val_idx]
 
-    for epoch in range(epochs):
-        model.train()
+        train_start = time.time()
+        for epoch in range(epochs):
+            epoch_start = time.time()
+            model.train()
+            np.random.shuffle(train_idx)
 
-        # Shuffle training indices
-        np.random.shuffle(train_idx)
+            total_loss = 0.0
+            num_batches = 0
 
-        # Mini-batch training
-        total_loss = 0.0
-        num_batches = 0
-
-        for i in range(0, len(train_idx), batch_size):
-            batch_idx = train_idx[i: i + batch_size]
-
-            if streaming:
-                # Load just this batch from mmap
-                batch_X = torch.tensor(np.array(X[batch_idx]), dtype=torch.float32)
-                batch_y_np = np.array(y[batch_idx])
-                batch_y = torch.tensor(batch_y_np, dtype=torch.float32).unsqueeze(1) if batch_y_np.ndim == 1 else torch.tensor(batch_y_np, dtype=torch.float32)
-            else:
+            for i in range(0, len(train_idx), batch_size):
+                batch_idx = train_idx[i: i + batch_size]
                 batch_X = X[batch_idx]
                 batch_y = y[batch_idx]
 
-            optimizer.zero_grad()
-            pred = model(batch_X)
-            loss = criterion(pred, batch_y)
-            loss.backward()
-            optimizer.step()
+                optimizer.zero_grad()
+                pred = model(batch_X)
+                loss = criterion(pred, batch_y)
+                loss.backward()
+                optimizer.step()
 
-            total_loss += loss.item()
-            num_batches += 1
+                total_loss += loss.item()
+                num_batches += 1
 
-        train_loss = total_loss / num_batches
+            # -- end of in-memory epoch: validate and log --
+            train_loss = total_loss / num_batches
+            model.eval()
+            with torch.no_grad():
+                val_pred = model(X_val)
+                val_loss = criterion(val_pred, y_val).item()
 
-        # Validation
-        model.eval()
-        with torch.no_grad():
-            val_pred = model(X_val)
-            val_loss = criterion(val_pred, y_val).item()
+            history['train_loss'].append(train_loss)
+            history['val_loss'].append(val_loss)
 
-        history['train_loss'].append(train_loss)
-        history['val_loss'].append(val_loss)
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                best_model_state = model.state_dict().copy()
+                marker = " *"
+            else:
+                marker = ""
 
-        # Save best model
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            best_model_state = model.state_dict().copy()
-            marker = " *"
-        else:
-            marker = ""
-
-        if verbose:
-            print(f"  Epoch {epoch+1:3d}/{epochs}: "
-                  f"train={train_loss:.4f}, val={val_loss:.4f}{marker}", flush=True)
+            if verbose:
+                epoch_time = time.time() - epoch_start
+                elapsed = time.time() - train_start
+                eta = epoch_time * (epochs - epoch - 1)
+                print(f"  Epoch {epoch+1:3d}/{epochs}: "
+                      f"train={train_loss:.4f}, val={val_loss:.4f} "
+                      f"({epoch_time:.0f}s, total {elapsed:.0f}s, ETA {eta/60:.0f}m){marker}", flush=True)
 
     # Restore best model
     if best_model_state is not None:
@@ -1061,6 +1874,103 @@ def export_to_json(model: TonnesjakkNNUE, output_path: str):
     print(f"Exported to {output_path}")
 
 
+def export_quantized_json(
+    model: TonnesjakkNNUE,
+    output_path: str,
+    fc1_scale: int = 512,
+    fc2_scale: int = 64,
+    fc3_scale: int = 64,
+    crelu_shift: int = 4,
+):
+    """
+    Export model weights in quantized int16 format for fast Rust inference.
+
+    Quantization scheme (Stockfish-style fixed-point):
+    - FC1 weights/bias: i16 at fc1_scale (default 512)
+    - FC2 weights: i16 at fc2_scale (default 64), bias: i32
+    - FC3 weights: i16 at fc3_scale (default 64), bias: i32
+    - ClippedReLU between FC1 and FC2: clamp(acc >> crelu_shift, 0, 127)
+
+    The accumulator (FC1 output) holds values at scale fc1_scale.
+    After ClippedReLU with right-shift, values are in [0, 127].
+    FC2 dot product produces i32 at scale (fc1_scale >> crelu_shift) * fc2_scale.
+    FC3 produces the final i32 output, converted to f32 via output_scale.
+    """
+    state_dict = model.state_dict()
+
+    # Extract f32 weights
+    fc1_w = state_dict['net.0.weight']  # [hidden1, input_size]
+    fc1_b = state_dict['net.0.bias']    # [hidden1]
+    fc2_w = state_dict['net.2.weight']  # [hidden2, hidden1]
+    fc2_b = state_dict['net.2.bias']    # [hidden2]
+    fc3_w = state_dict['net.4.weight']  # [1, hidden2]
+    fc3_b = state_dict['net.4.bias']    # [1]
+
+    # Quantize FC1: i16 at fc1_scale
+    fc1_w_q = torch.clamp(torch.round(fc1_w * fc1_scale), -32768, 32767).to(torch.int32)
+    fc1_b_q = torch.clamp(torch.round(fc1_b * fc1_scale), -32768, 32767).to(torch.int32)
+
+    # Quantize FC2: i16 weights at fc2_scale
+    fc2_w_q = torch.clamp(torch.round(fc2_w * fc2_scale), -32768, 32767).to(torch.int32)
+
+    # FC2 bias: i32 at scale (fc1_scale >> crelu_shift) * fc2_scale
+    # This matches the scale of dot(clipped_relu_output, fc2_weight)
+    fc2_bias_scale = (fc1_scale >> crelu_shift) * fc2_scale
+    fc2_b_q = torch.round(fc2_b * fc2_bias_scale).to(torch.int32)
+
+    # Quantize FC3: i16 weights at fc3_scale
+    fc3_w_q = torch.clamp(torch.round(fc3_w * fc3_scale), -32768, 32767).to(torch.int32)
+
+    # FC3 bias: i32 at scale that matches FC3 input * fc3_scale
+    # FC3 input comes from FC2 output after ReLU + rescaling.
+    # We convert FC2 output to a clipped range before FC3, so FC3 bias scale
+    # matches: fc3_scale * FC2_CRELU_DIVISOR (we use a second clamp for FC2 output)
+    # For simplicity: FC3 bias = round(bias * fc2_bias_scale * fc3_scale / fc2_scale)
+    # Actually, FC3 input scale = fc2_bias_scale (since we just ReLU, no shift for FC2->FC3)
+    # So FC3 output scale = fc2_bias_scale * fc3_scale
+    fc3_output_scale = fc2_bias_scale * fc3_scale
+    fc3_b_q = torch.round(fc3_b * fc3_output_scale).to(torch.int32)
+
+    # output_scale converts the final i32 output back to the [-1, 1] tanh input range
+    output_scale = 1.0 / fc3_output_scale
+
+    output = {
+        "quantized": True,
+        "hidden1": model.hidden1,
+        "hidden2": model.hidden2,
+        "input_size": model.input_size,
+        "fc1_weight_scale": fc1_scale,
+        "fc2_weight_scale": fc2_scale,
+        "fc3_weight_scale": fc3_scale,
+        "crelu_shift": crelu_shift,
+        "output_scale": output_scale,
+        "weights": {
+            "fc1_weight": fc1_w_q.tolist(),
+            "fc1_bias": fc1_b_q.tolist(),
+            "fc2_weight": fc2_w_q.tolist(),
+            "fc2_bias": fc2_b_q.tolist(),
+            "fc3_weight": fc3_w_q.squeeze(0).tolist(),  # [hidden2] not [1, hidden2]
+            "fc3_bias": int(fc3_b_q.item()),
+        }
+    }
+
+    with open(output_path, "w") as f:
+        json.dump(output, f)
+
+    # Print quantization stats
+    fc1_w_list = fc1_w_q.flatten().tolist()
+    fc2_w_list = fc2_w_q.flatten().tolist()
+    fc3_w_list = fc3_w_q.flatten().tolist()
+    print(f"Exported quantized weights to {output_path}")
+    print(f"  FC1 weights: i16 range [{min(fc1_w_list)}, {max(fc1_w_list)}] (scale={fc1_scale})")
+    print(f"  FC1 bias: i16 range [{min(fc1_b_q.tolist())}, {max(fc1_b_q.tolist())}]")
+    print(f"  FC2 weights: i16 range [{min(fc2_w_list)}, {max(fc2_w_list)}] (scale={fc2_scale})")
+    print(f"  FC2 bias: i32 (scale={fc2_bias_scale})")
+    print(f"  FC3 weights: i16 range [{min(fc3_w_list)}, {max(fc3_w_list)}] (scale={fc3_scale})")
+    print(f"  ClippedReLU shift: {crelu_shift}")
+    print(f"  Output scale: {output_scale:.10f}")
+
+
 # =============================================================================
 # Main Training Pipeline
 # =============================================================================
@@ -1071,7 +1981,7 @@ def train_nnue(
     random_moves: int = 4,
     hidden1: int = 64,
     hidden2: int = 32,
-    epochs: int = 50,
+    epochs: int = 200,
     output_dir: str = ".",
     use_nnue: Optional[str] = None,
     use_search_scores: bool = True,
@@ -1085,10 +1995,15 @@ def train_nnue(
     generate_only: bool = False,
     workers: int = 1,
     no_relational: bool = False,
-    batch_size: int = 128,
+    batch_size: int = 4096,
     rescale_labels: Optional[float] = None,
-    lambda_blend: Optional[float] = None
-) -> Optional[TonnesjakkNNUE]:
+    lambda_blend: Optional[float] = None,
+    loss_fn: str = "wdl-ce",
+    learning_rate: float = 0.001,
+    halfpail: bool = False,
+    num_workers: int = 0,
+    resume_from: Optional[str] = None,
+) -> Optional[nn.Module]:
     """
     Complete NNUE training pipeline.
 
@@ -1103,17 +2018,29 @@ def train_nnue(
     - augment: Apply horizontal flip augmentation (doubles training data)
     - save_data: Save generated positions to file for reuse
     - load_data: Load positions from file instead of generating
+    - halfpail: Use HalfPail dual-perspective sparse feature architecture
     """
     # Determine input size based on relational feature mode
     input_size = BASE_FEATURES if no_relational else INPUT_SIZE
     rel_count = 0 if no_relational else RELATIONAL_FEATURES
 
     print("=" * 60)
-    print("NNUE TRAINING FOR TONNESJAKK")
+    if halfpail:
+        print("HALFPAIL NNUE TRAINING FOR TONNESJAKK")
+    else:
+        print("NNUE TRAINING FOR TONNESJAKK")
     print("=" * 60)
     print(f"\nSettings:")
-    print(f"  Architecture: {input_size} -> {hidden1} -> {hidden2} -> 1")
-    if no_relational:
+    if halfpail:
+        print(f"  Architecture: HalfPail EmbeddingBag({HALFPAIL_FEATURES}, {hidden1}) -> FC2({2*hidden1+HALFPAIL_DENSE}, {hidden2}) -> 1")
+    else:
+        print(f"  Architecture: {input_size} -> {hidden1} -> {hidden2} -> 1")
+    if resume_from:
+        print(f"  Resuming from: {resume_from}")
+    print(f"  Loss: {loss_fn} ({'WDL cross-entropy' if loss_fn == 'wdl-ce' else 'mean squared error'})")
+    if halfpail:
+        print(f"  Features: HalfPail sparse ({HALFPAIL_FEATURES} perspective features, {HALFPAIL_DENSE} dense)")
+    elif no_relational:
         print(f"  Features: {BASE_FEATURES} base (no relational)")
     else:
         print(f"  Features: {BASE_FEATURES} base + {RELATIONAL_FEATURES} relational")
@@ -1208,18 +2135,34 @@ def train_nnue(
 
     # Step 2: Train
     print(f"\n[2/3] Training model...")
-    model, history = train_model(
-        X, y,
-        hidden1=hidden1,
-        hidden2=hidden2,
-        input_size=input_size,
-        epochs=epochs,
-        batch_size=batch_size
-    )
+    if halfpail:
+        model, history = train_halfpail_model(
+            X, y,
+            hidden1=hidden1,
+            hidden2=hidden2,
+            epochs=epochs,
+            batch_size=batch_size,
+            learning_rate=learning_rate,
+            loss_fn=loss_fn,
+            num_workers=num_workers,
+            resume_from=resume_from,
+        )
+    else:
+        model, history = train_model(
+            X, y,
+            hidden1=hidden1,
+            hidden2=hidden2,
+            input_size=input_size,
+            epochs=epochs,
+            batch_size=batch_size,
+            loss_fn=loss_fn,
+            learning_rate=learning_rate
+        )
 
     # Step 3: Export
     print(f"\n[3/3] Exporting...")
     output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
     json_path = output_path / "nnue_weights.json"
     old_weights_path = None
 
@@ -1240,7 +2183,10 @@ def train_nnue(
     print(f"  PyTorch model: {torch_path}")
 
     # Save JSON for Rust
-    export_to_json(model, str(json_path))
+    if halfpail:
+        export_halfpail_json(model, str(json_path))
+    else:
+        export_to_json(model, str(json_path))
     print(f"  JSON weights: {json_path}")
 
     # Step 4: Compare with heuristic baseline (and optionally previous version)
@@ -1299,7 +2245,9 @@ def train_nnue(
             "search_scores": use_search_scores,
             "augment": augment,
             "input_size": input_size,
-            "no_relational": no_relational
+            "no_relational": no_relational,
+            "loss_fn": loss_fn,
+            "halfpail": halfpail
         }
         add_training_result(generation, config, comparison, str(history_path))
         print(f"\n  Training history saved (generation {generation})")
@@ -1601,10 +2549,14 @@ Examples:
     parser.add_argument("--arch", type=int, nargs=2, default=[64, 32],
                         metavar=("H1", "H2"),
                         help="Hidden layer sizes (default: 64 32)")
-    parser.add_argument("--epochs", type=int, default=50,
-                        help="Training epochs (default: 50)")
-    parser.add_argument("--batch-size", type=int, default=128,
-                        help="Training batch size (default: 128, try 1024 for faster training)")
+    parser.add_argument("--epochs", type=int, default=200,
+                        help="Training epochs (default: 200)")
+    parser.add_argument("--batch-size", type=int, default=4096,
+                        help="Training batch size (default: 4096)")
+    parser.add_argument("--loss", type=str, default="wdl-ce", choices=["mse", "wdl-ce"],
+                        help="Loss function: 'wdl-ce' (cross-entropy in WDL space) or 'mse' (default: wdl-ce)")
+    parser.add_argument("--lr", type=float, default=0.001,
+                        help="Learning rate (default: 0.001, try 0.003 with batch-size 4096)")
     parser.add_argument("--output", type=str, default=".",
                         help="Output directory (default: current)")
     parser.add_argument("--use-nnue", type=str, default=None,
@@ -1637,19 +2589,47 @@ Examples:
                         help="Multiply labels by this factor (e.g. 10 to fix /10000 -> /1000 normalization)")
     parser.add_argument("--lambda", type=float, default=None, dest="lambda_blend",
                         help="Lambda blend: mix search scores and game outcomes (0.85 = 85%% eval + 15%% outcome)")
+    parser.add_argument("--quantize", type=str, nargs=2, metavar=("INPUT", "OUTPUT"),
+                        help="Quantize f32 weights to int16: --quantize input.json output_q.json")
     parser.add_argument("--compare", type=str, nargs=2, metavar=("NNUE_A", "NNUE_B"),
                         help="Compare two NNUE versions (use 'heuristic' for no NNUE)")
     parser.add_argument("--compare-timed", type=str, nargs=3, metavar=("MS", "NNUE_A", "NNUE_B"),
                         help="Equal-time comparison: MS per move (use 'heuristic' for no NNUE)")
+    parser.add_argument("--halfpail", action="store_true",
+                        help="Use HalfPail dual-perspective sparse feature architecture")
+    parser.add_argument("--resume-from", type=str, default=None,
+                        help="Resume training from a saved .pt model file")
+    parser.add_argument("--num-workers", type=int, default=0,
+                        help="DataLoader workers for HalfPail training (0=main process, 4+ recommended)")
     parser.add_argument("--test", action="store_true",
                         help="Run quick test")
+    parser.add_argument("--test-halfpail", action="store_true",
+                        help="Run HalfPail decoding round-trip test")
     parser.add_argument("--benchmark", action="store_true",
                         help="Run benchmark")
 
     args = parser.parse_args()
 
-    if args.test:
+    if args.test_halfpail:
+        test_halfpail_decoding(1000)
+    elif args.test:
         quick_test()
+    elif args.quantize:
+        input_path, output_path = args.quantize
+        # Load f32 weights from JSON and recreate PyTorch model
+        with open(input_path, 'r') as f:
+            data = json.load(f)
+        input_size = len(data['weights']['fc1_weight'][0])
+        model = TonnesjakkNNUE(data['hidden1'], data['hidden2'], input_size=input_size)
+        state_dict = {}
+        state_dict['net.0.weight'] = torch.tensor(data['weights']['fc1_weight'])
+        state_dict['net.0.bias'] = torch.tensor(data['weights']['fc1_bias'])
+        state_dict['net.2.weight'] = torch.tensor(data['weights']['fc2_weight'])
+        state_dict['net.2.bias'] = torch.tensor(data['weights']['fc2_bias'])
+        state_dict['net.4.weight'] = torch.tensor(data['weights']['fc3_weight'])
+        state_dict['net.4.bias'] = torch.tensor(data['weights']['fc3_bias'])
+        model.load_state_dict(state_dict)
+        export_quantized_json(model, output_path)
     elif args.benchmark:
         benchmark()
     elif args.history:
@@ -1701,7 +2681,12 @@ Examples:
             no_relational=args.no_relational,
             batch_size=args.batch_size,
             rescale_labels=args.rescale_labels,
-            lambda_blend=args.lambda_blend
+            lambda_blend=args.lambda_blend,
+            loss_fn=args.loss,
+            learning_rate=args.lr,
+            halfpail=args.halfpail,
+            num_workers=args.num_workers,
+            resume_from=args.resume_from,
         )
 
 
