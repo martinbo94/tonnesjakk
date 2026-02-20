@@ -632,27 +632,40 @@ class AlphaZeroTrainer:
             n_heuristic = int(self.games_per_iter * heuristic_ratio)
             n_network = self.games_per_iter - n_heuristic
 
-            # Heuristic self-play games (fast, decisive)
-            for g in range(n_heuristic):
-                examples, winner = heuristic_self_play_game(
-                    simulations=max(200, self.simulations),
-                    random_opening=6,
+            # Heuristic self-play games (fully in Rust, ~4ms each)
+            if n_heuristic > 0:
+                rust_engine = _RustMCTSEngine(max(200, self.simulations), self.c_puct)
+                h_results = rust_engine.play_heuristic_games(
+                    n_heuristic, random_opening=6, max_moves=80, temp_moves=10,
                 )
-                new_examples.extend(examples)
-                results[winner] += 1
-                total_games += 1
+                for hr in h_results:
+                    for ex in hr.examples:
+                        new_examples.append((
+                            np.array(ex.planes, dtype=np.float32).reshape(6, 6, 6),
+                            np.array(ex.policy_target, dtype=np.float32),
+                            ex.value_target,
+                        ))
+                    results[hr.winner] += 1
+                    total_games += 1
 
             heuristic_time = time.time() - iter_start
 
-            # Network self-play games
+            # Network self-play games (game loop in Rust, NN callback in Python)
+            rust_net_engine = _RustMCTSEngine(self.simulations, self.c_puct)
+            batch_eval_fn = mcts._batch_eval_fn
             for g in range(n_network):
-                examples, winner = self_play_game(
-                    mcts,
-                    temperature=self.temperature,
-                    random_opening=4,
+                nr = rust_net_engine.play_network_game(
+                    batch_eval_fn, batch_size=mcts.batch_size,
+                    random_opening=4, max_moves=80,
+                    temp_moves=15, temperature=self.temperature,
                 )
-                new_examples.extend(examples)
-                results[winner] += 1
+                for ex in nr.examples:
+                    new_examples.append((
+                        np.array(ex.planes, dtype=np.float32).reshape(6, 6, 6),
+                        np.array(ex.policy_target, dtype=np.float32),
+                        ex.value_target,
+                    ))
+                results[nr.winner] += 1
                 total_games += 1
 
             selfplay_time = time.time() - iter_start
@@ -797,7 +810,7 @@ class AlphaZeroTrainer:
     def _evaluate(
         self, num_games: int, opponent_depth: int
     ) -> Tuple[float, float, float, int, int, int]:
-        """Play network MCTS vs alpha-beta engine.
+        """Play network MCTS vs alpha-beta engine (game loop in Rust).
 
         Returns (elo, elo_lo, elo_hi, wins, draws, losses).
         """
@@ -807,49 +820,16 @@ class AlphaZeroTrainer:
             simulations=self.simulations,
             c_puct=self.c_puct,
         )
-        engine = Engine()
-        wins, draws, losses = 0, 0, 0
-
-        for game_idx in range(num_games):
-            board = Board()
-            engine.full_reset()
-            mcts_is_white = (game_idx % 2 == 0)
-
-            # Random opening
-            for _ in range(2):
-                moves = board.generate_moves()
-                if not moves or board.check_winner() is not None:
-                    break
-                board.make_move(random.choice(moves))
-
-            move_count = 0
-            while board.check_winner() is None and move_count < 80:
-                is_white_turn = _is_white(board)
-                is_mcts_turn = (is_white_turn == mcts_is_white)
-
-                if is_mcts_turn:
-                    move, _ = mcts.search(board, add_noise=False)
-                else:
-                    engine.full_reset()
-                    sr = engine.search(board, opponent_depth)
-                    move = sr.best_move
-
-                if move is None:
-                    break
-
-                board.make_move(move)
-                move_count += 1
-
-            winner = board.check_winner()
-            if winner is None:
-                draws += 1
-            else:
-                white_won = _is_white_winner(winner)
-                if white_won == mcts_is_white:
-                    wins += 1
-                else:
-                    losses += 1
-
+        rust_engine = _RustMCTSEngine(self.simulations, self.c_puct)
+        result = rust_engine.play_eval_match(
+            mcts._batch_eval_fn,
+            num_games=num_games,
+            opponent_depth=opponent_depth,
+            batch_size=mcts.batch_size,
+            random_opening=2,
+            max_moves=80,
+        )
+        wins, draws, losses = result.wins, result.draws, result.losses
         elo, elo_lo, elo_hi = elo_with_ci(wins, losses, draws)
         return elo, elo_lo, elo_hi, wins, draws, losses
 

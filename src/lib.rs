@@ -5492,6 +5492,9 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("POLICY_SIZE", mcts::POLICY_SIZE)?;
     m.add_class::<mcts::MCTSEngine>()?;
     m.add_class::<mcts::MCTSSearchResult>()?;
+    m.add_class::<mcts::TrainingExample>()?;
+    m.add_class::<mcts::SelfPlayResult>()?;
+    m.add_class::<mcts::EvalMatchResult>()?;
     Ok(())
 }
 
