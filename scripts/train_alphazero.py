@@ -53,6 +53,10 @@ def main():
                         help="Residual blocks for resnet (default: 5)")
     parser.add_argument("--train-window", type=int, default=20000,
                         help="Max examples to train on per iteration (default: 20000)")
+    parser.add_argument("--policy-weight", type=float, default=1.0,
+                        help="Policy loss weight (default: 1.0)")
+    parser.add_argument("--device", type=str, default="auto",
+                        help="Device: auto, cpu, cuda, mps (default: auto)")
     parser.add_argument("--save-dir", type=str, default="alphazero_checkpoints",
                         help="Checkpoint directory (default: alphazero_checkpoints)")
     args = parser.parse_args()
@@ -71,6 +75,8 @@ def main():
     print(f"  Training epochs: {args.training_epochs}")
     print(f"  Train window: {args.train_window:,} examples/iter")
     print(f"  Heuristic ratio: {args.heuristic_ratio:.0%} -> {args.heuristic_ratio_end:.0%}")
+    print(f"  Policy weight: {args.policy_weight}")
+    print(f"  Device: {args.device}")
     print(f"  Save dir: {args.save_dir}")
     print(f"  Ctrl+C between chunks to stop safely.")
     print("=" * 60)
@@ -90,7 +96,12 @@ def main():
         train_window=args.train_window,
         network_type=args.network,
         num_blocks=args.num_blocks,
+        policy_weight=args.policy_weight,
+        device=args.device,
     )
+
+    # Set LR schedule for total iterations
+    trainer.set_lr_schedule(total_iters)
 
     # Resume from checkpoint if available (loads model + replay buffer)
     if checkpoint.exists():

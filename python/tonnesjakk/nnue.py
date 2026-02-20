@@ -335,7 +335,7 @@ class HalfPailNNUE(nn.Module):
         self.hidden1 = hidden1
         self.hidden2 = hidden2
         self.num_perspective_features = HALFPAIL_FEATURES  # 3996
-        self.dense_size = HALFPAIL_DENSE  # 6
+        self.dense_size = HALFPAIL_DENSE  # 20
 
         # Shared perspective embedding (FC1 equivalent)
         # EmbeddingBag with mode='sum' acts like sparse matrix multiplication

@@ -67,8 +67,8 @@ Sparse features (3996 per perspective)
      ↓ EmbeddingBag(3996, 128)
      ↓ ReLU
      ↓
-  concat(white_128, black_128, dense_6) = 262 features
-     ↓ Linear(262, 32)
+  concat(white_128, black_128, dense_20) = 276 features
+     ↓ Linear(276, 32)
      ↓ ReLU
      ↓ Linear(32, 1)
      ↓ Tanh
@@ -83,15 +83,21 @@ The network has **~520,000 parameters**. The sparse first layer uses `EmbeddingB
 **Sparse features (3996 per perspective):**
 Each perspective (white/black) encodes pieces relative to the pail position. The pail serves as a "bucket" (37 possible states: 36 squares + no pail placed), and for each bucket, there are 36 squares × 3 piece types = 108 features. Total: 37 × 108 = 3996. Piece types are: friendly barrel, enemy barrel, enemy pail.
 
-**Dense features (6):**
-| Feature | Description |
-|---------|-------------|
-| White scored | Barrels scored by white (normalized) |
-| Black scored | Barrels scored by black (normalized) |
-| White pail placed | Whether white has placed their pail (0 or 1) |
-| Black pail placed | Whether black has placed their pail (0 or 1) |
-| White barrels on board | Count of white barrels currently on the board |
-| Black barrels on board | Count of black barrels currently on the board |
+**Dense features (20):**
+
+These are the same relational features used in the legacy NNUE training data (features 144-163):
+
+| Features | Description |
+|----------|-------------|
+| 4 | White barrel distances to goal (sorted, normalized /5) |
+| 4 | Black barrel distances to goal (sorted, normalized /5) |
+| 2 | White/black scored barrels (normalized /4) |
+| 2 | White/black pails placed (0 or 1) |
+| 1 | Current player (+1 white, -1 black) |
+| 2 | White/black immediate threats (barrels 1 step from scoring, /4) |
+| 1 | Score differential (white_scored - black_scored) /4 |
+| 2 | White/black barrels on board (/4) |
+| 2 | White/black pail blocking count (/4) |
 
 The dual-perspective design means the network sees the position from both sides simultaneously, which helps it evaluate asymmetric positions more accurately.
 
@@ -104,7 +110,7 @@ The first layer is the bottleneck — it maps 3996 sparse features to 128 hidden
 
 This turns the first-layer computation from a full lookup into a small incremental update. The engine maintains a "dual accumulator stack" that caches both perspectives and can be efficiently updated on make/unmake move.
 
-The 6 dense features depend on global board state and are recomputed each evaluation.
+The 20 dense features depend on global board state and are recomputed each evaluation.
 
 ### SIMD Acceleration
 
@@ -200,17 +206,18 @@ python -m tonnesjakk.alphazero --evaluate alphazero_resnet/best_model.pt --games
 ┌──────────────────────────────────────────────────────┐
 │                 Python (web/server.py)                │
 │                  FastAPI + Uvicorn                    │
-│           Serves web UI for human vs AI play         │
+│     Serves web UI for human vs AI (heuristic or AZ)  │
 └───────────────────────┬──────────────────────────────┘
                         │ PyO3
 ┌───────────────────────▼──────────────────────────────┐
-│                Rust Core (src/lib.rs + mcts.rs)       │
+│         Rust Core (src/ — 4 modules + lib.rs)        │
 │                                                      │
-│  Board / BitBoard        Game state & move generation│
-│  BitBoardEngine          Search (PVS, LMR, TT, ...) │
-│  IncrementalNNUE         SIMD neural net evaluation  │
-│  MCTSEngine              MCTS with batched NN eval   │
-│  Engine                  Python-facing API wrapper   │
+│  board.rs    Board, BitBoard, moves, Zobrist hashing │
+│  nnue.rs     IncrementalNNUE, QuantizedNNUE,         │
+│              HalfPailNNUE, EvalCache                 │
+│  search.rs   BitBoardEngine, TT, Engine (Python API) │
+│  mcts.rs     MCTSEngine with batched NN eval         │
+│  lib.rs      Module glue, re-exports, pymodule       │
 └──────────────────────────────────────────────────────┘
                         │ PyO3
 ┌───────────────────────▼──────────────────────────────┐
@@ -219,10 +226,11 @@ python -m tonnesjakk.alphazero --evaluate alphazero_resnet/best_model.pt --games
 │  nnue.py       Supervised NNUE training & export     │
 │  alphazero.py  AlphaZero self-play + ResNet/MLP      │
 │  mcts.py       Python MCTS (reference implementation)│
+│  utils.py      Shared helpers (ELO, device detect)   │
 └──────────────────────────────────────────────────────┘
 ```
 
-The Rust engine (~6,000 lines) handles everything performance-critical: board representation, move generation, search, NNUE inference, and MCTS tree search. Python handles neural network training and the web UI. The two communicate through [PyO3](https://pyo3.rs/) bindings, compiled with [maturin](https://github.com/PyO3/maturin).
+The Rust engine (~5,600 lines across 4 modules) handles everything performance-critical: board representation, move generation, search, NNUE inference, and MCTS tree search. Python handles neural network training and the web UI. The two communicate through [PyO3](https://pyo3.rs/) bindings, compiled with [maturin](https://github.com/PyO3/maturin).
 
 ### Board Representation: Bitboards
 
@@ -306,16 +314,20 @@ The HalfPail NNUE is currently undertrained (5 epochs). Poor eval quality causes
 ```
 tonnesjakk/
 ├── src/
-│   ├── lib.rs                    # Rust engine (~6,000 lines)
-│   └── mcts.rs                   # Rust MCTS with batched NN eval
+│   ├── board.rs                  # Board, BitBoard, moves, Zobrist (~1600 lines)
+│   ├── nnue.rs                   # NNUE variants + EvalCache (~1860 lines)
+│   ├── search.rs                 # Alpha-beta engine + TT (~1700 lines)
+│   ├── mcts.rs                   # MCTS with batched NN eval (~1550 lines)
+│   └── lib.rs                    # Module glue, re-exports, pymodule (~490 lines)
 ├── python/tonnesjakk/
 │   ├── nnue.py                   # Supervised NNUE training pipeline
 │   ├── alphazero.py              # AlphaZero self-play training
 │   ├── mcts.py                   # Python MCTS (reference impl)
+│   ├── utils.py                  # Shared helpers (ELO, device, etc.)
 │   └── __init__.py               # Python package init
 ├── web/
-│   ├── server.py                 # FastAPI web backend
-│   └── index.html                # Browser-based game UI
+│   ├── server.py                 # FastAPI web backend (heuristic + AlphaZero)
+│   └── index.html                # Browser-based game UI with engine selector
 ├── scripts/
 │   ├── train_alphazero.py        # Chunked AlphaZero training runner
 │   ├── test_model.py             # Time-based model comparison

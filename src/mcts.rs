@@ -238,6 +238,57 @@ impl Rng {
         }
         probs.len() - 1
     }
+
+    /// Standard normal via Box-Muller transform.
+    fn normal(&mut self) -> f64 {
+        let u1 = self.f64().max(1e-30); // avoid log(0)
+        let u2 = self.f64();
+        (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos()
+    }
+
+    /// Gamma variate using Marsaglia & Tsang's method (alpha >= 1).
+    /// For alpha < 1, uses Ahrens-Dieter boost: Gamma(a) = Gamma(a+1) * U^(1/a).
+    fn gamma_variate(&mut self, alpha: f64) -> f64 {
+        if alpha < 1.0 {
+            // Boost: Gamma(a) = Gamma(a+1) * U^(1/a)
+            let g = self.gamma_variate(alpha + 1.0);
+            let u = self.f64().max(1e-30);
+            return g * u.powf(1.0 / alpha);
+        }
+
+        // Marsaglia & Tsang for alpha >= 1
+        let d = alpha - 1.0 / 3.0;
+        let c = 1.0 / (9.0 * d).sqrt();
+
+        loop {
+            let x = self.normal();
+            let v = 1.0 + c * x;
+            if v <= 0.0 {
+                continue;
+            }
+            let v = v * v * v;
+            let u = self.f64();
+            // Accept/reject
+            if u < 1.0 - 0.0331 * (x * x) * (x * x) {
+                return d * v;
+            }
+            if u.ln() < 0.5 * x * x + d * (1.0 - v + v.ln()) {
+                return d * v;
+            }
+        }
+    }
+
+    /// Sample from Dirichlet(alpha, ..., alpha) with n components.
+    fn dirichlet(&mut self, alpha: f64, n: usize) -> Vec<f32> {
+        let mut samples: Vec<f64> = (0..n)
+            .map(|_| self.gamma_variate(alpha).max(1e-30))
+            .collect();
+        let sum: f64 = samples.iter().sum();
+        for s in &mut samples {
+            *s /= sum;
+        }
+        samples.into_iter().map(|s| s as f32).collect()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -248,29 +299,39 @@ impl Rng {
 pub struct MCTSEngine {
     simulations: u32,
     c_puct: f32,
+    fpu_reduction: f32,
+    dirichlet_alpha: f32,
+    dirichlet_epsilon: f32,
     nodes: Vec<MCTSNode>,
     engine: BitBoardEngine, // For heuristic evaluation
     rng: Rng,
+    heuristic_cache: std::collections::HashMap<u64, f32>,
+    network_cache: std::collections::HashMap<u64, (Vec<f32>, f32)>,
 }
 
 #[pymethods]
 impl MCTSEngine {
     #[new]
-    #[pyo3(signature = (simulations=200, c_puct=1.4))]
-    fn new(simulations: u32, c_puct: f32) -> Self {
+    #[pyo3(signature = (simulations=200, c_puct=1.4, fpu_reduction=0.3, dirichlet_alpha=0.5, dirichlet_epsilon=0.25))]
+    fn new(simulations: u32, c_puct: f32, fpu_reduction: f32, dirichlet_alpha: f32, dirichlet_epsilon: f32) -> Self {
         MCTSEngine {
             simulations,
             c_puct,
+            fpu_reduction,
+            dirichlet_alpha,
+            dirichlet_epsilon,
             nodes: Vec::with_capacity(8192),
             engine: BitBoardEngine::new(),
             rng: Rng::new(),
+            heuristic_cache: std::collections::HashMap::new(),
+            network_cache: std::collections::HashMap::new(),
         }
     }
 
     /// Pure-Rust MCTS with heuristic leaf evaluation. No Python calls.
     fn search_heuristic(&mut self, board: &Board) -> MCTSSearchResult {
         let bb = BitBoard::from_board(board);
-        self.search_impl(&bb, None)
+        self.search_impl(&bb, None, false)
     }
 
     /// MCTS with neural network evaluation via Python callback (one-at-a-time).
@@ -282,7 +343,7 @@ impl MCTSEngine {
         eval_fn: PyObject,
     ) -> PyResult<MCTSSearchResult> {
         let bb = BitBoard::from_board(board);
-        Ok(self.search_impl(&bb, Some((py, &eval_fn))))
+        Ok(self.search_impl(&bb, Some((py, &eval_fn)), false))
     }
 
     /// MCTS with batched neural network evaluation (much faster for large networks).
@@ -297,7 +358,7 @@ impl MCTSEngine {
         batch_size: u32,
     ) -> PyResult<MCTSSearchResult> {
         let bb = BitBoard::from_board(board);
-        Ok(self.search_batched_impl(&bb, py, &eval_fn, batch_size))
+        Ok(self.search_batched_impl(&bb, py, &eval_fn, batch_size, false))
     }
 
     /// Get planes for a board position (for Python-side network inference).
@@ -364,7 +425,7 @@ impl MCTSEngine {
         temperature: f32,
     ) -> MCTSSearchResult {
         let bb = BitBoard::from_board(board);
-        let mut result = self.search_impl(&bb, None);
+        let mut result = self.search_impl(&bb, None, false);
         if temperature > 0.0 && result.best_move.is_some() {
             result.best_move = self.sample_move_by_temp(0, temperature);
         }
@@ -425,18 +486,29 @@ impl MCTSEngine {
         &mut self,
         bb: &BitBoard,
         eval_fn: Option<(Python<'_>, &PyObject)>,
+        add_noise: bool,
     ) -> MCTSSearchResult {
         let is_white = bb.current_player == Player::White;
 
-        // Initialize tree
-        self.nodes.clear();
-        self.nodes.push(MCTSNode::root(is_white));
+        // Reuse tree if available, otherwise initialize fresh
+        let reused = !self.nodes.is_empty()
+            && self.nodes[0].children_count > 0
+            && self.nodes.len() < 500_000;
+        if !reused {
+            self.nodes.clear();
+            self.nodes.push(MCTSNode::root(is_white));
 
-        // Expand root
-        let _root_value = self.evaluate_and_expand(0, bb, &eval_fn);
+            // Expand root
+            let _root_value = self.evaluate_and_expand(0, bb, &eval_fn);
+        }
 
         if self.nodes[0].children_count == 0 {
             return MCTSSearchResult::empty();
+        }
+
+        // Apply Dirichlet noise at root for self-play exploration
+        if add_noise {
+            self.apply_dirichlet_noise(0);
         }
 
         // Single legal move: no search needed
@@ -481,10 +553,14 @@ impl MCTSEngine {
         self.build_result(0)
     }
 
-    /// PUCT child selection.
+    /// PUCT child selection with FPU reduction.
     fn select_child(&self, node_idx: usize) -> usize {
         let node = &self.nodes[node_idx];
         let sqrt_parent = (node.visit_count as f32).sqrt();
+
+        // FPU: unvisited children use parent's average minus fpu_reduction
+        let parent_q = node.q_value();
+        let parent_q_adj = if node.player_is_white { parent_q } else { -parent_q };
 
         let mut best_idx = node.children_start as usize;
         let mut best_score = f32::NEG_INFINITY;
@@ -493,9 +569,13 @@ impl MCTSEngine {
             let child_idx = node.children_start as usize + i;
             let child = &self.nodes[child_idx];
 
-            let q = child.q_value();
-            // Negate Q when parent is Black (Black minimizes White's score)
-            let q_adjusted = if node.player_is_white { q } else { -q };
+            let q_adjusted = if child.visit_count == 0 {
+                // FPU: assume unvisited is slightly worse than parent average
+                parent_q_adj - self.fpu_reduction
+            } else {
+                let q = child.q_value();
+                if node.player_is_white { q } else { -q }
+            };
 
             let exploration =
                 self.c_puct * child.prior * sqrt_parent / (1.0 + child.visit_count as f32);
@@ -546,8 +626,20 @@ impl MCTSEngine {
                 }
             }
             None => {
-                // Heuristic evaluation
-                let v = (self.engine.evaluate_heuristic(bb) as f32 / SCORE_SCALING).tanh();
+                // Heuristic evaluation with cache
+                let hash = bb.hash;
+                let v = if let Some(&cached_v) = self.heuristic_cache.get(&hash) {
+                    cached_v
+                } else {
+                    let v = (self.engine.evaluate_heuristic(bb) as f32 / SCORE_SCALING).tanh();
+                    if self.heuristic_cache.len() < 100_000 {
+                        self.heuristic_cache.insert(hash, v);
+                    } else {
+                        self.heuristic_cache.clear();
+                        self.heuristic_cache.insert(hash, v);
+                    }
+                    v
+                };
                 let uniform = 1.0 / moves.len() as f32;
                 (v, vec![uniform; moves.len()])
             }
@@ -685,41 +777,52 @@ impl MCTSEngine {
         py: Python<'_>,
         eval_fn: &PyObject,
         batch_size: u32,
+        add_noise: bool,
     ) -> MCTSSearchResult {
         let is_white = bb.current_player == Player::White;
 
-        // Initialize tree
-        self.nodes.clear();
-        self.nodes.push(MCTSNode::root(is_white));
+        // Reuse tree if available, otherwise initialize fresh
+        let reused = !self.nodes.is_empty()
+            && self.nodes[0].children_count > 0
+            && self.nodes.len() < 500_000;
+        if !reused {
+            self.nodes.clear();
+            self.nodes.push(MCTSNode::root(is_white));
 
-        // Expand root with single eval
-        let root_planes = bb_to_planes(bb);
-        let root_moves = bb.generate_moves();
-        if root_moves.is_empty() {
-            return MCTSSearchResult::empty();
-        }
-
-        // Evaluate root
-        match self.call_network_single(py, eval_fn, &root_planes) {
-            Ok((policy_logits, value)) => {
-                let priors = Self::masked_softmax(&policy_logits, &root_moves);
-                self.expand_node(0, &root_moves, &priors, is_white);
-                // Backprop root value
-                self.nodes[0].visit_count += 1;
-                self.nodes[0].total_value += value;
+            // Expand root with single eval
+            let root_planes = bb_to_planes(bb);
+            let root_moves = bb.generate_moves();
+            if root_moves.is_empty() {
+                return MCTSSearchResult::empty();
             }
-            Err(_) => {
-                let v = (self.engine.evaluate_heuristic(bb) as f32 / SCORE_SCALING).tanh();
-                let uniform = 1.0 / root_moves.len() as f32;
-                let priors = vec![uniform; root_moves.len()];
-                self.expand_node(0, &root_moves, &priors, is_white);
-                self.nodes[0].visit_count += 1;
-                self.nodes[0].total_value += v;
+
+            // Evaluate root
+            match self.call_network_single(py, eval_fn, &root_planes) {
+                Ok((policy_logits, value)) => {
+                    let priors = Self::masked_softmax(&policy_logits, &root_moves);
+                    self.expand_node(0, &root_moves, &priors, is_white);
+                    // Backprop root value
+                    self.nodes[0].visit_count += 1;
+                    self.nodes[0].total_value += value;
+                }
+                Err(_) => {
+                    let v = (self.engine.evaluate_heuristic(bb) as f32 / SCORE_SCALING).tanh();
+                    let uniform = 1.0 / root_moves.len() as f32;
+                    let priors = vec![uniform; root_moves.len()];
+                    self.expand_node(0, &root_moves, &priors, is_white);
+                    self.nodes[0].visit_count += 1;
+                    self.nodes[0].total_value += v;
+                }
             }
         }
 
         if self.nodes[0].children_count == 0 {
             return MCTSSearchResult::empty();
+        }
+
+        // Apply Dirichlet noise at root for self-play exploration
+        if add_noise {
+            self.apply_dirichlet_noise(0);
         }
 
         if self.nodes[0].children_count == 1 {
@@ -777,6 +880,16 @@ impl MCTSEngine {
                     continue;
                 }
 
+                // Check network cache before adding to batch
+                let hash = sim_bb.hash;
+                if let Some((cached_logits, cached_value)) = self.network_cache.get(&hash).cloned() {
+                    let priors = Self::masked_softmax(&cached_logits, &moves);
+                    let child_is_white = !self.nodes[node_idx].player_is_white;
+                    self.expand_node(node_idx, &moves, &priors, child_is_white);
+                    self.backpropagate(node_idx, cached_value);
+                    continue;
+                }
+
                 // Apply virtual loss along path to root
                 let mut vl_idx = node_idx;
                 loop {
@@ -819,6 +932,14 @@ impl MCTSEngine {
                     // Get network output (or fallback to heuristic)
                     let (value, priors) = match &batch_results {
                         Ok((policies, values)) => {
+                            // Cache network output
+                            let hash = leaf.bb.hash;
+                            if self.network_cache.len() < 100_000 {
+                                self.network_cache.insert(hash, (policies[i].clone(), values[i]));
+                            } else {
+                                self.network_cache.clear();
+                                self.network_cache.insert(hash, (policies[i].clone(), values[i]));
+                            }
                             let priors = Self::masked_softmax(&policies[i], &leaf.moves);
                             (values[i], priors)
                         }
@@ -1045,6 +1166,7 @@ impl MCTSEngine {
         max_moves: usize,
         temp_moves: usize,
     ) -> SelfPlayResult {
+        self.clear_caches();
         let mut bb = BitBoard::new();
         let mut examples: Vec<(Vec<f32>, Vec<f32>)> = Vec::new();
 
@@ -1063,7 +1185,7 @@ impl MCTSEngine {
 
         let mut move_count = 0u32;
         while bb.check_winner().is_none() && (move_count as usize) < max_moves {
-            let result = self.search_impl(&bb, None);
+            let result = self.search_impl(&bb, None, true); // add_noise=true for self-play
             if result.best_move.is_none() {
                 break;
             }
@@ -1091,9 +1213,14 @@ impl MCTSEngine {
                 best_bm
             };
 
+            // Retain subtree for chosen move before making it
+            self.retain_subtree(&chosen_bitmove);
             bb.make_move(&chosen_bitmove);
             move_count += 1;
         }
+
+        // Clear tree at end of game
+        self.nodes.clear();
 
         // Determine outcome
         let (outcome, winner_str) = self.determine_outcome(&bb);
@@ -1129,6 +1256,7 @@ impl MCTSEngine {
         temp_moves: usize,
         temperature: f32,
     ) -> PyResult<SelfPlayResult> {
+        self.clear_caches();
         let mut bb = BitBoard::new();
         let mut examples: Vec<(Vec<f32>, Vec<f32>)> = Vec::new();
 
@@ -1147,7 +1275,7 @@ impl MCTSEngine {
 
         let mut move_count = 0u32;
         while bb.check_winner().is_none() && (move_count as usize) < max_moves {
-            let result = self.search_batched_impl(&bb, py, eval_fn, batch_size);
+            let result = self.search_batched_impl(&bb, py, eval_fn, batch_size, true); // add_noise=true
             if result.best_move.is_none() {
                 break;
             }
@@ -1165,9 +1293,14 @@ impl MCTSEngine {
                 self.most_visited_bitmove()
             };
 
+            // Retain subtree for chosen move before making it
+            self.retain_subtree(&chosen_bitmove);
             bb.make_move(&chosen_bitmove);
             move_count += 1;
         }
+
+        // Clear tree at end of game
+        self.nodes.clear();
 
         // Determine outcome
         let (outcome, winner_str) = self.determine_outcome(&bb);
@@ -1211,6 +1344,7 @@ impl MCTSEngine {
 
             let mut bb = BitBoard::new();
             self.engine.full_reset();
+            self.clear_caches();
 
             // Random opening
             for _ in 0..random_opening {
@@ -1231,8 +1365,8 @@ impl MCTSEngine {
                 let is_mcts_turn = is_white_turn == mcts_is_white;
 
                 let chosen_bitmove = if is_mcts_turn {
-                    // MCTS move (network)
-                    let result = self.search_batched_impl(&bb, py, eval_fn, batch_size);
+                    // MCTS move (network) -- no noise for eval
+                    let result = self.search_batched_impl(&bb, py, eval_fn, batch_size, false);
                     match result.best_move {
                         Some(_) => self.most_visited_bitmove(),
                         None => break,
@@ -1247,9 +1381,19 @@ impl MCTSEngine {
                     }
                 };
 
+                // Retain subtree for tree reuse
+                if is_mcts_turn {
+                    self.retain_subtree(&chosen_bitmove);
+                } else {
+                    // Opponent moved -- try to retain subtree from opponent's move
+                    self.retain_subtree(&chosen_bitmove);
+                }
                 bb.make_move(&chosen_bitmove);
                 move_count += 1;
             }
+
+            // Clear tree at end of game
+            self.nodes.clear();
 
             // Determine result
             match bb.check_winner() {
@@ -1271,6 +1415,110 @@ impl MCTSEngine {
     // -----------------------------------------------------------------------
     // Helpers
     // -----------------------------------------------------------------------
+
+    /// Retain the subtree rooted at the child matching `chosen_bitmove`.
+    /// Promotes that child to root, remapping all indices.
+    /// Returns true if subtree was found and retained, false otherwise (tree cleared).
+    fn retain_subtree(&mut self, chosen_bitmove: &BitMove) -> bool {
+        if self.nodes.is_empty() || self.nodes[0].children_count == 0 {
+            self.nodes.clear();
+            return false;
+        }
+
+        // Find the child matching chosen_bitmove
+        let root = &self.nodes[0];
+        let start = root.children_start as usize;
+        let mut found_idx: Option<usize> = None;
+        for i in 0..root.children_count as usize {
+            if self.nodes[start + i].bitmove == *chosen_bitmove {
+                found_idx = Some(start + i);
+                break;
+            }
+        }
+
+        let child_idx = match found_idx {
+            Some(idx) => idx,
+            None => {
+                self.nodes.clear();
+                return false;
+            }
+        };
+
+        // BFS from child_idx, collecting all reachable nodes
+        let mut old_to_new: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+        let mut new_nodes: Vec<MCTSNode> = Vec::new();
+        let mut queue: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
+
+        // Add the new root
+        old_to_new.insert(child_idx, 0);
+        new_nodes.push(self.nodes[child_idx].clone());
+        queue.push_back(child_idx);
+
+        while let Some(old_idx) = queue.pop_front() {
+            let node = &self.nodes[old_idx];
+            if node.children_count > 0 {
+                let ch_start = node.children_start as usize;
+                for i in 0..node.children_count as usize {
+                    let old_child = ch_start + i;
+                    if old_child < self.nodes.len() {
+                        let new_idx = new_nodes.len();
+                        old_to_new.insert(old_child, new_idx);
+                        new_nodes.push(self.nodes[old_child].clone());
+                        queue.push_back(old_child);
+                    }
+                }
+            }
+        }
+
+        // Remap parent and children_start
+        for new_idx in 0..new_nodes.len() {
+            let node = &mut new_nodes[new_idx];
+            if node.parent != u32::MAX {
+                if let Some(&mapped) = old_to_new.get(&(node.parent as usize)) {
+                    node.parent = mapped as u32;
+                } else {
+                    node.parent = u32::MAX; // orphan -> root
+                }
+            }
+            if node.children_count > 0 && node.children_start != u32::MAX {
+                if let Some(&mapped) = old_to_new.get(&(node.children_start as usize)) {
+                    node.children_start = mapped as u32;
+                } else {
+                    // Children not found -- clear them
+                    node.children_start = u32::MAX;
+                    node.children_count = 0;
+                }
+            }
+        }
+
+        // Set new root's parent to u32::MAX
+        new_nodes[0].parent = u32::MAX;
+
+        self.nodes = new_nodes;
+        true
+    }
+
+    /// Clear evaluation caches (call between games, not between moves).
+    fn clear_caches(&mut self) {
+        self.heuristic_cache.clear();
+        self.network_cache.clear();
+    }
+
+    /// Apply Dirichlet noise to root node's children priors.
+    /// prior = (1 - epsilon) * prior + epsilon * noise[i]
+    fn apply_dirichlet_noise(&mut self, root_idx: usize) {
+        let n_children = self.nodes[root_idx].children_count as usize;
+        if n_children == 0 {
+            return;
+        }
+        let noise = self.rng.dirichlet(self.dirichlet_alpha as f64, n_children);
+        let eps = self.dirichlet_epsilon;
+        let start = self.nodes[root_idx].children_start as usize;
+        for i in 0..n_children {
+            let child = &mut self.nodes[start + i];
+            child.prior = (1.0 - eps) * child.prior + eps * noise[i];
+        }
+    }
 
     /// Get the BitMove of the most-visited root child.
     fn most_visited_bitmove(&self) -> BitMove {
