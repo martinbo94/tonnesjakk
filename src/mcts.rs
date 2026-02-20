@@ -3,6 +3,9 @@
 //! Arena-based MCTS with PUCT selection, supporting two evaluation modes:
 //! - Heuristic: entirely in Rust, no Python calls (very fast)
 //! - Network: calls a Python function for leaf evaluation (policy + value)
+//!
+//! Also provides full game loops (self-play and evaluation matches) that
+//! run entirely in Rust, returning training data to Python.
 
 use pyo3::prelude::*;
 
@@ -149,6 +152,95 @@ impl MCTSSearchResult {
 }
 
 // ---------------------------------------------------------------------------
+// Training data from self-play games (exposed to Python)
+// ---------------------------------------------------------------------------
+
+/// Training example from a single position: (planes, policy_target, value_target).
+#[pyclass]
+#[derive(Clone)]
+pub struct TrainingExample {
+    #[pyo3(get)]
+    pub planes: Vec<f32>,        // 216 floats (6x6x6)
+    #[pyo3(get)]
+    pub policy_target: Vec<f32>, // 1332 floats
+    #[pyo3(get)]
+    pub value_target: f32,       // outcome in [-1, +1]
+}
+
+/// Result of a complete self-play game.
+#[pyclass]
+#[derive(Clone)]
+pub struct SelfPlayResult {
+    #[pyo3(get)]
+    pub examples: Vec<TrainingExample>,
+    #[pyo3(get)]
+    pub winner: String,          // "white", "black", or "draw"
+    #[pyo3(get)]
+    pub move_count: u32,
+}
+
+/// Result of an evaluation match (multiple games).
+#[pyclass]
+#[derive(Clone)]
+pub struct EvalMatchResult {
+    #[pyo3(get)]
+    pub wins: u32,
+    #[pyo3(get)]
+    pub draws: u32,
+    #[pyo3(get)]
+    pub losses: u32,
+}
+
+// ---------------------------------------------------------------------------
+// Simple xorshift64 RNG (avoids adding rand crate dependency)
+// ---------------------------------------------------------------------------
+
+struct Rng(u64);
+
+impl Rng {
+    fn new() -> Self {
+        // Seed from a mix of address space and a constant
+        let seed = 0xdeadbeef_12345678u64
+            ^ (std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos() as u64);
+        Rng(if seed == 0 { 1 } else { seed })
+    }
+
+    #[inline]
+    fn next_u64(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+
+    /// Random usize in [0, n)
+    fn usize(&mut self, n: usize) -> usize {
+        (self.next_u64() % n as u64) as usize
+    }
+
+    /// Random float in [0, 1)
+    fn f64(&mut self) -> f64 {
+        (self.next_u64() >> 11) as f64 / (1u64 << 53) as f64
+    }
+
+    /// Sample from a probability distribution. Returns index.
+    fn sample_distribution(&mut self, probs: &[f64]) -> usize {
+        let r = self.f64();
+        let mut cumulative = 0.0;
+        for (i, &p) in probs.iter().enumerate() {
+            cumulative += p;
+            if r < cumulative {
+                return i;
+            }
+        }
+        probs.len() - 1
+    }
+}
+
+// ---------------------------------------------------------------------------
 // MCTS Engine (exposed to Python)
 // ---------------------------------------------------------------------------
 
@@ -158,6 +250,7 @@ pub struct MCTSEngine {
     c_puct: f32,
     nodes: Vec<MCTSNode>,
     engine: BitBoardEngine, // For heuristic evaluation
+    rng: Rng,
 }
 
 #[pymethods]
@@ -170,6 +263,7 @@ impl MCTSEngine {
             c_puct,
             nodes: Vec::with_capacity(8192),
             engine: BitBoardEngine::new(),
+            rng: Rng::new(),
         }
     }
 
@@ -225,6 +319,100 @@ impl MCTSEngine {
             36u16
         };
         from_idx * 36 + to_idx
+    }
+
+    // -----------------------------------------------------------------------
+    // #1: Full heuristic self-play game (entirely in Rust, no Python calls)
+    // -----------------------------------------------------------------------
+
+    /// Play one complete self-play game using heuristic MCTS. Returns training data.
+    /// No Python calls at all -- runs ~10x faster than the Python game loop.
+    #[pyo3(signature = (random_opening=6, max_moves=80, temp_moves=10))]
+    fn play_heuristic_game(
+        &mut self,
+        random_opening: usize,
+        max_moves: usize,
+        temp_moves: usize,
+    ) -> SelfPlayResult {
+        self.play_heuristic_game_impl(random_opening, max_moves, temp_moves)
+    }
+
+    /// Play N heuristic self-play games. Returns a list of SelfPlayResult.
+    #[pyo3(signature = (n_games, random_opening=6, max_moves=80, temp_moves=10))]
+    fn play_heuristic_games(
+        &mut self,
+        n_games: usize,
+        random_opening: usize,
+        max_moves: usize,
+        temp_moves: usize,
+    ) -> Vec<SelfPlayResult> {
+        (0..n_games)
+            .map(|_| self.play_heuristic_game_impl(random_opening, max_moves, temp_moves))
+            .collect()
+    }
+
+    // -----------------------------------------------------------------------
+    // #2: Temperature-based move selection (in Rust)
+    // -----------------------------------------------------------------------
+
+    /// Search with heuristic and return a move sampled by temperature.
+    /// temperature=0 returns the most-visited move (deterministic).
+    #[pyo3(signature = (board, temperature=1.0))]
+    fn search_heuristic_with_temp(
+        &mut self,
+        board: &Board,
+        temperature: f32,
+    ) -> MCTSSearchResult {
+        let bb = BitBoard::from_board(board);
+        let mut result = self.search_impl(&bb, None);
+        if temperature > 0.0 && result.best_move.is_some() {
+            result.best_move = self.sample_move_by_temp(0, temperature);
+        }
+        result
+    }
+
+    // -----------------------------------------------------------------------
+    // #3: Network self-play game loop (game loop in Rust, NN callback to Python)
+    // -----------------------------------------------------------------------
+
+    /// Play one complete self-play game using network MCTS with batched evaluation.
+    /// The game loop runs in Rust; only the network forward pass calls Python.
+    #[pyo3(signature = (eval_fn, batch_size=8, random_opening=4, max_moves=80, temp_moves=15, temperature=1.0))]
+    fn play_network_game(
+        &mut self,
+        py: Python<'_>,
+        eval_fn: PyObject,
+        batch_size: u32,
+        random_opening: usize,
+        max_moves: usize,
+        temp_moves: usize,
+        temperature: f32,
+    ) -> PyResult<SelfPlayResult> {
+        self.play_network_game_impl(
+            py, &eval_fn, batch_size, random_opening, max_moves, temp_moves, temperature,
+        )
+    }
+
+    // -----------------------------------------------------------------------
+    // #4: Evaluation match (MCTS vs alpha-beta, game loop in Rust)
+    // -----------------------------------------------------------------------
+
+    /// Play N evaluation games: network MCTS vs alpha-beta engine.
+    /// Alternates colors. Returns (wins, draws, losses) for MCTS.
+    #[pyo3(signature = (eval_fn, num_games=20, opponent_depth=5, batch_size=8, random_opening=2, max_moves=80))]
+    fn play_eval_match(
+        &mut self,
+        py: Python<'_>,
+        eval_fn: PyObject,
+        num_games: usize,
+        opponent_depth: u8,
+        batch_size: u32,
+        random_opening: usize,
+        max_moves: usize,
+    ) -> PyResult<EvalMatchResult> {
+        self.play_eval_match_impl(
+            py, &eval_fn, num_games, opponent_depth, batch_size, random_opening, max_moves,
+        )
     }
 }
 
@@ -765,5 +953,352 @@ impl MCTSEngine {
         let result = eval_fn.call1(py, (batch_planes.to_vec(),))?;
         let (batch_policy, batch_values): (Vec<Vec<f32>>, Vec<f32>) = result.extract(py)?;
         Ok((batch_policy, batch_values))
+    }
+
+    // -----------------------------------------------------------------------
+    // Temperature-based move selection from MCTS tree
+    // -----------------------------------------------------------------------
+
+    /// Sample a BitMove from the root's children visit counts using temperature.
+    /// Returns None if root has no children.
+    fn sample_bitmove_by_temp(&mut self, root_idx: usize, temperature: f32) -> Option<BitMove> {
+        let root = &self.nodes[root_idx];
+        if root.children_count == 0 {
+            return None;
+        }
+
+        let n_children = root.children_count as usize;
+        let start = root.children_start as usize;
+
+        let mut probs = Vec::with_capacity(n_children);
+        for i in 0..n_children {
+            let visits = self.nodes[start + i].visit_count as f64;
+            if temperature <= 0.01 {
+                probs.push(visits);
+            } else {
+                probs.push(visits.powf(1.0 / temperature as f64));
+            }
+        }
+
+        let total: f64 = probs.iter().sum();
+        if total <= 0.0 {
+            return Some(self.nodes[start].bitmove);
+        }
+        for p in &mut probs {
+            *p /= total;
+        }
+
+        let idx = self.rng.sample_distribution(&probs);
+        Some(self.nodes[start + idx].bitmove)
+    }
+
+    /// Sample a Move (Python-facing) from the root's children visit counts using temperature.
+    /// Returns None if root has no children.
+    fn sample_move_by_temp(&mut self, root_idx: usize, temperature: f32) -> Option<Move> {
+        self.sample_bitmove_by_temp(root_idx, temperature)
+            .map(|bm| bm.to_move())
+    }
+
+    /// Select a move from a BitMove list using a policy target distribution.
+    fn select_move_by_policy(
+        &mut self,
+        moves: &[BitMove],
+        policy_target: &[f32],
+        temperature: f32,
+    ) -> BitMove {
+        let mut probs: Vec<f64> = moves
+            .iter()
+            .map(|bm| {
+                let idx = policy_index(bm) as usize;
+                let p = if idx < policy_target.len() {
+                    policy_target[idx] as f64
+                } else {
+                    0.0
+                };
+                if temperature > 0.01 {
+                    p.powf(1.0 / temperature as f64)
+                } else {
+                    p
+                }
+            })
+            .collect();
+
+        let total: f64 = probs.iter().sum();
+        if total <= 0.0 {
+            return moves[self.rng.usize(moves.len())];
+        }
+        for p in &mut probs {
+            *p /= total;
+        }
+
+        let idx = self.rng.sample_distribution(&probs);
+        moves[idx]
+    }
+
+    // -----------------------------------------------------------------------
+    // #1: Full heuristic self-play game (entirely in Rust)
+    // -----------------------------------------------------------------------
+
+    fn play_heuristic_game_impl(
+        &mut self,
+        random_opening: usize,
+        max_moves: usize,
+        temp_moves: usize,
+    ) -> SelfPlayResult {
+        let mut bb = BitBoard::new();
+        let mut examples: Vec<(Vec<f32>, Vec<f32>)> = Vec::new();
+
+        // Random opening moves
+        for _ in 0..random_opening {
+            if bb.check_winner().is_some() {
+                break;
+            }
+            let moves = bb.generate_moves();
+            if moves.is_empty() {
+                break;
+            }
+            let idx = self.rng.usize(moves.len());
+            bb.make_move(&moves[idx]);
+        }
+
+        let mut move_count = 0u32;
+        while bb.check_winner().is_none() && (move_count as usize) < max_moves {
+            let result = self.search_impl(&bb, None);
+            if result.best_move.is_none() {
+                break;
+            }
+
+            // Collect training data
+            let planes = bb_to_planes(&bb);
+            examples.push((planes, result.policy_target.clone()));
+
+            // Temperature-based selection for first moves
+            let chosen_bitmove = if (move_count as usize) < temp_moves {
+                let moves = bb.generate_moves();
+                self.select_move_by_policy(&moves, &result.policy_target, 1.0)
+            } else {
+                // Find the BitMove for the best move
+                let root = &self.nodes[0];
+                let mut best_visits = 0u32;
+                let mut best_bm = self.nodes[root.children_start as usize].bitmove;
+                for i in 0..root.children_count as usize {
+                    let child = &self.nodes[root.children_start as usize + i];
+                    if child.visit_count > best_visits {
+                        best_visits = child.visit_count;
+                        best_bm = child.bitmove;
+                    }
+                }
+                best_bm
+            };
+
+            bb.make_move(&chosen_bitmove);
+            move_count += 1;
+        }
+
+        // Determine outcome
+        let (outcome, winner_str) = self.determine_outcome(&bb);
+
+        // Fill in outcomes
+        let training_examples: Vec<TrainingExample> = examples
+            .into_iter()
+            .map(|(planes, policy)| TrainingExample {
+                planes,
+                policy_target: policy,
+                value_target: outcome,
+            })
+            .collect();
+
+        SelfPlayResult {
+            examples: training_examples,
+            winner: winner_str,
+            move_count,
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // #3: Network self-play game loop (game loop in Rust, NN in Python)
+    // -----------------------------------------------------------------------
+
+    fn play_network_game_impl(
+        &mut self,
+        py: Python<'_>,
+        eval_fn: &PyObject,
+        batch_size: u32,
+        random_opening: usize,
+        max_moves: usize,
+        temp_moves: usize,
+        temperature: f32,
+    ) -> PyResult<SelfPlayResult> {
+        let mut bb = BitBoard::new();
+        let mut examples: Vec<(Vec<f32>, Vec<f32>)> = Vec::new();
+
+        // Random opening moves
+        for _ in 0..random_opening {
+            if bb.check_winner().is_some() {
+                break;
+            }
+            let moves = bb.generate_moves();
+            if moves.is_empty() {
+                break;
+            }
+            let idx = self.rng.usize(moves.len());
+            bb.make_move(&moves[idx]);
+        }
+
+        let mut move_count = 0u32;
+        while bb.check_winner().is_none() && (move_count as usize) < max_moves {
+            let result = self.search_batched_impl(&bb, py, eval_fn, batch_size);
+            if result.best_move.is_none() {
+                break;
+            }
+
+            // Collect training data
+            let planes = bb_to_planes(&bb);
+            examples.push((planes, result.policy_target.clone()));
+
+            // Temperature-based selection for first moves, then deterministic
+            let chosen_bitmove = if (move_count as usize) < temp_moves && temperature > 0.0 {
+                // Sample from visit distribution via the tree
+                self.sample_bitmove_by_temp(0, temperature)
+                    .unwrap_or_else(|| self.most_visited_bitmove())
+            } else {
+                self.most_visited_bitmove()
+            };
+
+            bb.make_move(&chosen_bitmove);
+            move_count += 1;
+        }
+
+        // Determine outcome
+        let (outcome, winner_str) = self.determine_outcome(&bb);
+
+        let training_examples: Vec<TrainingExample> = examples
+            .into_iter()
+            .map(|(planes, policy)| TrainingExample {
+                planes,
+                policy_target: policy,
+                value_target: outcome,
+            })
+            .collect();
+
+        Ok(SelfPlayResult {
+            examples: training_examples,
+            winner: winner_str,
+            move_count,
+        })
+    }
+
+    // -----------------------------------------------------------------------
+    // #4: Evaluation match (MCTS vs alpha-beta)
+    // -----------------------------------------------------------------------
+
+    fn play_eval_match_impl(
+        &mut self,
+        py: Python<'_>,
+        eval_fn: &PyObject,
+        num_games: usize,
+        opponent_depth: u8,
+        batch_size: u32,
+        random_opening: usize,
+        max_moves: usize,
+    ) -> PyResult<EvalMatchResult> {
+        let mut wins = 0u32;
+        let mut draws = 0u32;
+        let mut losses = 0u32;
+
+        for game_idx in 0..num_games {
+            let mcts_is_white = game_idx % 2 == 0;
+
+            let mut bb = BitBoard::new();
+            self.engine.full_reset();
+
+            // Random opening
+            for _ in 0..random_opening {
+                if bb.check_winner().is_some() {
+                    break;
+                }
+                let moves = bb.generate_moves();
+                if moves.is_empty() {
+                    break;
+                }
+                let idx = self.rng.usize(moves.len());
+                bb.make_move(&moves[idx]);
+            }
+
+            let mut move_count = 0u32;
+            while bb.check_winner().is_none() && (move_count as usize) < max_moves {
+                let is_white_turn = bb.current_player == Player::White;
+                let is_mcts_turn = is_white_turn == mcts_is_white;
+
+                let chosen_bitmove = if is_mcts_turn {
+                    // MCTS move (network)
+                    let result = self.search_batched_impl(&bb, py, eval_fn, batch_size);
+                    match result.best_move {
+                        Some(_) => self.most_visited_bitmove(),
+                        None => break,
+                    }
+                } else {
+                    // Alpha-beta opponent
+                    self.engine.full_reset();
+                    let (_, bm_opt) = self.engine.search(&bb, opponent_depth);
+                    match bm_opt {
+                        Some(bm) => bm,
+                        None => break,
+                    }
+                };
+
+                bb.make_move(&chosen_bitmove);
+                move_count += 1;
+            }
+
+            // Determine result
+            match bb.check_winner() {
+                None => draws += 1,
+                Some(winner) => {
+                    let white_won = winner == Player::White;
+                    if white_won == mcts_is_white {
+                        wins += 1;
+                    } else {
+                        losses += 1;
+                    }
+                }
+            }
+        }
+
+        Ok(EvalMatchResult { wins, draws, losses })
+    }
+
+    // -----------------------------------------------------------------------
+    // Helpers
+    // -----------------------------------------------------------------------
+
+    /// Get the BitMove of the most-visited root child.
+    fn most_visited_bitmove(&self) -> BitMove {
+        let root = &self.nodes[0];
+        let start = root.children_start as usize;
+        let mut best_visits = 0u32;
+        let mut best_bm = self.nodes[start].bitmove;
+        for i in 0..root.children_count as usize {
+            let child = &self.nodes[start + i];
+            if child.visit_count > best_visits {
+                best_visits = child.visit_count;
+                best_bm = child.bitmove;
+            }
+        }
+        best_bm
+    }
+
+    /// Determine game outcome: returns (value_target, winner_string).
+    fn determine_outcome(&self, bb: &BitBoard) -> (f32, String) {
+        match bb.check_winner() {
+            Some(Player::White) => (1.0, "white".to_string()),
+            Some(Player::Black) => (-1.0, "black".to_string()),
+            None => {
+                // Draw: use heuristic score as value target
+                let score = self.engine.evaluate_heuristic(bb);
+                let outcome = (score as f32 / SCORE_SCALING).tanh();
+                (outcome, "draw".to_string())
+            }
+        }
     }
 }
