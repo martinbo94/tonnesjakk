@@ -1,12 +1,11 @@
 #!/usr/bin/env python
 """
-Convenience script to run NNUE training.
+Convenience script to run HalfPail NNUE training.
 
 Usage:
-    python train_nnue.py                  # Default (10K games)
-    python train_nnue.py --games 20000    # More games
-    python train_nnue.py --test           # Quick test
-    python train_nnue.py --benchmark      # Speed benchmark
+    python train_nnue.py                                    # Default training
+    python train_nnue.py --load-data data.bin --epochs 50   # Train on data
+    python train_nnue.py --games 20000 --save-data data.bin # Generate data
 """
 import sys
 from pathlib import Path

@@ -16,11 +16,12 @@ Training loop:
 Usage:
   python -m tonnesjakk.alphazero --iterations 20 --games-per-iter 50 --simulations 200
   python -m tonnesjakk.alphazero --evaluate model.pt --games 50 --opponent-depth 5
+
+Game loops (self-play, heuristic self-play, evaluation matches) run in Rust
+via MCTSEngine methods (play_network_game, play_heuristic_games, play_eval_match).
 """
 
 import argparse
-import math
-import random
 import time
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -30,11 +31,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from tonnesjakk import Board, Engine
-from tonnesjakk._core import MCTSEngine as _RustMCTSEngine, POLICY_SIZE as _RUST_POLICY_SIZE
-from tonnesjakk.utils import is_white as _is_white, is_white_winner as _is_white_winner, safe_str as _safe_str, elo_with_ci
-
-SCORE_SCALING = 600.0  # tanh(score/600) normalization, matches NNUE training
+from tonnesjakk import Board
+from tonnesjakk._core import MCTSEngine as _RustMCTSEngine
+from tonnesjakk.utils import elo_with_ci
 
 
 # ---------------------------------------------------------------------------
@@ -82,59 +81,6 @@ def mirror_planes(planes: np.ndarray) -> np.ndarray:
 def mirror_policy(policy: np.ndarray) -> np.ndarray:
     """Mirror a policy vector using precomputed mapping. Shape: (1332,) or (N, 1332)."""
     return policy[..., _POLICY_MIRROR]
-
-
-# ---------------------------------------------------------------------------
-# Move encoding
-# ---------------------------------------------------------------------------
-
-def move_to_index(move) -> int:
-    """Encode a Move as a policy index in [0, 1331].
-
-    Encoding: from_idx * 36 + to_idx
-      - from_idx: row*6+col for board squares (0-35), 36 for off-board placement
-      - to_idx: row*6+col for destination (0-35)
-
-    Compound moves (with pail placement) map to the same index as the
-    barrel-only action. This is a minor simplification -- pail placement
-    only matters in the first 1-2 moves.
-    """
-    to_idx = move.barrel_to.row * 6 + move.barrel_to.col
-    if move.is_barrel_placement:
-        from_idx = 36  # off-board
-    else:
-        from_idx = move.barrel_from.row * 6 + move.barrel_from.col
-    return from_idx * 36 + to_idx
-
-
-def board_to_planes(board) -> np.ndarray:
-    """Convert board to 6x6x6 float planes for network input.
-
-    Planes:
-      0: White barrels (1.0 where present)
-      1: Black barrels
-      2: White pail
-      3: Black pail
-      4: Current player (1.0 if White to move, 0.0 if Black)
-      5: Ones (bias plane)
-    """
-    arr = board.to_array()  # 6x6, values in {0, +1, -1, +2, -2}
-    planes = np.zeros((BOARD_PLANES, BOARD_SIZE, BOARD_SIZE), dtype=np.float32)
-    for r in range(BOARD_SIZE):
-        for c in range(BOARD_SIZE):
-            v = arr[r][c]
-            if v == 1:
-                planes[0, r, c] = 1.0
-            elif v == -1:
-                planes[1, r, c] = 1.0
-            elif v == 2:
-                planes[2, r, c] = 1.0
-            elif v == -2:
-                planes[3, r, c] = 1.0
-    if _is_white(board):
-        planes[4, :, :] = 1.0
-    planes[5, :, :] = 1.0
-    return planes
 
 
 # ---------------------------------------------------------------------------
@@ -376,200 +322,6 @@ class NetworkMCTS:
         }
 
         return result.best_move, info
-
-
-# ---------------------------------------------------------------------------
-# Self-play
-# ---------------------------------------------------------------------------
-
-def self_play_game(
-    network_mcts: NetworkMCTS,
-    temperature: float = 1.0,
-    temp_threshold: int = 15,
-    max_moves: int = 80,
-    random_opening: int = 4,
-) -> Tuple[List[Tuple[np.ndarray, np.ndarray, float]], str]:
-    """Play one self-play game, collecting training data.
-
-    Args:
-        network_mcts: MCTS with network evaluation.
-        temperature: Exploration temperature for move selection.
-        temp_threshold: After this many moves, switch to deterministic.
-        max_moves: Maximum game length.
-        random_opening: Number of random opening moves.
-
-    Returns:
-        (examples, winner_str) where examples is list of
-        (board_planes, policy_target, outcome) tuples.
-    """
-    board = Board()
-    examples = []
-
-    # Random opening for variety
-    for _ in range(random_opening):
-        moves = board.generate_moves()
-        if not moves or board.check_winner() is not None:
-            break
-        board.make_move(random.choice(moves))
-
-    move_count = 0
-    while board.check_winner() is None and move_count < max_moves:
-        best_move, info = network_mcts.search(board, add_noise=True)
-        if best_move is None:
-            break
-
-        # Collect training example (outcome filled in after game)
-        planes = board_to_planes(board)
-        policy_target = info["policy_target"]
-        examples.append((planes, policy_target))
-
-        # Temperature-based move selection
-        if move_count < temp_threshold and temperature > 0:
-            # Build visit distribution and sample
-            move = _sample_move_by_temperature(
-                network_mcts, board, info, temperature
-            )
-            if move is None:
-                move = best_move
-        else:
-            move = best_move
-
-        board.make_move(move)
-        move_count += 1
-
-    # Determine outcome
-    # For draws, use heuristic eval of final position as value target.
-    # This bootstraps the value head -- pure game outcome (0.0) gives no
-    # signal when most games draw due to weak early play.
-    winner = board.check_winner()
-    if winner is None:
-        engine = Engine()
-        heuristic_score = engine.evaluate_position(board)
-        outcome = math.tanh(heuristic_score / SCORE_SCALING)
-        winner_str = "draw"
-    elif _is_white_winner(winner):
-        outcome = 1.0
-        winner_str = "white"
-    else:
-        outcome = -1.0
-        winner_str = "black"
-
-    # Fill in outcomes
-    training_examples = [
-        (planes, policy, outcome) for planes, policy in examples
-    ]
-
-    return training_examples, winner_str
-
-
-def _sample_move_by_temperature(network_mcts, board, info, temperature):
-    """Sample a move from visit count distribution with temperature."""
-    children_info = info.get("children", [])
-    if not children_info:
-        return None
-
-    # We need actual move objects, not just strings. Re-generate legal moves
-    # and match by visit count ordering.
-    # Simpler approach: regenerate moves and use policy_target as distribution
-    moves = board.generate_moves()
-    if not moves:
-        return None
-
-    policy_target = info["policy_target"]
-    move_probs = []
-    valid_moves = []
-    for m in moves:
-        idx = move_to_index(m)
-        prob = policy_target[idx]
-        if prob > 0:
-            move_probs.append(prob)
-            valid_moves.append(m)
-
-    if not valid_moves:
-        return None
-
-    # Apply temperature
-    probs = np.array(move_probs, dtype=np.float64)
-    if temperature != 1.0:
-        probs = probs ** (1.0 / temperature)
-    probs = probs / probs.sum()
-
-    idx = np.random.choice(len(valid_moves), p=probs)
-    return valid_moves[idx]
-
-
-def heuristic_self_play_game(
-    simulations: int = 400,
-    c_puct: float = 1.4,
-    max_moves: int = 80,
-    random_opening: int = 6,
-) -> Tuple[List[Tuple[np.ndarray, np.ndarray, float]], str]:
-    """Play one self-play game using pure heuristic MCTS (Rust, very fast).
-
-    These games produce decisive outcomes (wins/losses) to bootstrap the value
-    head. The policy targets come from heuristic MCTS visit counts -- not ideal,
-    but they teach basic move ordering.
-
-    Returns:
-        (examples, winner_str) same format as self_play_game().
-    """
-    board = Board()
-    engine = _RustMCTSEngine(simulations, c_puct)
-    examples = []
-
-    # More random opening moves for variety (heuristic games are fast)
-    for _ in range(random_opening):
-        moves = board.generate_moves()
-        if not moves or board.check_winner() is not None:
-            break
-        board.make_move(random.choice(moves))
-
-    move_count = 0
-    while board.check_winner() is None and move_count < max_moves:
-        result = engine.search_heuristic(board)
-        if result.best_move is None:
-            break
-
-        planes = board_to_planes(board)
-        policy_target = np.array(result.policy_target, dtype=np.float32)
-        examples.append((planes, policy_target))
-
-        # Temperature-based selection for first moves, then deterministic
-        if move_count < 10:
-            moves = board.generate_moves()
-            if moves:
-                probs = np.array([policy_target[move_to_index(m)] for m in moves], dtype=np.float64)
-                total = probs.sum()
-                if total > 0:
-                    probs /= total
-                    idx = np.random.choice(len(moves), p=probs)
-                    board.make_move(moves[idx])
-                else:
-                    board.make_move(result.best_move)
-            else:
-                break
-        else:
-            board.make_move(result.best_move)
-        move_count += 1
-
-    # Determine outcome
-    winner = board.check_winner()
-    if winner is None:
-        eng = Engine()
-        heuristic_score = eng.evaluate_position(board)
-        outcome = math.tanh(heuristic_score / SCORE_SCALING)
-        winner_str = "draw"
-    elif _is_white_winner(winner):
-        outcome = 1.0
-        winner_str = "white"
-    else:
-        outcome = -1.0
-        winner_str = "black"
-
-    training_examples = [
-        (planes, policy, outcome) for planes, policy in examples
-    ]
-    return training_examples, winner_str
 
 
 # ---------------------------------------------------------------------------
@@ -951,52 +703,6 @@ class AlphaZeroTrainer:
 
 
 # ---------------------------------------------------------------------------
-# Demo
-# ---------------------------------------------------------------------------
-
-def demo_game(network_mcts: NetworkMCTS, max_moves: int = 80):
-    """Play and display a game using the network MCTS."""
-    board = Board()
-
-    # Random opening
-    for _ in range(2):
-        moves = board.generate_moves()
-        if not moves or board.check_winner() is not None:
-            break
-        board.make_move(random.choice(moves))
-
-    print("After 2 random opening moves:")
-    print(board.display())
-    print()
-
-    move_count = 0
-    while board.check_winner() is None and move_count < max_moves:
-        move, info = network_mcts.search(board, add_noise=False)
-        if move is None:
-            break
-
-        player = "White" if _is_white(board) else "Black"
-        q_str = ""
-        if info.get("children"):
-            q_str = f" Q={info['children'][0]['q']:+.3f}"
-        print(f"Move {move_count + 1} ({player}): {_safe_str(move)}  "
-              f"[{info['visits']} visits{q_str}]")
-
-        board.make_move(move)
-        move_count += 1
-
-        print(board.display())
-        print()
-
-    winner = board.check_winner()
-    if winner is None:
-        print(f"Draw after {move_count} moves")
-    else:
-        w = "White" if _is_white_winner(winner) else "Black"
-        print(f"{w} wins after {move_count} moves")
-
-
-# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -1008,7 +714,6 @@ def main():
 Examples:
   python -m tonnesjakk.alphazero --iterations 20 --games-per-iter 50 --simulations 200
   python -m tonnesjakk.alphazero --evaluate alphazero_checkpoints/best_model.pt --games 50
-  python -m tonnesjakk.alphazero --demo alphazero_checkpoints/best_model.pt --simulations 200
         """,
     )
 
@@ -1053,8 +758,6 @@ Examples:
     # Modes
     parser.add_argument("--evaluate", type=str, default=None, metavar="MODEL",
                         help="Evaluate a saved model against heuristic")
-    parser.add_argument("--demo", type=str, default=None, metavar="MODEL",
-                        help="Play a demo game with a saved model")
     parser.add_argument("--resume", type=str, default=None, metavar="MODEL",
                         help="Resume training from a checkpoint")
     parser.add_argument("--games", type=int, default=50,
@@ -1083,31 +786,8 @@ Examples:
         print(f"Result: {w}W-{d}D-{l}L")
         print(f"ELO: {elo:+.0f} [{elo_lo:+.0f}, {elo_hi:+.0f}]")
 
-    elif args.demo:
-        # Play a demo game
-        net = make_network(args.network, hidden=args.hidden, num_blocks=args.num_blocks)
-        checkpoint = torch.load(args.demo, map_location="cpu", weights_only=True)
-        net.load_state_dict(checkpoint["model_state_dict"])
-        net.eval()
-        mcts = NetworkMCTS(net, simulations=args.simulations, c_puct=args.c_puct)
-        demo_game(mcts)
-
     else:
         # Train
-        print("=" * 60)
-        print("ALPHAZERO TRAINING FOR TONNESJAKK")
-        print("=" * 60)
-        print(f"  Network: {args.network} (blocks={args.num_blocks}, channels={args.hidden})")
-        print(f"  Iterations: {args.iterations}")
-        print(f"  Games/iter: {args.games_per_iter}")
-        print(f"  Simulations: {args.simulations}")
-        print(f"  LR: {args.lr} (cosine annealing)")
-        print(f"  Policy weight: {args.policy_weight}")
-        print(f"  Device: {trainer.device}")
-        print(f"  Eval every: {args.eval_every} iters (depth {args.eval_depth})")
-        print(f"  Save dir: {args.save_dir}")
-        print()
-
         trainer = AlphaZeroTrainer(
             hidden=args.hidden,
             simulations=args.simulations,
@@ -1123,6 +803,20 @@ Examples:
             policy_weight=args.policy_weight,
             device=args.device,
         )
+
+        print("=" * 60)
+        print("ALPHAZERO TRAINING FOR TONNESJAKK")
+        print("=" * 60)
+        print(f"  Network: {args.network} (blocks={args.num_blocks}, channels={args.hidden})")
+        print(f"  Iterations: {args.iterations}")
+        print(f"  Games/iter: {args.games_per_iter}")
+        print(f"  Simulations: {args.simulations}")
+        print(f"  LR: {args.lr} (cosine annealing)")
+        print(f"  Policy weight: {args.policy_weight}")
+        print(f"  Device: {trainer.device}")
+        print(f"  Eval every: {args.eval_every} iters (depth {args.eval_depth})")
+        print(f"  Save dir: {args.save_dir}")
+        print()
 
         if args.resume:
             trainer.load(args.resume)

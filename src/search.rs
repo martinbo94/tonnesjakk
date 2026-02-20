@@ -334,17 +334,12 @@ impl Engine {
 
     /// Check if NNUE is loaded
     fn has_nnue(&self) -> bool {
-        self.inner.nnue.is_some() || self.inner.quantized_nnue.is_some() || self.inner.halfpail_nnue.is_some()
+        self.inner.halfpail_nnue.is_some()
     }
 
     /// Clear NNUE (revert to heuristic evaluation)
     fn clear_nnue(&mut self) {
         self.inner.clear_nnue();
-    }
-
-    /// Skip relational features during NNUE evaluation (for benchmarking)
-    fn set_skip_relational(&mut self, skip: bool) {
-        self.inner.skip_relational = skip;
     }
 
     /// Time-based search: iterative deepening that stops when time runs out.
@@ -408,29 +403,11 @@ pub struct BitBoardEngine {
     // Previous move (for continuation history indexing)
     prev_move: Option<BitMove>,
 
-    // NNUE evaluator (f32)
-    nnue: Option<IncrementalNNUE>,
-
-    // Accumulator stack (f32)
-    acc_stack: AccumulatorStack,
-
-    // Working accumulator for evaluation (reused to avoid allocations)
-    eval_acc: Accumulator,
-
-    // Quantized NNUE evaluator (i16) — takes priority over f32 when loaded
-    quantized_nnue: Option<QuantizedNNUE>,
-
-    // Quantized accumulator stack
-    qacc_stack: QAccumulatorStack,
-
-    // HalfPail NNUE evaluator — takes priority over f32/quantized when loaded
+    // HalfPail NNUE evaluator
     halfpail_nnue: Option<HalfPailNNUE>,
 
     // Dual accumulator stack for HalfPail
     dual_acc_stack: DualAccumulatorStack,
-
-    // Skip relational features (for benchmarking)
-    skip_relational: bool,
 
     // Time-based search: deadline for when to abort, checked every 1024 nodes
     deadline: Option<Instant>,
@@ -479,14 +456,8 @@ impl BitBoardEngine {
             history: [[0; NUM_SQUARES]; NUM_SQUARES],
             cont_history: [[0i32; NUM_SQUARES]; NUM_SQUARES],
             prev_move: None,
-            nnue: None,
-            acc_stack: AccumulatorStack::new(),
-            eval_acc: Accumulator::default(),
-            quantized_nnue: None,
-            qacc_stack: QAccumulatorStack::new(),
             halfpail_nnue: None,
             dual_acc_stack: DualAccumulatorStack::new(),
-            skip_relational: false,
             deadline: None,
             nodes_since_check: 0,
             search_stopped: false,
@@ -535,59 +506,14 @@ impl BitBoardEngine {
     /// Last NNUE-modell (auto-detects halfpail vs quantized vs f32 format)
     pub fn load_nnue(&mut self, path: &str) -> Result<(), Box<dyn std::error::Error>> {
         let json_str = std::fs::read_to_string(path)?;
-        let value: serde_json::Value = serde_json::from_str(&json_str)?;
-
-        if value.get("halfpail").and_then(|v| v.as_bool()).unwrap_or(false) {
-            // HalfPail dual-perspective sparse format
-            let json: HalfPailJson = serde_json::from_value(value)?;
-            let hp = HalfPailNNUE::from_json(json)?;
-            self.halfpail_nnue = Some(hp);
-            self.nnue = None;
-            self.quantized_nnue = None;
-        } else if value.get("quantized").and_then(|v| v.as_bool()).unwrap_or(false) {
-            // Quantized int16 format
-            let json: QuantizedNNUEJson = serde_json::from_value(value)?;
-            let qnnue = QuantizedNNUE::from_json(json)?;
-            self.quantized_nnue = Some(qnnue);
-            self.nnue = None;
-            self.halfpail_nnue = None;
-        } else {
-            // Standard f32 format
-            let model: NNUEModel = serde_json::from_value(value)?;
-            let fc1_weight: Vec<f32> = model.weights.fc1_weight.into_iter().flatten().collect();
-            let fc2_weight: Vec<f32> = model.weights.fc2_weight.into_iter().flatten().collect();
-            let fc3_weight: Vec<f32> = model.weights.fc3_weight.into_iter().flatten().collect();
-            let input_size = fc1_weight.len() / model.hidden1;
-            let hidden1 = model.hidden1;
-            let mut fc1_weight_t = vec![0.0f32; input_size * hidden1];
-            for neuron in 0..hidden1 {
-                for feature in 0..input_size {
-                    fc1_weight_t[feature * hidden1 + neuron] = fc1_weight[neuron * input_size + feature];
-                }
-            }
-            let nnue = IncrementalNNUE {
-                fc1_weight,
-                fc1_weight_t,
-                fc1_bias: model.weights.fc1_bias,
-                fc2_weight,
-                fc2_bias: model.weights.fc2_bias,
-                fc3_weight,
-                fc3_bias: model.weights.fc3_bias[0],
-                hidden1,
-                hidden2: model.hidden2,
-                input_size,
-            };
-            self.nnue = Some(nnue);
-            self.quantized_nnue = None;
-            self.halfpail_nnue = None;
-        }
+        let json: HalfPailJson = serde_json::from_str(&json_str)?;
+        let hp = HalfPailNNUE::from_json(json)?;
+        self.halfpail_nnue = Some(hp);
         Ok(())
     }
 
     /// Clear NNUE (revert to heuristic evaluation)
     pub fn clear_nnue(&mut self) {
-        self.nnue = None;
-        self.quantized_nnue = None;
         self.halfpail_nnue = None;
     }
 
@@ -602,8 +528,6 @@ impl BitBoardEngine {
         self.eval_cache.clear();
         self.clear_history();
         self.killer_moves = std::array::from_fn(|_| [None, None]);
-        self.acc_stack.reset();
-        self.qacc_stack.reset();
         self.dual_acc_stack.reset();
         self.nodes_searched = 0;
         self.cutoffs = 0;
@@ -721,47 +645,14 @@ impl BitBoardEngine {
             return score;
         }
 
-        // HalfPail NNUE (highest priority — best feature representation)
-        if self.halfpail_nnue.is_some() {
+        let score = if let Some(ref hp) = self.halfpail_nnue {
             let dual_acc = self.dual_acc_stack.current();
-            let hp = self.halfpail_nnue.as_ref().unwrap();
-            let score = hp.evaluate_from_dual_acc(bb, dual_acc);
-            self.eval_cache.store(hash, score);
-            score
-        }
-        // Quantized NNUE (preferred — faster)
-        else if self.quantized_nnue.is_some() {
-            let base_acc = self.qacc_stack.current();
-            let qnnue = self.quantized_nnue.as_ref().unwrap();
-            let score = qnnue.evaluate_from_qacc(bb, base_acc);
-            self.eval_cache.store(hash, score);
-            score
-        }
-        // Float NNUE (fallback)
-        else if self.nnue.is_some() {
-            let base_acc = self.acc_stack.current();
-            let pre_activation = base_acc.pre_activation;
-
-            let nnue = self.nnue.as_ref().unwrap();
-            let eval_acc = &mut self.eval_acc;
-
-            eval_acc.pre_activation = pre_activation;
-
-            if !self.skip_relational && nnue.input_size > BASE_FEATURES {
-                nnue.add_relational_features(bb, eval_acc);
-            }
-
-            eval_acc.apply_relu();
-            let score = (nnue.evaluate_from_accumulator(eval_acc) * 1000.0) as i32;
-
-            self.eval_cache.store(hash, score);
-            score
+            hp.evaluate_from_dual_acc(bb, dual_acc)
         } else {
-            // Heuristisk eval (cache already checked above)
-            let score = self.evaluate_heuristic(bb);
-            self.eval_cache.store(hash, score);
-            score
-        }
+            self.evaluate_heuristic(bb)
+        };
+        self.eval_cache.store(hash, score);
+        score
     }
 
     /// Hent eval cache statistikk
@@ -909,23 +800,11 @@ impl BitBoardEngine {
         // Age history (don't clear - accumulated knowledge is valuable)
         self.age_history();
 
-        // Initialiser accumulator med full evaluering
-        self.acc_stack.reset();
-        self.qacc_stack.reset();
+        // Initialize accumulator
         self.dual_acc_stack.reset();
         if let Some(ref hp) = self.halfpail_nnue {
             let dual_acc = self.dual_acc_stack.current_mut();
             hp.init_accumulators(bb, dual_acc);
-        } else if let Some(ref qnnue) = self.quantized_nnue {
-            let acc = self.qacc_stack.current_mut();
-            qnnue.init_accumulator(bb, acc);
-        } else if let Some(ref nnue) = self.nnue {
-            let acc = self.acc_stack.current_mut();
-            for i in 0..nnue.hidden1 {
-                acc.pre_activation[i] = nnue.fc1_bias[i];
-            }
-            nnue.add_features_from_bitboard(bb, acc);
-            acc.apply_relu();
         }
 
         let maximizing = bb.current_player == Player::White;
@@ -1056,8 +935,7 @@ impl BitBoardEngine {
                 new_bb.make_move(&mv);
 
                 // Oppdater accumulator (halfpail, quantized, or float)
-                if self.halfpail_nnue.is_some() {
-                    let hp = self.halfpail_nnue.as_ref().unwrap();
+                if let Some(ref hp) = self.halfpail_nnue {
                     let (w_deltas, b_deltas, w_recomp, b_recomp) = hp.compute_move_deltas(bb, &mv);
                     self.dual_acc_stack.push();
                     if w_recomp || b_recomp {
@@ -1069,27 +947,12 @@ impl BitBoardEngine {
                         hp.apply_deltas(&mut dual_acc.white_pre, &w_deltas);
                         hp.apply_deltas(&mut dual_acc.black_pre, &b_deltas);
                     }
-                } else if let Some(ref qnnue) = self.quantized_nnue {
-                    let deltas = compute_nnue_move_deltas(bb, &mv);
-                    self.qacc_stack.push();
-                    let acc = self.qacc_stack.current_mut();
-                    qnnue.apply_deltas_q(acc, &deltas);
-                } else if self.nnue.is_some() {
-                    let nnue = self.nnue.as_ref().unwrap();
-                    let deltas = nnue.compute_move_deltas(bb, &mv);
-                    self.acc_stack.push();
-                    let acc = self.acc_stack.current_mut();
-                    nnue.apply_deltas(acc, &deltas);
                 }
 
                 let score = self.quiesce(&new_bb, alpha, beta, false, qsdepth + 1);
 
                 if self.halfpail_nnue.is_some() {
                     self.dual_acc_stack.pop();
-                } else if self.quantized_nnue.is_some() {
-                    self.qacc_stack.pop();
-                } else if self.nnue.is_some() {
-                    self.acc_stack.pop();
                 }
 
                 best = best.max(score);
@@ -1106,8 +969,7 @@ impl BitBoardEngine {
                 new_bb.make_move(&mv);
 
                 // Oppdater accumulator (halfpail, quantized, or float)
-                if self.halfpail_nnue.is_some() {
-                    let hp = self.halfpail_nnue.as_ref().unwrap();
+                if let Some(ref hp) = self.halfpail_nnue {
                     let (w_deltas, b_deltas, w_recomp, b_recomp) = hp.compute_move_deltas(bb, &mv);
                     self.dual_acc_stack.push();
                     if w_recomp || b_recomp {
@@ -1119,27 +981,12 @@ impl BitBoardEngine {
                         hp.apply_deltas(&mut dual_acc.white_pre, &w_deltas);
                         hp.apply_deltas(&mut dual_acc.black_pre, &b_deltas);
                     }
-                } else if let Some(ref qnnue) = self.quantized_nnue {
-                    let deltas = compute_nnue_move_deltas(bb, &mv);
-                    self.qacc_stack.push();
-                    let acc = self.qacc_stack.current_mut();
-                    qnnue.apply_deltas_q(acc, &deltas);
-                } else if self.nnue.is_some() {
-                    let nnue = self.nnue.as_ref().unwrap();
-                    let deltas = nnue.compute_move_deltas(bb, &mv);
-                    self.acc_stack.push();
-                    let acc = self.acc_stack.current_mut();
-                    nnue.apply_deltas(acc, &deltas);
                 }
 
                 let score = self.quiesce(&new_bb, alpha, beta, true, qsdepth + 1);
 
                 if self.halfpail_nnue.is_some() {
                     self.dual_acc_stack.pop();
-                } else if self.quantized_nnue.is_some() {
-                    self.qacc_stack.pop();
-                } else if self.nnue.is_some() {
-                    self.acc_stack.pop();
                 }
 
                 best = best.min(score);
@@ -1445,17 +1292,6 @@ impl BitBoardEngine {
                     hp.apply_deltas(&mut dual_acc.white_pre, &w_deltas);
                     hp.apply_deltas(&mut dual_acc.black_pre, &b_deltas);
                 }
-            } else if let Some(ref qnnue) = self.quantized_nnue {
-                let deltas = compute_nnue_move_deltas(bb, &mv);
-                self.qacc_stack.push();
-                let acc = self.qacc_stack.current_mut();
-                qnnue.apply_deltas_q(acc, &deltas);
-            } else if self.nnue.is_some() {
-                let nnue = self.nnue.as_ref().unwrap();
-                let deltas = nnue.compute_move_deltas(bb, &mv);
-                self.acc_stack.push();
-                let acc = self.acc_stack.current_mut();
-                nnue.apply_deltas(acc, &deltas);
             }
 
             let score;
@@ -1523,10 +1359,6 @@ impl BitBoardEngine {
             // Pop accumulator
             if self.halfpail_nnue.is_some() {
                 self.dual_acc_stack.pop();
-            } else if self.quantized_nnue.is_some() {
-                self.qacc_stack.pop();
-            } else if self.nnue.is_some() {
-                self.acc_stack.pop();
             }
 
             moves_searched += 1;
