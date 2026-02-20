@@ -30,6 +30,8 @@ Thumbs.db
 nnue_weights*.json
 *.pt
 *.npz
+*.bin
+*_meta.json
 
 # Project docs (kept locally only)
 CLAUDE.md

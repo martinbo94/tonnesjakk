@@ -313,6 +313,177 @@
             color: #fff;
         }
 
+        /* ======= REPLAY VIEW ======= */
+        #replay-screen {
+            display: none;
+            width: 100%;
+            max-width: 1100px;
+        }
+
+        .replay-layout {
+            display: flex;
+            gap: 30px;
+            align-items: flex-start;
+            flex-wrap: wrap;
+            justify-content: center;
+        }
+
+        .replay-board-area {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 10px;
+        }
+
+        #replay-board {
+            display: grid;
+            grid-template-columns: repeat(6, 60px);
+            grid-template-rows: repeat(6, 60px);
+            gap: 2px;
+            background: #2d2d44;
+            padding: 10px;
+            border-radius: 10px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.5);
+        }
+
+        .replay-controls {
+            display: flex;
+            gap: 8px;
+            align-items: center;
+            justify-content: center;
+            margin-top: 10px;
+        }
+
+        .replay-controls button {
+            padding: 8px 16px;
+            font-size: 1.1em;
+            min-width: 44px;
+            background: #555;
+        }
+
+        .replay-controls button:hover {
+            background: #4CAF50;
+        }
+
+        .replay-controls button:disabled {
+            opacity: 0.3;
+            cursor: not-allowed;
+        }
+
+        .replay-controls button:disabled:hover {
+            background: #555;
+        }
+
+        .replay-move-label {
+            font-size: 0.95em;
+            color: #ccc;
+            min-width: 100px;
+            text-align: center;
+        }
+
+        .replay-sidebar {
+            background: #2d2d44;
+            padding: 20px;
+            border-radius: 10px;
+            min-width: 320px;
+            max-width: 400px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.5);
+            max-height: 520px;
+            display: flex;
+            flex-direction: column;
+        }
+
+        .replay-sidebar h3 {
+            color: #4CAF50;
+            margin-bottom: 12px;
+        }
+
+        .replay-sidebar select {
+            width: 100%;
+            margin-bottom: 12px;
+        }
+
+        .replay-game-list {
+            flex: 1;
+            overflow-y: auto;
+            margin-bottom: 12px;
+            border: 1px solid #444;
+            border-radius: 5px;
+        }
+
+        .replay-game-item {
+            padding: 8px 12px;
+            cursor: pointer;
+            border-bottom: 1px solid #333;
+            font-size: 0.9em;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            transition: background 0.15s;
+        }
+
+        .replay-game-item:hover {
+            background: #3a3a55;
+        }
+
+        .replay-game-item.active {
+            background: #1b5e20;
+        }
+
+        .replay-game-item .result-badge {
+            display: inline-block;
+            padding: 2px 8px;
+            border-radius: 3px;
+            font-weight: bold;
+            font-size: 0.85em;
+        }
+
+        .result-badge.win-w { background: #e8e8e8; color: #333; }
+        .result-badge.win-b { background: #333; color: #fff; }
+        .result-badge.draw { background: #666; color: #fff; }
+
+        .replay-move-info {
+            background: #1a1a2e;
+            padding: 12px;
+            border-radius: 5px;
+            font-size: 0.9em;
+            line-height: 1.7;
+        }
+
+        .replay-move-info .label {
+            color: #888;
+        }
+
+        .replay-move-info .value {
+            color: #fff;
+            font-weight: bold;
+        }
+
+        .replay-score-bar {
+            display: flex;
+            gap: 20px;
+            font-size: 1.1em;
+            justify-content: center;
+            padding: 8px;
+        }
+
+        .cell.highlight-from {
+            box-shadow: inset 0 0 0 3px #FF9800;
+        }
+
+        .cell.highlight-to {
+            box-shadow: inset 0 0 0 3px #4CAF50;
+        }
+
+        .cell.highlight-pail {
+            box-shadow: inset 0 0 0 3px #2196F3;
+        }
+
+        .cell.highlight-path {
+            box-shadow: inset 0 0 0 2px #FFC107;
+            background-color: rgba(255, 193, 7, 0.15);
+        }
+
         /* Loading */
         .loading {
             display: inline-block;
@@ -364,6 +535,55 @@
         </div>
 
         <button onclick="startGame()">Start spill</button>
+        <div style="margin-top: 20px; border-top: 1px solid #444; padding-top: 20px;">
+            <button class="secondary" onclick="openReplayView()">Inspect Games</button>
+            <p style="font-size:0.8em; color:#888; margin-top:5px;">Browse and replay test match games</p>
+        </div>
+    </div>
+
+    <!-- Replay screen -->
+    <div id="replay-screen">
+        <div class="replay-layout">
+            <div class="replay-board-area">
+                <div class="replay-score-bar">
+                    <span>White <span id="replay-white-engine" style="font-size:0.8em; color:#aaa;"></span>: <strong id="replay-white-score">0</strong></span>
+                    <span>|</span>
+                    <span>Black <span id="replay-black-engine" style="font-size:0.8em; color:#aaa;"></span>: <strong id="replay-black-score">0</strong></span>
+                </div>
+                <div id="replay-board"></div>
+                <div class="replay-controls">
+                    <button onclick="replayFirst()" title="First move (Home)">|&lt;</button>
+                    <button onclick="replayPrev()" title="Previous move (Left arrow)">&lt;</button>
+                    <span class="replay-move-label" id="replay-move-label">Move 0 / 0</span>
+                    <button onclick="replayNext()" title="Next move (Right arrow)">&gt;</button>
+                    <button onclick="replayLast()" title="Last move (End)">&gt;|</button>
+                </div>
+                <div style="font-size:0.8em; color:#888; margin-top:4px;">
+                    Arrow keys: prev/next &bull; Home/End: first/last
+                </div>
+            </div>
+
+            <div class="replay-sidebar">
+                <h3>Game Records</h3>
+                <select id="replay-record-select" onchange="onRecordSelect()">
+                    <option value="">-- Select a test run --</option>
+                </select>
+
+                <div class="replay-game-list" id="replay-game-list"></div>
+
+                <div class="replay-move-info" id="replay-move-info">
+                    <div><span class="label">Player:</span> <span class="value" id="rmi-player">-</span></div>
+                    <div><span class="label">Engine:</span> <span class="value" id="rmi-who">-</span></div>
+                    <div><span class="label">Score:</span> <span class="value" id="rmi-score">-</span></div>
+                    <div><span class="label">Depth:</span> <span class="value" id="rmi-depth">-</span></div>
+                    <div><span class="label">Nodes:</span> <span class="value" id="rmi-nodes">-</span></div>
+                </div>
+
+                <div style="margin-top: 12px; text-align: center;">
+                    <button onclick="closeReplayView()" class="secondary">Back</button>
+                </div>
+            </div>
+        </div>
     </div>
 
     <!-- Game container (hidden initially) -->
@@ -1091,6 +1311,289 @@
             lastAiMove = null;
             resetSelection();
         }
+
+        // =====================================================================
+        // REPLAY MODE
+        // =====================================================================
+
+        let replayData = null;       // The loaded record file
+        let replayGameIndex = -1;    // Which game is selected
+        let replayMoveIndex = -1;    // Current move position (-1 = initial board)
+
+        function openReplayView() {
+            document.getElementById('start-screen').style.display = 'none';
+            document.getElementById('game-container').style.display = 'none';
+            document.getElementById('replay-screen').style.display = 'block';
+            loadGameRecordsList();
+        }
+
+        function closeReplayView() {
+            document.getElementById('replay-screen').style.display = 'none';
+            document.getElementById('start-screen').style.display = 'block';
+            replayData = null;
+            replayGameIndex = -1;
+            replayMoveIndex = -1;
+        }
+
+        async function loadGameRecordsList() {
+            try {
+                const data = await api('/api/game-records');
+                const select = document.getElementById('replay-record-select');
+                select.innerHTML = '<option value="">-- Select a test run --</option>';
+
+                data.records.forEach(rec => {
+                    const opt = document.createElement('option');
+                    opt.value = rec.filename;
+                    const wld = `+${rec.wins} =${rec.draws} -${rec.losses}`;
+                    const shortA = (rec.model_a || '').replace(/.*[\/\\]/, '').replace(/\.json$/, '');
+                    const shortB = (rec.model_b || '').replace(/.*[\/\\]/, '').replace(/\.json$/, '');
+                    opt.textContent = `${shortA} vs ${shortB} | ${rec.total_games}g ${wld}`;
+                    opt.title = `${rec.date} — ${rec.model_a} vs ${rec.model_b}`;
+                    select.appendChild(opt);
+                });
+            } catch (e) {
+                console.error('Failed to load game records:', e);
+            }
+        }
+
+        async function onRecordSelect() {
+            const filename = document.getElementById('replay-record-select').value;
+            if (!filename) {
+                replayData = null;
+                document.getElementById('replay-game-list').innerHTML = '';
+                return;
+            }
+
+            try {
+                replayData = await api(`/api/game-records/${filename}`);
+                renderGameList();
+            } catch (e) {
+                console.error('Failed to load record:', e);
+            }
+        }
+
+        function renderGameList() {
+            const list = document.getElementById('replay-game-list');
+            list.innerHTML = '';
+            if (!replayData) return;
+
+            replayData.games.forEach((game, idx) => {
+                const item = document.createElement('div');
+                item.className = 'replay-game-item' + (idx === replayGameIndex ? ' active' : '');
+                item.onclick = () => selectReplayGame(idx);
+
+                // Determine if model won, lost, or drew
+                const modelWon = (game.result === 'W' && game.model_is_white) ||
+                                 (game.result === 'B' && !game.model_is_white);
+                const modelLost = (game.result === 'W' && !game.model_is_white) ||
+                                  (game.result === 'B' && game.model_is_white);
+                const resultClass = modelWon ? 'win-w' : modelLost ? 'win-b' : 'draw';
+                const resultLabel = modelWon ? 'Model W' : modelLost ? 'Model L' : 'Draw';
+                const modelColor = game.model_is_white ? 'white' : 'black';
+
+                item.innerHTML = `
+                    <span>Game ${game.game_num} (${game.total_moves}m)</span>
+                    <span>
+                        <span class="result-badge ${resultClass}">${resultLabel}</span>
+                        <span style="font-size:0.75em; color:#888; margin-left:3px;">${modelColor}</span>
+                    </span>
+                `;
+                list.appendChild(item);
+            });
+        }
+
+        function selectReplayGame(idx) {
+            replayGameIndex = idx;
+            replayMoveIndex = -1;  // Start at initial board
+            renderGameList();
+
+            // Show engine names next to White/Black
+            if (replayData && replayData.metadata && idx >= 0) {
+                const game = replayData.games[idx];
+                const modelName = replayData.metadata.model_a || 'model';
+                const oppName = replayData.metadata.model_b || 'opponent';
+                const whiteName = game.model_is_white ? modelName : oppName;
+                const blackName = game.model_is_white ? oppName : modelName;
+                // Show just the filename stem for brevity
+                const short = s => s.replace(/.*[\/\\]/, '').replace(/\.json$/, '');
+                document.getElementById('replay-white-engine').textContent = `(${short(whiteName)})`;
+                document.getElementById('replay-black-engine').textContent = `(${short(blackName)})`;
+            }
+
+            renderReplayState();
+        }
+
+        function renderReplayState() {
+            if (!replayData || replayGameIndex < 0) return;
+            const game = replayData.games[replayGameIndex];
+
+            // Get board state
+            let boardArr;
+            let whiteScored = 0, blackScored = 0;
+
+            if (replayMoveIndex < 0) {
+                // Initial board (before any moves in this game)
+                boardArr = game.initial_board;
+            } else {
+                const move = game.moves[replayMoveIndex];
+                boardArr = move.board_after;
+                whiteScored = move.white_scored || 0;
+                blackScored = move.black_scored || 0;
+            }
+
+            // Update scores
+            document.getElementById('replay-white-score').textContent = whiteScored;
+            document.getElementById('replay-black-score').textContent = blackScored;
+
+            // Update move label
+            const totalMoves = game.moves.length;
+            const displayIdx = replayMoveIndex + 1;
+            document.getElementById('replay-move-label').textContent =
+                `Move ${displayIdx} / ${totalMoves}`;
+
+            // Render board
+            const board = document.getElementById('replay-board');
+            board.innerHTML = '';
+
+            // Get current move's highlights
+            let highlightFrom = null, highlightTo = null, highlightPail = null;
+            let highlightPath = [];
+            if (replayMoveIndex >= 0) {
+                const moveData = game.moves[replayMoveIndex].move;
+                highlightFrom = moveData.barrel_from;
+                highlightTo = moveData.barrel_to;
+                highlightPail = moveData.place_pail;
+                // barrel_path includes all intermediate + final positions in a jump chain
+                if (moveData.barrel_path && moveData.barrel_path.length > 1) {
+                    // Exclude first (=from) and last (=to) — they get their own highlights
+                    highlightPath = moveData.barrel_path.slice(0, -1);
+                    if (highlightFrom) {
+                        highlightPath = highlightPath.filter(
+                            p => !(p[0] === highlightFrom[0] && p[1] === highlightFrom[1])
+                        );
+                    }
+                }
+            }
+
+            for (let row = 0; row < BOARD_SIZE; row++) {
+                for (let col = 0; col < BOARD_SIZE; col++) {
+                    const cell = document.createElement('div');
+                    cell.className = 'cell ' + ((row + col) % 2 === 0 ? 'light' : 'dark');
+
+                    // Highlight move
+                    if (highlightFrom && highlightFrom[0] === row && highlightFrom[1] === col) {
+                        cell.classList.add('highlight-from');
+                    }
+                    if (highlightTo && highlightTo[0] === row && highlightTo[1] === col) {
+                        cell.classList.add('highlight-to');
+                    }
+                    if (highlightPail && highlightPail[0] === row && highlightPail[1] === col) {
+                        cell.classList.add('highlight-pail');
+                    }
+                    if (highlightPath.some(p => p[0] === row && p[1] === col)) {
+                        cell.classList.add('highlight-path');
+                    }
+
+                    // Add piece
+                    const val = boardArr[row][col];
+                    if (val !== 0) {
+                        const piece = document.createElement('div');
+                        piece.className = 'piece';
+
+                        if (val === 1) {
+                            piece.classList.add('white-barrel');
+                        } else if (val === -1) {
+                            piece.classList.add('black-barrel');
+                        } else if (val === 2) {
+                            piece.classList.add('white-pail');
+                            piece.textContent = 'M';
+                        } else if (val === -2) {
+                            piece.classList.add('black-pail');
+                            piece.textContent = 'M';
+                        }
+
+                        cell.appendChild(piece);
+                    }
+
+                    board.appendChild(cell);
+                }
+            }
+
+            // Update move info panel
+            if (replayMoveIndex >= 0) {
+                const move = game.moves[replayMoveIndex];
+                document.getElementById('rmi-player').textContent = move.player;
+                document.getElementById('rmi-who').textContent = move.who;
+                document.getElementById('rmi-score').textContent =
+                    (move.score >= 0 ? '+' : '') + move.score;
+                document.getElementById('rmi-depth').textContent = move.depth;
+                document.getElementById('rmi-nodes').textContent =
+                    move.nodes.toLocaleString();
+            } else {
+                document.getElementById('rmi-player').textContent = '-';
+                document.getElementById('rmi-who').textContent = 'Initial position';
+                document.getElementById('rmi-score').textContent = '-';
+                document.getElementById('rmi-depth').textContent = '-';
+                document.getElementById('rmi-nodes').textContent = '-';
+            }
+        }
+
+        // Navigation
+        function replayNext() {
+            if (!replayData || replayGameIndex < 0) return;
+            const game = replayData.games[replayGameIndex];
+            if (replayMoveIndex < game.moves.length - 1) {
+                replayMoveIndex++;
+                renderReplayState();
+            }
+        }
+
+        function replayPrev() {
+            if (!replayData || replayGameIndex < 0) return;
+            if (replayMoveIndex > -1) {
+                replayMoveIndex--;
+                renderReplayState();
+            }
+        }
+
+        function replayFirst() {
+            if (!replayData || replayGameIndex < 0) return;
+            replayMoveIndex = -1;
+            renderReplayState();
+        }
+
+        function replayLast() {
+            if (!replayData || replayGameIndex < 0) return;
+            const game = replayData.games[replayGameIndex];
+            replayMoveIndex = game.moves.length - 1;
+            renderReplayState();
+        }
+
+        // Keyboard navigation
+        document.addEventListener('keydown', (e) => {
+            // Only handle when replay screen is visible
+            if (document.getElementById('replay-screen').style.display === 'none') return;
+            if (!replayData || replayGameIndex < 0) return;
+
+            switch (e.key) {
+                case 'ArrowLeft':
+                    e.preventDefault();
+                    replayPrev();
+                    break;
+                case 'ArrowRight':
+                    e.preventDefault();
+                    replayNext();
+                    break;
+                case 'Home':
+                    e.preventDefault();
+                    replayFirst();
+                    break;
+                case 'End':
+                    e.preventDefault();
+                    replayLast();
+                    break;
+            }
+        });
     </script>
 </body>
 </html>

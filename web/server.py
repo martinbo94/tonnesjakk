@@ -3,6 +3,8 @@ Tonnesjakk Web Server
 FastAPI backend for spillet
 """
 
+import json
+
 from fastapi import FastAPI, HTTPException
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
@@ -280,6 +282,59 @@ def ai_move(game_id: str):
         result["valid_moves"] = get_valid_moves(board)
 
     return result
+
+
+# ---------------------------------------------------------------------------
+# Game record replay endpoints
+# ---------------------------------------------------------------------------
+
+GAME_RECORDS_DIR = Path(__file__).resolve().parent.parent / "scripts" / "game_records"
+
+
+@app.get("/api/game-records")
+def list_game_records():
+    """List available game record files."""
+    if not GAME_RECORDS_DIR.exists():
+        return {"records": []}
+
+    records = []
+    for f in sorted(GAME_RECORDS_DIR.glob("*.json"), reverse=True):
+        # Read just the metadata to build the listing
+        try:
+            with open(f, "r") as fh:
+                data = json.load(fh)
+            meta = data.get("metadata", {})
+            records.append({
+                "filename": f.name,
+                "model_a": meta.get("model_a", "?"),
+                "model_b": meta.get("model_b", "?"),
+                "date": meta.get("date", "?"),
+                "total_games": meta.get("total_games", 0),
+                "wins": meta.get("wins", 0),
+                "losses": meta.get("losses", 0),
+                "draws": meta.get("draws", 0),
+            })
+        except (json.JSONDecodeError, OSError):
+            continue
+
+    return {"records": records}
+
+
+@app.get("/api/game-records/{filename}")
+def get_game_record(filename: str):
+    """Load a specific game record file."""
+    # Sanitise: only allow simple filenames (no path traversal)
+    if "/" in filename or "\\" in filename or ".." in filename:
+        raise HTTPException(status_code=400, detail="Invalid filename")
+
+    filepath = GAME_RECORDS_DIR / filename
+    if not filepath.exists():
+        raise HTTPException(status_code=404, detail="Record not found")
+
+    with open(filepath, "r") as f:
+        data = json.load(f)
+
+    return data
 
 
 # Serve static files

@@ -150,6 +150,17 @@ def is_white_turn(board: Board) -> bool:
     return "White" in repr(board.current_player)
 
 
+def move_to_record(move) -> dict:
+    """Convert a Move object to a JSON-serialisable dict."""
+    return {
+        "place_pail": [move.place_pail.row, move.place_pail.col] if move.place_pail else None,
+        "is_barrel_placement": move.is_barrel_placement,
+        "barrel_from": [move.barrel_from.row, move.barrel_from.col] if move.barrel_from else None,
+        "barrel_to": [move.barrel_to.row, move.barrel_to.col],
+        "barrel_path": [[p.row, p.col] for p in move.barrel_path] if move.barrel_path else [],
+    }
+
+
 # ---------------------------------------------------------------------------
 # Core match runner
 # ---------------------------------------------------------------------------
@@ -162,6 +173,7 @@ def run_match(
     max_moves: int = 80,
     game_timeout: float = 120.0,
     verbose: bool = True,
+    record_moves: bool = False,
 ) -> MatchupResult:
     """
     Play a match between two engines with full per-move stat tracking.
@@ -174,6 +186,7 @@ def run_match(
         max_moves: Maximum moves per game before declaring a draw.
         game_timeout: Maximum wall-clock seconds per game.
         verbose: Print per-game progress.
+        record_moves: If True, record full move history for replay.
 
     Returns:
         MatchupResult with per-game data and aggregates.
@@ -190,6 +203,9 @@ def run_match(
     engine_model = make_engine(model_path)
     engine_opponent = make_engine(opponent_path)
 
+    # Move recording (full game histories for replay)
+    all_game_records = [] if record_moves else None
+
     match_start = time.time()
 
     for game_idx in range(num_games):
@@ -200,13 +216,17 @@ def run_match(
         engine_model.full_reset()
         engine_opponent.full_reset()
 
-        # Random opening (2–4 random moves)
-        opening_moves = random.randint(2, 4)
+        # Random opening (2 or 4 random moves — must be even for fairness)
+        opening_moves = random.choice([2, 4])
         for _ in range(opening_moves):
             moves = board.generate_moves()
             if not moves or board.check_winner() is not None:
                 break
             board.make_move(random.choice(moves))
+
+        # Record initial board state (after opening)
+        move_records = []
+        initial_board = board.to_array() if record_moves else None
 
         # Play game, collecting per-move stats
         game_result = GameResult(winner="draw", moves=0)
@@ -235,8 +255,28 @@ def run_match(
             else:
                 game_result.opponent_move_stats.append(stats)
 
+            # Record move details before making it
+            if record_moves:
+                who = model_name if is_model_turn else opponent_name
+                move_rec = {
+                    "move_num": move_count + 1,
+                    "player": "white" if white_turn else "black",
+                    "who": who,
+                    "move": move_to_record(sr.best_move),
+                    "score": sr.score,
+                    "depth": sr.depth,
+                    "nodes": sr.nodes_searched,
+                }
+
             board.make_move(sr.best_move)
             move_count += 1
+
+            # Record board state after the move
+            if record_moves:
+                move_rec["board_after"] = board.to_array()
+                move_rec["white_scored"] = board.white_scored
+                move_rec["black_scored"] = board.black_scored
+                move_records.append(move_rec)
 
         game_result.moves = move_count
         game_result.wall_time = time.time() - game_start
@@ -257,6 +297,22 @@ def run_match(
 
         result.games.append(game_result)
 
+        # Store full game record for replay
+        if record_moves:
+            # Map result to W/B/D notation for the replay viewer
+            result_code = {"model": "W" if model_is_white else "B",
+                           "opponent": "B" if model_is_white else "W",
+                           "draw": "D"}[game_result.winner]
+            all_game_records.append({
+                "game_num": game_idx + 1,
+                "model_is_white": model_is_white,
+                "result": result_code,
+                "result_label": game_result.winner,
+                "total_moves": move_count,
+                "initial_board": initial_board,
+                "moves": move_records,
+            })
+
         if verbose:
             tag = {"model": "W", "opponent": "L", "draw": "D"}[game_result.winner]
             md = game_result.model_avg_depth
@@ -270,7 +326,7 @@ def run_match(
             )
 
     result.wall_time = time.time() - match_start
-    return result
+    return result, all_game_records
 
 
 # ---------------------------------------------------------------------------
@@ -409,6 +465,43 @@ def save_history(matchup: MatchupResult, path: Path = HISTORY_PATH) -> None:
     print(f"  Saved to {path}")
 
 
+GAME_RECORDS_DIR = Path(__file__).resolve().parent / "game_records"
+
+
+def save_game_records(
+    matchup: MatchupResult,
+    game_records: List[Dict],
+    time_ms: int,
+) -> Path:
+    """Save full game records to a JSON file for replay inspection."""
+    GAME_RECORDS_DIR.mkdir(exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    model_short = Path(matchup.model_name).stem if matchup.model_name != "heuristic" else "heuristic"
+    opp_short = Path(matchup.opponent_name).stem if matchup.opponent_name != "heuristic" else "heuristic"
+    filename = f"{timestamp}_{model_short}_vs_{opp_short}.json"
+    filepath = GAME_RECORDS_DIR / filename
+
+    data = {
+        "metadata": {
+            "model_a": matchup.model_name,
+            "model_b": matchup.opponent_name,
+            "time_ms": time_ms,
+            "date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "total_games": matchup.total,
+            "wins": matchup.wins,
+            "losses": matchup.losses,
+            "draws": matchup.draws,
+        },
+        "games": game_records,
+    }
+
+    with open(filepath, "w") as f:
+        json.dump(data, f)
+
+    print(f"  Game records saved to {filepath}")
+    return filepath
+
+
 def print_history(path: Path = HISTORY_PATH) -> None:
     """Print a tabular summary of all past matchups."""
     history = load_history(path)
@@ -460,6 +553,7 @@ Examples:
     parser.add_argument("--time-ms", type=int, default=50, help="Milliseconds per move (default: 50)")
     parser.add_argument("--max-moves", type=int, default=80, help="Max moves per game (default: 80)")
     parser.add_argument("--no-save", action="store_true", help="Don't save results to history")
+    parser.add_argument("--no-record", action="store_true", help="Don't record moves for replay")
     parser.add_argument("--history", action="store_true", help="Show past test results and exit")
     parser.add_argument("--quiet", action="store_true", help="Suppress per-game output")
     parser.add_argument("--seed", type=int, default=None, help="Random seed for reproducibility")
@@ -487,6 +581,7 @@ Examples:
         random.seed(args.seed)
 
     verbose = not args.quiet
+    record = not args.no_record
 
     # -- Matchup 1: model vs heuristic --
     print(f"\n{'='*64}")
@@ -494,17 +589,20 @@ Examples:
     print(f"  {args.games} games, {args.time_ms}ms/move")
     print(f"{'='*64}\n")
 
-    matchup_heur = run_match(
+    matchup_heur, game_records_heur = run_match(
         model_path=args.model,
         opponent_path=None,
         num_games=args.games,
         time_ms=args.time_ms,
         max_moves=args.max_moves,
         verbose=verbose,
+        record_moves=record,
     )
     print_results(matchup_heur)
     if not args.no_save:
         save_history(matchup_heur)
+    if record and game_records_heur:
+        save_game_records(matchup_heur, game_records_heur, args.time_ms)
 
     # -- Matchup 2: model vs reference (optional) --
     if args.reference:
@@ -513,17 +611,20 @@ Examples:
         print(f"  {args.games} games, {args.time_ms}ms/move")
         print(f"{'='*64}\n")
 
-        matchup_ref = run_match(
+        matchup_ref, game_records_ref = run_match(
             model_path=args.model,
             opponent_path=args.reference,
             num_games=args.games,
             time_ms=args.time_ms,
             max_moves=args.max_moves,
             verbose=verbose,
+            record_moves=record,
         )
         print_results(matchup_ref)
         if not args.no_save:
             save_history(matchup_ref)
+        if record and game_records_ref:
+            save_game_records(matchup_ref, game_records_ref, args.time_ms)
 
 
 if __name__ == "__main__":

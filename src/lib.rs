@@ -1,7 +1,9 @@
 use pyo3::prelude::*;
 use std::fmt;
 use std::time::{Duration, Instant};
-use wide::f32x8;
+use wide::{f32x8, i16x16, i32x8};
+
+pub mod mcts;
 
 // ============================================================================
 // KONSTANTER
@@ -25,7 +27,7 @@ pub const TT_SIZE: usize = 1 << 20; // ~1 million entries
 // NNUE feature sizes
 /// Base features: 6x6 board * 4 piece types = 144
 pub const BASE_FEATURES: usize = NUM_SQUARES * 4;
-/// Relational features (13 total):
+/// Relational features (20 total):
 ///   [0-3]  White barrel distances to goal (normalized 0-1, closest first)
 ///   [4-7]  Black barrel distances to goal (normalized 0-1, closest first)
 ///   [8]    White barrels scored (normalized 0-1)
@@ -33,9 +35,16 @@ pub const BASE_FEATURES: usize = NUM_SQUARES * 4;
 ///   [10]   White pail placed (0 or 1)
 ///   [11]   Black pail placed (0 or 1)
 ///   [12]   Current player (+1 white, -1 black)
-pub const RELATIONAL_FEATURES: usize = 13;
+///   [13]   White immediate threats (barrels 1 step from scoring, /4)
+///   [14]   Black immediate threats (barrels 1 step from scoring, /4)
+///   [15]   Score differential (white_scored - black_scored) / 4, range -1 to +1
+///   [16]   White barrels on board / 4
+///   [17]   Black barrels on board / 4
+///   [18]   White pail blocking count / 4
+///   [19]   Black pail blocking count / 4
+pub const RELATIONAL_FEATURES: usize = 20;
 /// Total input features to NNUE
-pub const INPUT_SIZE: usize = BASE_FEATURES + RELATIONAL_FEATURES; // 157
+pub const INPUT_SIZE: usize = BASE_FEATURES + RELATIONAL_FEATURES; // 164
 
 
 // ============================================================================
@@ -1128,6 +1137,19 @@ impl Move {
         };
         format!("Move({}{})", pail_str, barrel_str)
     }
+
+    /// Policy index for AlphaZero training: encodes from/to as index in [0, 1331].
+    fn policy_index(&self) -> u16 {
+        let to_idx = (self.barrel_to.row * 6 + self.barrel_to.col) as u16;
+        let from_idx = if self.is_barrel_placement {
+            36u16
+        } else if let Some(pos) = &self.barrel_from {
+            (pos.row * 6 + pos.col) as u16
+        } else {
+            36u16
+        };
+        from_idx * 36 + to_idx
+    }
 }
 
 /// Spillbrettet og tilstanden
@@ -1480,6 +1502,18 @@ impl Board {
     /// Vis brettet som ASCII
     fn display(&self) -> String {
         format!("{}", self)
+    }
+
+    /// Create a copy of the board (needed for MCTS tree search)
+    fn copy(&self) -> Board {
+        self.clone()
+    }
+
+    /// Convert board to 6x6x6 float planes for neural network input.
+    /// Planes: [white_barrels, black_barrels, white_pail, black_pail, current_player, ones]
+    fn to_planes(&self) -> Vec<f32> {
+        let bb = BitBoard::from_board(self);
+        mcts::bb_to_planes(&bb)
     }
 }
 
@@ -1896,6 +1930,26 @@ impl Engine {
         self.inner.weight_blocking = value;
     }
 
+    #[getter]
+    fn weight_scored(&self) -> i32 {
+        self.inner.weight_scored
+    }
+
+    #[setter]
+    fn set_weight_scored(&mut self, value: i32) {
+        self.inner.weight_scored = value;
+    }
+
+    #[getter]
+    fn weight_threat(&self) -> i32 {
+        self.inner.weight_threat
+    }
+
+    #[setter]
+    fn set_weight_threat(&mut self, value: i32) {
+        self.inner.weight_threat = value;
+    }
+
     /// Load NNUE weights from JSON file
     /// After loading, the engine will use NNUE for evaluation instead of heuristics
     fn load_nnue(&mut self, path: &str) -> PyResult<()> {
@@ -1906,7 +1960,7 @@ impl Engine {
 
     /// Check if NNUE is loaded
     fn has_nnue(&self) -> bool {
-        self.inner.nnue.is_some()
+        self.inner.nnue.is_some() || self.inner.quantized_nnue.is_some() || self.inner.halfpail_nnue.is_some()
     }
 
     /// Clear NNUE (revert to heuristic evaluation)
@@ -1936,6 +1990,14 @@ impl Engine {
             depth: depth_reached,
         }
     }
+
+    /// Expose heuristic evaluation to Python (for MCTS leaf evaluation).
+    /// Always uses the hand-crafted heuristic, not NNUE.
+    /// Returns score from White's perspective.
+    fn evaluate_position(&self, board: &Board) -> i32 {
+        let bb = BitBoard::from_board(board);
+        self.inner.evaluate_heuristic(&bb)
+    }
 }
 
 
@@ -1961,6 +2023,54 @@ struct NNUEModel {
     hidden1: usize,
     hidden2: usize,
     weights: NNUEWeights,
+}
+
+/// JSON format for quantized NNUE weights (int16/int32)
+#[derive(Deserialize)]
+struct QuantizedNNUEWeights {
+    fc1_weight: Vec<Vec<i16>>,   // [hidden1][input_size]
+    fc1_bias: Vec<i16>,          // [hidden1]
+    fc2_weight: Vec<Vec<i16>>,   // [hidden2][hidden1]
+    fc2_bias: Vec<i32>,          // [hidden2]
+    fc3_weight: Vec<i16>,        // [hidden2]
+    fc3_bias: i32,               // scalar
+}
+
+#[derive(Deserialize)]
+struct QuantizedNNUEJson {
+    hidden1: usize,
+    hidden2: usize,
+    input_size: usize,
+    fc1_weight_scale: i32,
+    fc2_weight_scale: i32,
+    #[allow(dead_code)]
+    fc3_weight_scale: i32,
+    crelu_shift: u32,
+    output_scale: f64,
+    weights: QuantizedNNUEWeights,
+}
+
+/// JSON format for HalfPail NNUE weights
+#[derive(Deserialize)]
+struct HalfPailWeights {
+    fc1_weight: Vec<Vec<f32>>,  // [num_perspective_features][hidden1] - shared embedding
+    fc1_bias: Vec<f32>,          // [hidden1]
+    fc2_weight: Vec<Vec<f32>>,  // [hidden2][2*hidden1 + dense_size]
+    fc2_bias: Vec<f32>,          // [hidden2]
+    fc3_weight: Vec<Vec<f32>>,  // [1][hidden2]
+    fc3_bias: Vec<f32>,          // [1]
+}
+
+#[derive(Deserialize)]
+struct HalfPailJson {
+    #[allow(dead_code)]
+    halfpail: bool,
+    hidden1: usize,
+    hidden2: usize,
+    num_perspective_features: usize,
+    #[allow(dead_code)]
+    dense_size: usize,
+    weights: HalfPailWeights,
 }
 
 /// Effektiv NNUE-evaluator i Rust
@@ -2087,21 +2197,25 @@ pub struct FeatureDelta {
     pub delta: i8,   // +1 (brikke lagt til) eller -1 (fjernet)
 }
 
+/// Maximum supported hidden layer sizes (for fixed-size accumulator arrays)
+const MAX_HIDDEN1: usize = 512;
+const MAX_HIDDEN2: usize = 128;
+
 /// Accumulator for inkrementell NNUE
 /// Cacher layer 1 output for å unngå full reberegning
 #[derive(Clone)]
 pub struct Accumulator {
     /// Pre-activation verdier (før ReLU)
-    pub pre_activation: [f32; 64],
+    pub pre_activation: [f32; MAX_HIDDEN1],
     /// Post-activation verdier (etter ReLU) - brukes av layer 2
-    pub post_activation: [f32; 64],
+    pub post_activation: [f32; MAX_HIDDEN1],
 }
 
 impl Default for Accumulator {
     fn default() -> Self {
         Accumulator {
-            pre_activation: [0.0; 64],
-            post_activation: [0.0; 64],
+            pre_activation: [0.0; MAX_HIDDEN1],
+            post_activation: [0.0; MAX_HIDDEN1],
         }
     }
 }
@@ -2212,6 +2326,81 @@ impl AccumulatorStack {
     }
 }
 
+// ============================================================================
+// QUANTIZED NNUE - Int16 accumulator for ~2-4x faster evaluation
+// ============================================================================
+
+/// Quantized accumulator: i16 pre-activation values at scale fc1_weight_scale
+#[derive(Clone)]
+pub struct QAccumulator {
+    pub values: [i16; MAX_HIDDEN1],
+}
+
+impl Default for QAccumulator {
+    fn default() -> Self {
+        QAccumulator { values: [0i16; MAX_HIDDEN1] }
+    }
+}
+
+impl QAccumulator {
+    #[inline]
+    pub fn copy_from(&mut self, other: &QAccumulator) {
+        self.values = other.values;
+    }
+}
+
+/// Stack of quantized accumulators for the search tree
+pub struct QAccumulatorStack {
+    accumulators: [QAccumulator; MAX_DEPTH],
+    depth: usize,
+}
+
+impl Default for QAccumulatorStack {
+    fn default() -> Self {
+        QAccumulatorStack {
+            accumulators: std::array::from_fn(|_| QAccumulator::default()),
+            depth: 0,
+        }
+    }
+}
+
+impl QAccumulatorStack {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    #[inline]
+    pub fn current(&self) -> &QAccumulator {
+        &self.accumulators[self.depth]
+    }
+
+    #[inline]
+    pub fn current_mut(&mut self) -> &mut QAccumulator {
+        &mut self.accumulators[self.depth]
+    }
+
+    #[inline]
+    pub fn push(&mut self) {
+        if self.depth + 1 < MAX_DEPTH {
+            let (left, right) = self.accumulators.split_at_mut(self.depth + 1);
+            right[0].copy_from(&left[self.depth]);
+            self.depth += 1;
+        }
+    }
+
+    #[inline]
+    pub fn pop(&mut self) {
+        if self.depth > 0 {
+            self.depth -= 1;
+        }
+    }
+
+    #[inline]
+    pub fn reset(&mut self) {
+        self.depth = 0;
+    }
+}
+
 /// Inkrementell NNUE evaluator
 /// Cacher layer 1 og oppdaterer kun endrede features
 ///
@@ -2230,6 +2419,61 @@ pub struct IncrementalNNUE {
     hidden1: usize,
     hidden2: usize,
     input_size: usize,  // 144 (legacy) or 157 (with relational features)
+}
+
+/// Compute NNUE feature deltas for a move (free function, used by both f32 and quantized paths)
+fn compute_nnue_move_deltas(bb: &BitBoard, mv: &BitMove) -> Vec<FeatureDelta> {
+    let mut deltas = Vec::with_capacity(4);
+    let player = bb.current_player;
+
+    // 1. Pail plassering
+    if let Some(pail_sq) = mv.pail_pos() {
+        let piece_type = match player {
+            Player::White => 2,
+            Player::Black => 3,
+        };
+        deltas.push(FeatureDelta {
+            index: feature_index(pail_sq as usize, piece_type) as u8,
+            delta: 1,
+        });
+    }
+
+    // 2. Tønne-bevegelse
+    let barrel_piece = match player {
+        Player::White => 0,
+        Player::Black => 1,
+    };
+
+    if mv.is_placement() {
+        let to_sq = mv.barrel_to() as usize;
+        let goal_row = bb.goal_row(player);
+        let (to_row, _) = sq_to_coords(to_sq);
+        if to_row != goal_row {
+            deltas.push(FeatureDelta {
+                index: feature_index(to_sq, barrel_piece) as u8,
+                delta: 1,
+            });
+        }
+    } else {
+        let from_sq = mv.barrel_from().unwrap() as usize;
+        let to_sq = mv.barrel_to() as usize;
+        let goal_row = bb.goal_row(player);
+        let (to_row, _) = sq_to_coords(to_sq);
+
+        deltas.push(FeatureDelta {
+            index: feature_index(from_sq, barrel_piece) as u8,
+            delta: -1,
+        });
+
+        if to_row != goal_row {
+            deltas.push(FeatureDelta {
+                index: feature_index(to_sq, barrel_piece) as u8,
+                delta: 1,
+            });
+        }
+    }
+
+    deltas
 }
 
 impl IncrementalNNUE {
@@ -2282,18 +2526,22 @@ impl IncrementalNNUE {
     ///   [11]   Black pail placed (0 or 1)
     ///   [12]   Current player (+1 white, -1 black)
     #[inline]
-    fn compute_relational_features(bb: &BitBoard) -> [f32; 13] {
-        let mut features = [0.0f32; 13];
+    pub fn compute_relational_features(bb: &BitBoard) -> [f32; 20] {
+        let mut features = [0.0f32; 20];
 
         // White barrel distances to goal (row 0 is goal, distance = row)
         // Sort ascending by distance, then feature = 1.0 - normalized_dist
         let mut white_dists = [0.0f32; 4];
+        let mut white_rows = [0usize; 4];
         let mut n_white = 0usize;
+        let mut white_threats = 0u32;
         let mut barrels = bb.white_barrels;
         while barrels != 0 && n_white < 4 {
             let sq = barrels.trailing_zeros() as usize;
             let row = sq / 6;
             white_dists[n_white] = row as f32 / 5.0;
+            white_rows[n_white] = row;
+            if row == 1 { white_threats += 1; } // 1 step from row 0 goal
             n_white += 1;
             barrels &= barrels - 1;
         }
@@ -2304,18 +2552,39 @@ impl IncrementalNNUE {
 
         // Black barrel distances to goal (row 5 is goal, distance = 5 - row)
         let mut black_dists = [0.0f32; 4];
+        let mut black_rows = [0usize; 4];
+        let mut black_cols = [0usize; 4];
         let mut n_black = 0usize;
+        let mut black_threats = 0u32;
         barrels = bb.black_barrels;
         while barrels != 0 && n_black < 4 {
             let sq = barrels.trailing_zeros() as usize;
             let row = sq / 6;
+            let col = sq % 6;
             black_dists[n_black] = (5 - row) as f32 / 5.0;
+            black_rows[n_black] = row;
+            black_cols[n_black] = col;
+            if row == 4 { black_threats += 1; } // 1 step from row 5 goal
             n_black += 1;
             barrels &= barrels - 1;
         }
         black_dists[..n_black].sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
         for i in 0..n_black {
             features[4 + i] = 1.0 - black_dists[i];
+        }
+
+        // We also need white barrel columns for blocking computation
+        let mut white_cols = [0usize; 4];
+        {
+            let mut i = 0usize;
+            let mut b = bb.white_barrels;
+            while b != 0 && i < 4 {
+                let sq = b.trailing_zeros() as usize;
+                white_rows[i] = sq / 6;
+                white_cols[i] = sq % 6;
+                i += 1;
+                b &= b - 1;
+            }
         }
 
         // Scored barrels (normalized by 4)
@@ -2331,6 +2600,44 @@ impl IncrementalNNUE {
             Player::White => 1.0,
             Player::Black => -1.0,
         };
+
+        // Immediate threats (barrels 1 step from scoring)
+        features[13] = white_threats as f32 / 4.0;
+        features[14] = black_threats as f32 / 4.0;
+
+        // Score differential
+        features[15] = (bb.white_scored as f32 - bb.black_scored as f32) / 4.0;
+
+        // Barrels on board
+        features[16] = n_white as f32 / 4.0;
+        features[17] = n_black as f32 / 4.0;
+
+        // Pail blocking counts
+        let mut white_pail_blocks = 0u32;
+        if bb.white_pail != 0 {
+            let pail_sq = bb.white_pail.trailing_zeros() as usize;
+            let pail_row = pail_sq / 6;
+            let pail_col = pail_sq % 6;
+            for i in 0..n_black {
+                if pail_col == black_cols[i] && pail_row > black_rows[i] {
+                    white_pail_blocks += 1;
+                }
+            }
+        }
+        features[18] = white_pail_blocks as f32 / 4.0;
+
+        let mut black_pail_blocks = 0u32;
+        if bb.black_pail != 0 {
+            let pail_sq = bb.black_pail.trailing_zeros() as usize;
+            let pail_row = pail_sq / 6;
+            let pail_col = pail_sq % 6;
+            for i in 0..n_white {
+                if pail_col == white_cols[i] && pail_row < white_rows[i] {
+                    black_pail_blocks += 1;
+                }
+            }
+        }
+        features[19] = black_pail_blocks as f32 / 4.0;
 
         features
     }
@@ -2550,72 +2857,16 @@ impl IncrementalNNUE {
         acc.apply_relu();
     }
 
-    /// Beregn feature deltas for et trekk
+    /// Beregn feature deltas for et trekk (delegates to free function)
     pub fn compute_move_deltas(&self, bb: &BitBoard, mv: &BitMove) -> Vec<FeatureDelta> {
-        let mut deltas = Vec::with_capacity(4);
-        let player = bb.current_player;
-
-        // 1. Pail plassering
-        if let Some(pail_sq) = mv.pail_pos() {
-            let piece_type = match player {
-                Player::White => 2,
-                Player::Black => 3,
-            };
-            deltas.push(FeatureDelta {
-                index: feature_index(pail_sq as usize, piece_type) as u8,
-                delta: 1,
-            });
-        }
-
-        // 2. Tønne-bevegelse
-        let barrel_piece = match player {
-            Player::White => 0,
-            Player::Black => 1,
-        };
-
-        if mv.is_placement() {
-            // Ny tønne plasseres
-            let to_sq = mv.barrel_to() as usize;
-            let goal_row = bb.goal_row(player);
-            let (to_row, _) = sq_to_coords(to_sq);
-
-            // Hvis den ikke scorer, legg til feature
-            if to_row != goal_row {
-                deltas.push(FeatureDelta {
-                    index: feature_index(to_sq, barrel_piece) as u8,
-                    delta: 1,
-                });
-            }
-        } else {
-            // Eksisterende tønne flyttes
-            let from_sq = mv.barrel_from().unwrap() as usize;
-            let to_sq = mv.barrel_to() as usize;
-            let goal_row = bb.goal_row(player);
-            let (to_row, _) = sq_to_coords(to_sq);
-
-            // Fjern fra gammel posisjon
-            deltas.push(FeatureDelta {
-                index: feature_index(from_sq, barrel_piece) as u8,
-                delta: -1,
-            });
-
-            // Legg til på ny posisjon (hvis ikke scoring)
-            if to_row != goal_row {
-                deltas.push(FeatureDelta {
-                    index: feature_index(to_sq, barrel_piece) as u8,
-                    delta: 1,
-                });
-            }
-        }
-
-        deltas
+        compute_nnue_move_deltas(bb, mv)
     }
 
     /// Evaluer fra ferdig accumulator (layer 2 og 3) med SIMD
     pub fn evaluate_from_accumulator(&self, acc: &Accumulator) -> f32 {
         // Layer 2: FC + ReLU (64 inputs -> 32 outputs)
         // Use SIMD to compute dot products 8 elements at a time
-        let mut hidden2 = [0.0f32; 32];
+        let mut hidden2 = [0.0f32; MAX_HIDDEN2];
 
         for i in 0..self.hidden2 {
             let weight_offset = i * self.hidden1;
@@ -2774,6 +3025,869 @@ impl IncrementalNNUE {
 }
 
 // ============================================================================
+// QUANTIZED NNUE EVALUATOR - Int16 weights with i16x16 SIMD
+// ============================================================================
+
+/// Quantized NNUE with int16 weights and int16 accumulator.
+/// Uses i16x16 SIMD (16 lanes) for accumulator updates and i16x16.dot() for FC2.
+/// FC3 is computed in f32 for simplicity (only 32 multiply-adds).
+pub struct QuantizedNNUE {
+    /// FC1 transposed weights: [input_size * hidden1], i16 at scale fc1_weight_scale
+    fc1_weight_t: Vec<i16>,
+    /// FC1 bias: [hidden1], i16 at scale fc1_weight_scale
+    fc1_bias: Vec<i16>,
+    /// FC2 weights: [hidden2 * hidden1], i16 at scale fc2_weight_scale
+    fc2_weight: Vec<i16>,
+    /// FC2 bias: [hidden2], i32 at scale (fc1_scale >> crelu_shift) * fc2_scale
+    fc2_bias: Vec<i32>,
+    /// FC3 weights: [hidden2], converted to f32 during load (pre-scaled by output_scale)
+    fc3_weight: Vec<f32>,
+    /// FC3 bias: f32 (pre-scaled by output_scale)
+    fc3_bias: f32,
+    /// Right-shift for ClippedReLU: clamp(acc >> crelu_shift, 0, 127)
+    crelu_shift: u32,
+    /// 1.0 / ((fc1_scale >> crelu_shift) * fc2_scale) — converts FC2 i32 output to f32
+    #[allow(dead_code)]
+    fc2_output_scale_inv: f32,
+    hidden1: usize,
+    hidden2: usize,
+    input_size: usize,
+}
+
+impl QuantizedNNUE {
+    /// Load quantized NNUE from parsed JSON
+    pub(crate) fn from_json(json: QuantizedNNUEJson) -> Result<Self, Box<dyn std::error::Error>> {
+        let hidden1 = json.hidden1;
+        let hidden2 = json.hidden2;
+        let input_size = json.input_size;
+
+        // Flatten and transpose FC1 weights: [hidden1][input_size] -> [input_size * hidden1]
+        let fc1_weight: Vec<i16> = json.weights.fc1_weight.into_iter().flatten().collect();
+        let mut fc1_weight_t = vec![0i16; input_size * hidden1];
+        for neuron in 0..hidden1 {
+            for feature in 0..input_size {
+                fc1_weight_t[feature * hidden1 + neuron] = fc1_weight[neuron * input_size + feature];
+            }
+        }
+
+        // Flatten FC2 weights: [hidden2][hidden1] -> [hidden2 * hidden1]
+        let fc2_weight: Vec<i16> = json.weights.fc2_weight.into_iter().flatten().collect();
+
+        // Compute the scale of FC2's dot product output
+        let fc2_input_scale = json.fc1_weight_scale >> json.crelu_shift;
+        let fc2_output_scale = fc2_input_scale * json.fc2_weight_scale;
+        let fc2_output_scale_inv = 1.0 / fc2_output_scale as f32;
+
+        // Convert FC3 weights from i16 to f32, pre-scaled by output_scale
+        // output_scale = 1.0 / (fc2_output_scale * fc3_weight_scale)
+        let output_scale = json.output_scale as f32;
+        let fc3_weight: Vec<f32> = json.weights.fc3_weight.iter()
+            .map(|&w| w as f32 * output_scale)
+            .collect();
+        let fc3_bias = json.weights.fc3_bias as f32 * output_scale;
+
+        Ok(Self {
+            fc1_weight_t,
+            fc1_bias: json.weights.fc1_bias,
+            fc2_weight,
+            fc2_bias: json.weights.fc2_bias,
+            fc3_weight,
+            fc3_bias,
+            crelu_shift: json.crelu_shift,
+            fc2_output_scale_inv,
+            hidden1,
+            hidden2,
+            input_size,
+        })
+    }
+
+    /// Initialize quantized accumulator with bias + all active base features
+    pub fn init_accumulator(&self, bb: &BitBoard, acc: &mut QAccumulator) {
+        for i in 0..self.hidden1 {
+            acc.values[i] = self.fc1_bias[i];
+        }
+        self.add_features_from_bitboard_q(bb, acc);
+    }
+
+    /// Add all base features from a bitboard to quantized accumulator
+    fn add_features_from_bitboard_q(&self, bb: &BitBoard, acc: &mut QAccumulator) {
+        let mut barrels = bb.white_barrels;
+        while barrels != 0 {
+            let sq = barrels.trailing_zeros() as usize;
+            self.add_feature_q(acc, feature_index(sq, 0));
+            barrels &= barrels - 1;
+        }
+
+        barrels = bb.black_barrels;
+        while barrels != 0 {
+            let sq = barrels.trailing_zeros() as usize;
+            self.add_feature_q(acc, feature_index(sq, 1));
+            barrels &= barrels - 1;
+        }
+
+        if bb.white_pail != 0 {
+            let sq = bb.white_pail.trailing_zeros() as usize;
+            self.add_feature_q(acc, feature_index(sq, 2));
+        }
+
+        if bb.black_pail != 0 {
+            let sq = bb.black_pail.trailing_zeros() as usize;
+            self.add_feature_q(acc, feature_index(sq, 3));
+        }
+    }
+
+    /// Add one binary feature to quantized accumulator (i16x16 SIMD, 16 lanes)
+    #[inline]
+    fn add_feature_q(&self, acc: &mut QAccumulator, feat: usize) {
+        let hidden1 = self.hidden1;
+        let base_idx = feat * hidden1;
+        let mut j = 0;
+
+        while j + 16 <= hidden1 {
+            let mut acc_arr = [0i16; 16];
+            acc_arr.copy_from_slice(&acc.values[j..j + 16]);
+            let acc_vec = i16x16::new(acc_arr);
+
+            let mut wt_arr = [0i16; 16];
+            wt_arr.copy_from_slice(&self.fc1_weight_t[base_idx + j..base_idx + j + 16]);
+            let wt_vec = i16x16::new(wt_arr);
+
+            let result = acc_vec + wt_vec;
+            acc.values[j..j + 16].copy_from_slice(&result.to_array());
+            j += 16;
+        }
+    }
+
+    /// Remove one binary feature from quantized accumulator (i16x16 SIMD)
+    #[inline]
+    fn remove_feature_q(&self, acc: &mut QAccumulator, feat: usize) {
+        let hidden1 = self.hidden1;
+        let base_idx = feat * hidden1;
+        let mut j = 0;
+
+        while j + 16 <= hidden1 {
+            let mut acc_arr = [0i16; 16];
+            acc_arr.copy_from_slice(&acc.values[j..j + 16]);
+            let acc_vec = i16x16::new(acc_arr);
+
+            let mut wt_arr = [0i16; 16];
+            wt_arr.copy_from_slice(&self.fc1_weight_t[base_idx + j..base_idx + j + 16]);
+            let wt_vec = i16x16::new(wt_arr);
+
+            let result = acc_vec - wt_vec;
+            acc.values[j..j + 16].copy_from_slice(&result.to_array());
+            j += 16;
+        }
+    }
+
+    /// Apply feature deltas to quantized accumulator (no activation applied here)
+    #[inline]
+    pub fn apply_deltas_q(&self, acc: &mut QAccumulator, deltas: &[FeatureDelta]) {
+        for d in deltas {
+            let feat = d.index as usize;
+            if d.delta > 0 {
+                self.add_feature_q(acc, feat);
+            } else {
+                self.remove_feature_q(acc, feat);
+            }
+        }
+    }
+
+    /// Add relational features to a working copy of accumulator values.
+    /// Uses f32x8 SIMD since relational features are continuous [-1, 1] values
+    /// that need float multiplication with i16 weights.
+    #[inline]
+    fn add_relational_features_q(&self, bb: &BitBoard, acc: &mut [i16; MAX_HIDDEN1]) {
+        if self.input_size <= BASE_FEATURES {
+            return;
+        }
+
+        let hidden1 = self.hidden1;
+        let rel_feats = IncrementalNNUE::compute_relational_features(bb);
+
+        for (feat_idx, &feat_val) in rel_feats.iter().enumerate() {
+            if feat_val == 0.0 {
+                continue;
+            }
+            let weight_base = (BASE_FEATURES + feat_idx) * hidden1;
+
+            // Process 8 neurons at a time: load i16 weight → f32, multiply, round, add back
+            let feat_splat = f32x8::splat(feat_val);
+            let mut j = 0;
+            while j + 8 <= hidden1 {
+                let w = f32x8::new([
+                    self.fc1_weight_t[weight_base + j] as f32,
+                    self.fc1_weight_t[weight_base + j + 1] as f32,
+                    self.fc1_weight_t[weight_base + j + 2] as f32,
+                    self.fc1_weight_t[weight_base + j + 3] as f32,
+                    self.fc1_weight_t[weight_base + j + 4] as f32,
+                    self.fc1_weight_t[weight_base + j + 5] as f32,
+                    self.fc1_weight_t[weight_base + j + 6] as f32,
+                    self.fc1_weight_t[weight_base + j + 7] as f32,
+                ]);
+                let contrib = feat_splat * w;
+                let arr = contrib.to_array();
+                for k in 0..8 {
+                    acc[j + k] = acc[j + k].saturating_add(arr[k].round() as i16);
+                }
+                j += 8;
+            }
+        }
+    }
+
+    /// Full evaluation from quantized accumulator: ClippedReLU → FC2 (dot) → FC3 → tanh
+    /// Returns centipawn score.
+    pub fn evaluate_from_qacc(&self, bb: &BitBoard, base_acc: &QAccumulator) -> i32 {
+        // 1. Copy base accumulator and add relational features
+        let mut acc = base_acc.values;
+        self.add_relational_features_q(bb, &mut acc);
+
+        // 2. ClippedReLU: clamp(acc >> shift, 0, 127)
+        let mut clipped = [0i16; MAX_HIDDEN1];
+        {
+            let zero = i16x16::ZERO;
+            let max_val = i16x16::new([127i16; 16]);
+            let mut j = 0;
+            while j + 16 <= self.hidden1 {
+                let mut arr = [0i16; 16];
+                arr.copy_from_slice(&acc[j..j + 16]);
+                let v = i16x16::new(arr);
+                // Right-shift, then clamp to [0, 127]
+                let shifted = v >> self.crelu_shift;
+                let clamped = shifted.max(zero).min(max_val);
+                clipped[j..j + 16].copy_from_slice(&clamped.to_array());
+                j += 16;
+            }
+        }
+
+        // 3. FC2: dot product with i16x16.dot() → i32x8 (the main speedup)
+        // 64 inputs → 32 outputs, processing 16 at a time
+        let mut hidden2 = [0i32; MAX_HIDDEN2];
+        for neuron in 0..self.hidden2 {
+            let wt_base = neuron * self.hidden1;
+            let mut sum = i32x8::ZERO;
+
+            let mut j = 0;
+            while j + 16 <= self.hidden1 {
+                let mut in_arr = [0i16; 16];
+                in_arr.copy_from_slice(&clipped[j..j + 16]);
+                let input = i16x16::new(in_arr);
+
+                let mut wt_arr = [0i16; 16];
+                wt_arr.copy_from_slice(&self.fc2_weight[wt_base + j..wt_base + j + 16]);
+                let weight = i16x16::new(wt_arr);
+
+                // vpmaddwd: 16 multiplies → 8 pairwise sums as i32
+                sum = sum + input.dot(weight);
+                j += 16;
+            }
+
+            // Horizontal sum of i32x8 + bias
+            hidden2[neuron] = sum.reduce_add() + self.fc2_bias[neuron];
+        }
+
+        // 4. FC2 ReLU (in i32) + convert to f32 for FC3
+        // FC3 weights are pre-scaled by output_scale during loading
+        let mut output = self.fc3_bias;
+        for i in 0..self.hidden2 {
+            let h2_relu = hidden2[i].max(0) as f32;
+            output += h2_relu * self.fc3_weight[i];
+        }
+
+        // 5. tanh and scale to centipawns
+        (output.tanh() * 1000.0) as i32
+    }
+}
+
+// ============================================================================
+// HALFPAIL NNUE - Dual-perspective sparse feature evaluation
+// ============================================================================
+
+/// HalfPail feature constants
+#[allow(dead_code)]
+const HALFPAIL_BUCKETS: usize = 37;    // 36 pail squares + 1 for "no pail"
+const HALFPAIL_PIECE_TYPES: usize = 3; // 0=friendly barrel, 1=enemy barrel, 2=enemy pail
+const HALFPAIL_FEATURES_PER_BUCKET: usize = NUM_SQUARES * HALFPAIL_PIECE_TYPES; // 108
+#[allow(dead_code)]
+const HALFPAIL_FEATURES: usize = HALFPAIL_BUCKETS * HALFPAIL_FEATURES_PER_BUCKET; // 3996
+const HALFPAIL_DENSE: usize = 20;
+
+/// Compute HalfPail feature index
+#[inline(always)]
+const fn halfpail_feature_index(bucket: usize, sq: usize, piece_type: usize) -> u16 {
+    (bucket * HALFPAIL_FEATURES_PER_BUCKET + sq * HALFPAIL_PIECE_TYPES + piece_type) as u16
+}
+
+/// Represents a change in HalfPail features for one perspective
+#[derive(Clone, Copy, Debug)]
+pub struct HalfPailDelta {
+    pub index: u16,   // 0-3995: which perspective feature
+    pub delta: i8,    // +1 (added) or -1 (removed)
+}
+
+/// Dual-perspective accumulator for HalfPail NNUE
+#[derive(Clone)]
+pub struct DualAccumulator {
+    pub white_pre: [f32; MAX_HIDDEN1],  // White perspective pre-activation
+    pub black_pre: [f32; MAX_HIDDEN1],  // Black perspective pre-activation
+}
+
+impl Default for DualAccumulator {
+    fn default() -> Self {
+        DualAccumulator {
+            white_pre: [0.0; MAX_HIDDEN1],
+            black_pre: [0.0; MAX_HIDDEN1],
+        }
+    }
+}
+
+impl DualAccumulator {
+    #[inline]
+    pub fn copy_from(&mut self, other: &DualAccumulator) {
+        self.white_pre = other.white_pre;
+        self.black_pre = other.black_pre;
+    }
+}
+
+/// Stack of dual accumulators for the search tree
+pub struct DualAccumulatorStack {
+    accumulators: Vec<DualAccumulator>,
+    depth: usize,
+}
+
+impl Default for DualAccumulatorStack {
+    fn default() -> Self {
+        let mut accs = Vec::with_capacity(MAX_DEPTH);
+        for _ in 0..MAX_DEPTH {
+            accs.push(DualAccumulator::default());
+        }
+        DualAccumulatorStack {
+            accumulators: accs,
+            depth: 0,
+        }
+    }
+}
+
+impl DualAccumulatorStack {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    #[inline]
+    pub fn current(&self) -> &DualAccumulator {
+        &self.accumulators[self.depth]
+    }
+
+    #[inline]
+    pub fn current_mut(&mut self) -> &mut DualAccumulator {
+        &mut self.accumulators[self.depth]
+    }
+
+    #[inline]
+    pub fn push(&mut self) {
+        if self.depth + 1 < MAX_DEPTH {
+            let (left, right) = self.accumulators.split_at_mut(self.depth + 1);
+            right[0].copy_from(&left[self.depth]);
+            self.depth += 1;
+        }
+    }
+
+    #[inline]
+    pub fn pop(&mut self) {
+        if self.depth > 0 {
+            self.depth -= 1;
+        }
+    }
+
+    #[inline]
+    pub fn reset(&mut self) {
+        self.depth = 0;
+    }
+}
+
+/// HalfPail NNUE evaluator
+///
+/// Architecture:
+///   White sparse → EmbeddingBag(3996, H1) + bias → ReLU → acc_white
+///   Black sparse → EmbeddingBag(3996, H1) + bias → ReLU → acc_black
+///                       (shared weights)
+///   concat(acc_white, acc_black, dense_6) → FC2 → ReLU → FC3 → Tanh
+pub struct HalfPailNNUE {
+    /// FC1 transposed weights: [HALFPAIL_FEATURES * hidden1]
+    /// Transposed for cache-friendly feature updates: fc1_weight_t[feature * hidden1 + neuron]
+    fc1_weight_t: Vec<f32>,
+    /// FC1 bias: [hidden1]
+    fc1_bias: Vec<f32>,
+    /// FC2 weights: [hidden2 * (2*hidden1 + HALFPAIL_DENSE)]
+    fc2_weight: Vec<f32>,
+    /// FC2 bias: [hidden2]
+    fc2_bias: Vec<f32>,
+    /// FC3 weights: [hidden2]
+    fc3_weight: Vec<f32>,
+    /// FC3 bias: scalar
+    fc3_bias: f32,
+    hidden1: usize,
+    hidden2: usize,
+}
+
+impl HalfPailNNUE {
+    /// Load from parsed JSON
+    pub(crate) fn from_json(json: HalfPailJson) -> Result<Self, Box<dyn std::error::Error>> {
+        let hidden1 = json.hidden1;
+        let hidden2 = json.hidden2;
+        let num_features = json.num_perspective_features;
+
+        // fc1_weight comes as [num_features][hidden1], transpose to [num_features * hidden1]
+        // in column-major order: fc1_weight_t[feature * hidden1 + neuron]
+        let mut fc1_weight_t = vec![0.0f32; num_features * hidden1];
+        for (feat, row) in json.weights.fc1_weight.iter().enumerate() {
+            for (neuron, &w) in row.iter().enumerate() {
+                fc1_weight_t[feat * hidden1 + neuron] = w;
+            }
+        }
+
+        // FC2: flatten [hidden2][fc2_input_size]
+        let fc2_weight: Vec<f32> = json.weights.fc2_weight.into_iter().flatten().collect();
+        let fc3_weight: Vec<f32> = json.weights.fc3_weight.into_iter().flatten().collect();
+
+        Ok(Self {
+            fc1_weight_t,
+            fc1_bias: json.weights.fc1_bias,
+            fc2_weight,
+            fc2_bias: json.weights.fc2_bias,
+            fc3_weight,
+            fc3_bias: json.weights.fc3_bias[0],
+            hidden1,
+            hidden2,
+        })
+    }
+
+    /// Add one sparse feature to an accumulator (SIMD)
+    #[inline]
+    fn add_feature(&self, acc: &mut [f32; MAX_HIDDEN1], feat: usize) {
+        let hidden1 = self.hidden1;
+        let base_idx = feat * hidden1;
+        let mut i = 0;
+
+        while i + 8 <= hidden1 {
+            let acc_vec = f32x8::new([
+                acc[i], acc[i+1], acc[i+2], acc[i+3],
+                acc[i+4], acc[i+5], acc[i+6], acc[i+7],
+            ]);
+            let wt_vec = f32x8::new([
+                self.fc1_weight_t[base_idx+i], self.fc1_weight_t[base_idx+i+1],
+                self.fc1_weight_t[base_idx+i+2], self.fc1_weight_t[base_idx+i+3],
+                self.fc1_weight_t[base_idx+i+4], self.fc1_weight_t[base_idx+i+5],
+                self.fc1_weight_t[base_idx+i+6], self.fc1_weight_t[base_idx+i+7],
+            ]);
+            let result = acc_vec + wt_vec;
+            let arr = result.to_array();
+            acc[i] = arr[0]; acc[i+1] = arr[1]; acc[i+2] = arr[2]; acc[i+3] = arr[3];
+            acc[i+4] = arr[4]; acc[i+5] = arr[5]; acc[i+6] = arr[6]; acc[i+7] = arr[7];
+            i += 8;
+        }
+    }
+
+    /// Remove one sparse feature from an accumulator (SIMD)
+    #[inline]
+    fn remove_feature(&self, acc: &mut [f32; MAX_HIDDEN1], feat: usize) {
+        let hidden1 = self.hidden1;
+        let base_idx = feat * hidden1;
+        let mut i = 0;
+
+        while i + 8 <= hidden1 {
+            let acc_vec = f32x8::new([
+                acc[i], acc[i+1], acc[i+2], acc[i+3],
+                acc[i+4], acc[i+5], acc[i+6], acc[i+7],
+            ]);
+            let wt_vec = f32x8::new([
+                self.fc1_weight_t[base_idx+i], self.fc1_weight_t[base_idx+i+1],
+                self.fc1_weight_t[base_idx+i+2], self.fc1_weight_t[base_idx+i+3],
+                self.fc1_weight_t[base_idx+i+4], self.fc1_weight_t[base_idx+i+5],
+                self.fc1_weight_t[base_idx+i+6], self.fc1_weight_t[base_idx+i+7],
+            ]);
+            let result = acc_vec - wt_vec;
+            let arr = result.to_array();
+            acc[i] = arr[0]; acc[i+1] = arr[1]; acc[i+2] = arr[2]; acc[i+3] = arr[3];
+            acc[i+4] = arr[4]; acc[i+5] = arr[5]; acc[i+6] = arr[6]; acc[i+7] = arr[7];
+            i += 8;
+        }
+    }
+
+    /// Initialize both perspectives from scratch for a position
+    pub fn init_accumulators(&self, bb: &BitBoard, dual_acc: &mut DualAccumulator) {
+        // Reset to bias
+        for i in 0..self.hidden1 {
+            dual_acc.white_pre[i] = self.fc1_bias[i];
+            dual_acc.black_pre[i] = self.fc1_bias[i];
+        }
+
+        let w_bucket = if bb.white_pail != 0 {
+            bb.white_pail.trailing_zeros() as usize
+        } else {
+            36 // no pail placed
+        };
+        let b_bucket = if bb.black_pail != 0 {
+            bb.black_pail.trailing_zeros() as usize
+        } else {
+            36
+        };
+
+        // White barrels: friendly for white perspective, enemy for black
+        let mut barrels = bb.white_barrels;
+        while barrels != 0 {
+            let sq = barrels.trailing_zeros() as usize;
+            self.add_feature(&mut dual_acc.white_pre,
+                halfpail_feature_index(w_bucket, sq, 0) as usize);  // friendly
+            self.add_feature(&mut dual_acc.black_pre,
+                halfpail_feature_index(b_bucket, sq, 1) as usize);  // enemy
+            barrels &= barrels - 1;
+        }
+
+        // Black barrels: enemy for white perspective, friendly for black
+        barrels = bb.black_barrels;
+        while barrels != 0 {
+            let sq = barrels.trailing_zeros() as usize;
+            self.add_feature(&mut dual_acc.white_pre,
+                halfpail_feature_index(w_bucket, sq, 1) as usize);  // enemy
+            self.add_feature(&mut dual_acc.black_pre,
+                halfpail_feature_index(b_bucket, sq, 0) as usize);  // friendly
+            barrels &= barrels - 1;
+        }
+
+        // White pail: enemy pail for black perspective (not in white's own perspective)
+        if bb.white_pail != 0 {
+            let sq = bb.white_pail.trailing_zeros() as usize;
+            self.add_feature(&mut dual_acc.black_pre,
+                halfpail_feature_index(b_bucket, sq, 2) as usize);  // enemy pail
+        }
+
+        // Black pail: enemy pail for white perspective (not in black's own perspective)
+        if bb.black_pail != 0 {
+            let sq = bb.black_pail.trailing_zeros() as usize;
+            self.add_feature(&mut dual_acc.white_pre,
+                halfpail_feature_index(w_bucket, sq, 2) as usize);  // enemy pail
+        }
+    }
+
+    /// Compute feature deltas for a move, returns (white_deltas, black_deltas, white_recompute, black_recompute)
+    ///
+    /// When a player places their pail, their own perspective needs full recompute
+    /// (the bucket changes from 36 to the pail square).
+    pub fn compute_move_deltas(
+        &self,
+        bb: &BitBoard,
+        mv: &BitMove,
+    ) -> (Vec<HalfPailDelta>, Vec<HalfPailDelta>, bool, bool) {
+        let player = bb.current_player;
+        let mut white_deltas = Vec::with_capacity(8);
+        let mut black_deltas = Vec::with_capacity(8);
+        let mut white_recompute = false;
+        let mut black_recompute = false;
+
+        // Current buckets
+        let w_bucket = if bb.white_pail != 0 {
+            bb.white_pail.trailing_zeros() as usize
+        } else { 36 };
+        let b_bucket = if bb.black_pail != 0 {
+            bb.black_pail.trailing_zeros() as usize
+        } else { 36 };
+
+        // 1. Handle pail placement
+        if let Some(pail_sq) = mv.pail_pos() {
+            let pail_sq = pail_sq as usize;
+            match player {
+                Player::White => {
+                    // White placed their pail → white perspective bucket changes → full recompute
+                    white_recompute = true;
+                    // For black perspective: enemy pail appeared at pail_sq
+                    black_deltas.push(HalfPailDelta {
+                        index: halfpail_feature_index(b_bucket, pail_sq, 2),
+                        delta: 1,
+                    });
+                }
+                Player::Black => {
+                    // Black placed their pail → black perspective bucket changes → full recompute
+                    black_recompute = true;
+                    // For white perspective: enemy pail appeared at pail_sq
+                    white_deltas.push(HalfPailDelta {
+                        index: halfpail_feature_index(w_bucket, pail_sq, 2),
+                        delta: 1,
+                    });
+                }
+            }
+        }
+
+        // After pail placement, use updated buckets for barrel deltas
+        // But only if the perspective is NOT being recomputed (recomputed ones get fresh init)
+        let w_bucket_for_deltas = if white_recompute {
+            // Doesn't matter - will be recomputed anyway
+            // But we still need a valid bucket for black's perspective of white's barrels
+            w_bucket
+        } else {
+            w_bucket
+        };
+        let b_bucket_for_deltas = if black_recompute {
+            b_bucket
+        } else {
+            b_bucket
+        };
+
+        // 2. Handle barrel movement
+        if mv.is_placement() {
+            let to_sq = mv.barrel_to() as usize;
+            let goal_row = bb.goal_row(player);
+            let (to_row, _) = sq_to_coords(to_sq);
+
+            if to_row != goal_row {
+                // Barrel placed on board (not scored immediately)
+                match player {
+                    Player::White => {
+                        if !white_recompute {
+                            white_deltas.push(HalfPailDelta {
+                                index: halfpail_feature_index(w_bucket_for_deltas, to_sq, 0), // friendly
+                                delta: 1,
+                            });
+                        }
+                        if !black_recompute {
+                            black_deltas.push(HalfPailDelta {
+                                index: halfpail_feature_index(b_bucket_for_deltas, to_sq, 1), // enemy
+                                delta: 1,
+                            });
+                        }
+                    }
+                    Player::Black => {
+                        if !white_recompute {
+                            white_deltas.push(HalfPailDelta {
+                                index: halfpail_feature_index(w_bucket_for_deltas, to_sq, 1), // enemy
+                                delta: 1,
+                            });
+                        }
+                        if !black_recompute {
+                            black_deltas.push(HalfPailDelta {
+                                index: halfpail_feature_index(b_bucket_for_deltas, to_sq, 0), // friendly
+                                delta: 1,
+                            });
+                        }
+                    }
+                }
+            }
+        } else {
+            // Regular barrel move
+            let from_sq = mv.barrel_from().unwrap() as usize;
+            let to_sq = mv.barrel_to() as usize;
+            let goal_row = bb.goal_row(player);
+            let (to_row, _) = sq_to_coords(to_sq);
+
+            match player {
+                Player::White => {
+                    // Remove from old position
+                    if !white_recompute {
+                        white_deltas.push(HalfPailDelta {
+                            index: halfpail_feature_index(w_bucket_for_deltas, from_sq, 0),
+                            delta: -1,
+                        });
+                    }
+                    if !black_recompute {
+                        black_deltas.push(HalfPailDelta {
+                            index: halfpail_feature_index(b_bucket_for_deltas, from_sq, 1),
+                            delta: -1,
+                        });
+                    }
+                    // Add to new position (if not scored)
+                    if to_row != goal_row {
+                        if !white_recompute {
+                            white_deltas.push(HalfPailDelta {
+                                index: halfpail_feature_index(w_bucket_for_deltas, to_sq, 0),
+                                delta: 1,
+                            });
+                        }
+                        if !black_recompute {
+                            black_deltas.push(HalfPailDelta {
+                                index: halfpail_feature_index(b_bucket_for_deltas, to_sq, 1),
+                                delta: 1,
+                            });
+                        }
+                    }
+                }
+                Player::Black => {
+                    if !white_recompute {
+                        white_deltas.push(HalfPailDelta {
+                            index: halfpail_feature_index(w_bucket_for_deltas, from_sq, 1),
+                            delta: -1,
+                        });
+                    }
+                    if !black_recompute {
+                        black_deltas.push(HalfPailDelta {
+                            index: halfpail_feature_index(b_bucket_for_deltas, from_sq, 0),
+                            delta: -1,
+                        });
+                    }
+                    if to_row != goal_row {
+                        if !white_recompute {
+                            white_deltas.push(HalfPailDelta {
+                                index: halfpail_feature_index(w_bucket_for_deltas, to_sq, 1),
+                                delta: 1,
+                            });
+                        }
+                        if !black_recompute {
+                            black_deltas.push(HalfPailDelta {
+                                index: halfpail_feature_index(b_bucket_for_deltas, to_sq, 0),
+                                delta: 1,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        (white_deltas, black_deltas, white_recompute, black_recompute)
+    }
+
+    /// Apply deltas to one perspective accumulator
+    #[inline]
+    pub fn apply_deltas(&self, acc: &mut [f32; MAX_HIDDEN1], deltas: &[HalfPailDelta]) {
+        for d in deltas {
+            let feat = d.index as usize;
+            if d.delta > 0 {
+                self.add_feature(acc, feat);
+            } else {
+                self.remove_feature(acc, feat);
+            }
+        }
+    }
+
+    /// Compute 20 dense features from a BitBoard position.
+    /// Reuses the same relational features as the legacy NNUE, in the same order
+    /// as the training data (features 144-163 of the 164-feature encoding).
+    #[inline]
+    fn compute_dense_features(bb: &BitBoard) -> [f32; HALFPAIL_DENSE] {
+        IncrementalNNUE::compute_relational_features(bb)
+    }
+
+    /// Evaluate from dual accumulator: apply ReLU, concat, FC2, FC3, tanh
+    /// Returns centipawn score
+    pub fn evaluate_from_dual_acc(&self, bb: &BitBoard, dual_acc: &DualAccumulator) -> i32 {
+        let hidden1 = self.hidden1;
+        let fc2_input_size = 2 * hidden1 + HALFPAIL_DENSE;
+
+        // Apply ReLU to both perspectives
+        let mut white_post = [0.0f32; MAX_HIDDEN1];
+        let mut black_post = [0.0f32; MAX_HIDDEN1];
+        {
+            let zero = f32x8::ZERO;
+            let mut i = 0;
+            while i + 8 <= hidden1 {
+                let w_vec = f32x8::new([
+                    dual_acc.white_pre[i], dual_acc.white_pre[i+1],
+                    dual_acc.white_pre[i+2], dual_acc.white_pre[i+3],
+                    dual_acc.white_pre[i+4], dual_acc.white_pre[i+5],
+                    dual_acc.white_pre[i+6], dual_acc.white_pre[i+7],
+                ]);
+                let b_vec = f32x8::new([
+                    dual_acc.black_pre[i], dual_acc.black_pre[i+1],
+                    dual_acc.black_pre[i+2], dual_acc.black_pre[i+3],
+                    dual_acc.black_pre[i+4], dual_acc.black_pre[i+5],
+                    dual_acc.black_pre[i+6], dual_acc.black_pre[i+7],
+                ]);
+                let w_relu = w_vec.max(zero);
+                let b_relu = b_vec.max(zero);
+                let w_arr = w_relu.to_array();
+                let b_arr = b_relu.to_array();
+                for k in 0..8 {
+                    white_post[i+k] = w_arr[k];
+                    black_post[i+k] = b_arr[k];
+                }
+                i += 8;
+            }
+        }
+
+        // Compute dense features
+        let dense = Self::compute_dense_features(bb);
+
+        // FC2: dot product over concat(white_post, black_post, dense)
+        let mut hidden2 = [0.0f32; MAX_HIDDEN2];
+        for neuron in 0..self.hidden2 {
+            let wt_base = neuron * fc2_input_size;
+            let mut sum = self.fc2_bias[neuron];
+
+            // White perspective part (SIMD)
+            let mut sum_vec = f32x8::ZERO;
+            let mut j = 0;
+            while j + 8 <= hidden1 {
+                let input_vec = f32x8::new([
+                    white_post[j], white_post[j+1], white_post[j+2], white_post[j+3],
+                    white_post[j+4], white_post[j+5], white_post[j+6], white_post[j+7],
+                ]);
+                let wt_vec = f32x8::new([
+                    self.fc2_weight[wt_base+j], self.fc2_weight[wt_base+j+1],
+                    self.fc2_weight[wt_base+j+2], self.fc2_weight[wt_base+j+3],
+                    self.fc2_weight[wt_base+j+4], self.fc2_weight[wt_base+j+5],
+                    self.fc2_weight[wt_base+j+6], self.fc2_weight[wt_base+j+7],
+                ]);
+                sum_vec = sum_vec + input_vec * wt_vec;
+                j += 8;
+            }
+            let arr = sum_vec.to_array();
+            sum += arr[0]+arr[1]+arr[2]+arr[3]+arr[4]+arr[5]+arr[6]+arr[7];
+
+            // Black perspective part (SIMD)
+            let black_offset = hidden1;
+            sum_vec = f32x8::ZERO;
+            j = 0;
+            while j + 8 <= hidden1 {
+                let input_vec = f32x8::new([
+                    black_post[j], black_post[j+1], black_post[j+2], black_post[j+3],
+                    black_post[j+4], black_post[j+5], black_post[j+6], black_post[j+7],
+                ]);
+                let wt_vec = f32x8::new([
+                    self.fc2_weight[wt_base+black_offset+j], self.fc2_weight[wt_base+black_offset+j+1],
+                    self.fc2_weight[wt_base+black_offset+j+2], self.fc2_weight[wt_base+black_offset+j+3],
+                    self.fc2_weight[wt_base+black_offset+j+4], self.fc2_weight[wt_base+black_offset+j+5],
+                    self.fc2_weight[wt_base+black_offset+j+6], self.fc2_weight[wt_base+black_offset+j+7],
+                ]);
+                sum_vec = sum_vec + input_vec * wt_vec;
+                j += 8;
+            }
+            let arr = sum_vec.to_array();
+            sum += arr[0]+arr[1]+arr[2]+arr[3]+arr[4]+arr[5]+arr[6]+arr[7];
+
+            // Dense part (20 values, scalar loop)
+            let dense_offset = 2 * hidden1;
+            for k in 0..HALFPAIL_DENSE {
+                sum += dense[k] * self.fc2_weight[wt_base + dense_offset + k];
+            }
+
+            hidden2[neuron] = sum.max(0.0);  // ReLU
+        }
+
+        // FC3: dot product → tanh → centipawns
+        let mut output = self.fc3_bias;
+        // SIMD for FC3 if hidden2 >= 8
+        let mut sum_vec = f32x8::ZERO;
+        let mut i = 0;
+        while i + 8 <= self.hidden2 {
+            let input_vec = f32x8::new([
+                hidden2[i], hidden2[i+1], hidden2[i+2], hidden2[i+3],
+                hidden2[i+4], hidden2[i+5], hidden2[i+6], hidden2[i+7],
+            ]);
+            let wt_vec = f32x8::new([
+                self.fc3_weight[i], self.fc3_weight[i+1],
+                self.fc3_weight[i+2], self.fc3_weight[i+3],
+                self.fc3_weight[i+4], self.fc3_weight[i+5],
+                self.fc3_weight[i+6], self.fc3_weight[i+7],
+            ]);
+            sum_vec = sum_vec + input_vec * wt_vec;
+            i += 8;
+        }
+        let arr = sum_vec.to_array();
+        output += arr[0]+arr[1]+arr[2]+arr[3]+arr[4]+arr[5]+arr[6]+arr[7];
+
+        (output.tanh() * 1000.0) as i32
+    }
+}
+
+// ============================================================================
 // EVALUATION CACHE - Unngå redundante NNUE-evalueringer
 // ============================================================================
 
@@ -2880,14 +3994,26 @@ pub struct BitBoardEngine {
     // Previous move (for continuation history indexing)
     prev_move: Option<BitMove>,
 
-    // NNUE evaluator
+    // NNUE evaluator (f32)
     nnue: Option<IncrementalNNUE>,
 
-    // Accumulator stack
+    // Accumulator stack (f32)
     acc_stack: AccumulatorStack,
 
     // Working accumulator for evaluation (reused to avoid allocations)
     eval_acc: Accumulator,
+
+    // Quantized NNUE evaluator (i16) — takes priority over f32 when loaded
+    quantized_nnue: Option<QuantizedNNUE>,
+
+    // Quantized accumulator stack
+    qacc_stack: QAccumulatorStack,
+
+    // HalfPail NNUE evaluator — takes priority over f32/quantized when loaded
+    halfpail_nnue: Option<HalfPailNNUE>,
+
+    // Dual accumulator stack for HalfPail
+    dual_acc_stack: DualAccumulatorStack,
 
     // Skip relational features (for benchmarking)
     skip_relational: bool,
@@ -2906,6 +4032,8 @@ pub struct BitBoardEngine {
     pub weight_progress: i32,
     pub weight_center_pail: i32,
     pub weight_blocking: i32,
+    pub weight_scored: i32,
+    pub weight_threat: i32,
 }
 
 impl Default for BitBoardEngine {
@@ -2940,15 +4068,21 @@ impl BitBoardEngine {
             nnue: None,
             acc_stack: AccumulatorStack::new(),
             eval_acc: Accumulator::default(),
+            quantized_nnue: None,
+            qacc_stack: QAccumulatorStack::new(),
+            halfpail_nnue: None,
+            dual_acc_stack: DualAccumulatorStack::new(),
             skip_relational: false,
             deadline: None,
             nodes_since_check: 0,
             search_stopped: false,
             last_completed_depth: 0,
             lmr_table,
-            weight_progress: 100,
-            weight_center_pail: 10,
-            weight_blocking: 15,
+            weight_progress: 80,
+            weight_center_pail: 15,
+            weight_blocking: 20,
+            weight_scored: 700,
+            weight_threat: 150,
         }
     }
 
@@ -2984,16 +4118,63 @@ impl BitBoardEngine {
         }
     }
 
-    /// Last NNUE-modell
+    /// Last NNUE-modell (auto-detects halfpail vs quantized vs f32 format)
     pub fn load_nnue(&mut self, path: &str) -> Result<(), Box<dyn std::error::Error>> {
-        let nnue = IncrementalNNUE::load(path)?;
-        self.nnue = Some(nnue);
+        let json_str = std::fs::read_to_string(path)?;
+        let value: serde_json::Value = serde_json::from_str(&json_str)?;
+
+        if value.get("halfpail").and_then(|v| v.as_bool()).unwrap_or(false) {
+            // HalfPail dual-perspective sparse format
+            let json: HalfPailJson = serde_json::from_value(value)?;
+            let hp = HalfPailNNUE::from_json(json)?;
+            self.halfpail_nnue = Some(hp);
+            self.nnue = None;
+            self.quantized_nnue = None;
+        } else if value.get("quantized").and_then(|v| v.as_bool()).unwrap_or(false) {
+            // Quantized int16 format
+            let json: QuantizedNNUEJson = serde_json::from_value(value)?;
+            let qnnue = QuantizedNNUE::from_json(json)?;
+            self.quantized_nnue = Some(qnnue);
+            self.nnue = None;
+            self.halfpail_nnue = None;
+        } else {
+            // Standard f32 format
+            let model: NNUEModel = serde_json::from_value(value)?;
+            let fc1_weight: Vec<f32> = model.weights.fc1_weight.into_iter().flatten().collect();
+            let fc2_weight: Vec<f32> = model.weights.fc2_weight.into_iter().flatten().collect();
+            let fc3_weight: Vec<f32> = model.weights.fc3_weight.into_iter().flatten().collect();
+            let input_size = fc1_weight.len() / model.hidden1;
+            let hidden1 = model.hidden1;
+            let mut fc1_weight_t = vec![0.0f32; input_size * hidden1];
+            for neuron in 0..hidden1 {
+                for feature in 0..input_size {
+                    fc1_weight_t[feature * hidden1 + neuron] = fc1_weight[neuron * input_size + feature];
+                }
+            }
+            let nnue = IncrementalNNUE {
+                fc1_weight,
+                fc1_weight_t,
+                fc1_bias: model.weights.fc1_bias,
+                fc2_weight,
+                fc2_bias: model.weights.fc2_bias,
+                fc3_weight,
+                fc3_bias: model.weights.fc3_bias[0],
+                hidden1,
+                hidden2: model.hidden2,
+                input_size,
+            };
+            self.nnue = Some(nnue);
+            self.quantized_nnue = None;
+            self.halfpail_nnue = None;
+        }
         Ok(())
     }
 
     /// Clear NNUE (revert to heuristic evaluation)
     pub fn clear_nnue(&mut self) {
         self.nnue = None;
+        self.quantized_nnue = None;
+        self.halfpail_nnue = None;
     }
 
     /// Tøm TT
@@ -3008,6 +4189,8 @@ impl BitBoardEngine {
         self.clear_history();
         self.killer_moves = std::array::from_fn(|_| [None, None]);
         self.acc_stack.reset();
+        self.qacc_stack.reset();
+        self.dual_acc_stack.reset();
         self.nodes_searched = 0;
         self.cutoffs = 0;
         self.tt_hits = 0;
@@ -3021,7 +4204,7 @@ impl BitBoardEngine {
     }
 
     /// Heuristisk evaluering (fallback når NNUE ikke er lastet)
-    fn evaluate_heuristic(&self, bb: &BitBoard) -> i32 {
+    pub fn evaluate_heuristic(&self, bb: &BitBoard) -> i32 {
         if let Some(winner) = bb.check_winner() {
             return match winner {
                 Player::White => 100_000,
@@ -3032,7 +4215,7 @@ impl BitBoardEngine {
         let mut score = 0;
 
         // Poeng for scorede tønner (big bonus)
-        score += (bb.white_scored as i32 - bb.black_scored as i32) * 500;
+        score += (bb.white_scored as i32 - bb.black_scored as i32) * self.weight_scored;
 
         // Fremgang + trussel-bonus for tønner nær mål
         let mut white_progress = 0i32;
@@ -3064,7 +4247,7 @@ impl BitBoardEngine {
         }
 
         score += (white_progress - black_progress) * self.weight_progress;
-        score += (white_threats - black_threats) * 200; // Immediate threats are valuable
+        score += (white_threats - black_threats) * self.weight_threat; // Immediate threats are valuable
 
         // Pail-posisjon: senterkontroll + blokkering
         // White's ideal pail position is in opponent's half (rows 0-2), centered
@@ -3124,8 +4307,24 @@ impl BitBoardEngine {
             return score;
         }
 
-        // Float NNUE
-        if self.nnue.is_some() {
+        // HalfPail NNUE (highest priority — best feature representation)
+        if self.halfpail_nnue.is_some() {
+            let dual_acc = self.dual_acc_stack.current();
+            let hp = self.halfpail_nnue.as_ref().unwrap();
+            let score = hp.evaluate_from_dual_acc(bb, dual_acc);
+            self.eval_cache.store(hash, score);
+            score
+        }
+        // Quantized NNUE (preferred — faster)
+        else if self.quantized_nnue.is_some() {
+            let base_acc = self.qacc_stack.current();
+            let qnnue = self.quantized_nnue.as_ref().unwrap();
+            let score = qnnue.evaluate_from_qacc(bb, base_acc);
+            self.eval_cache.store(hash, score);
+            score
+        }
+        // Float NNUE (fallback)
+        else if self.nnue.is_some() {
             let base_acc = self.acc_stack.current();
             let pre_activation = base_acc.pre_activation;
 
@@ -3298,7 +4497,15 @@ impl BitBoardEngine {
 
         // Initialiser accumulator med full evaluering
         self.acc_stack.reset();
-        if let Some(ref nnue) = self.nnue {
+        self.qacc_stack.reset();
+        self.dual_acc_stack.reset();
+        if let Some(ref hp) = self.halfpail_nnue {
+            let dual_acc = self.dual_acc_stack.current_mut();
+            hp.init_accumulators(bb, dual_acc);
+        } else if let Some(ref qnnue) = self.quantized_nnue {
+            let acc = self.qacc_stack.current_mut();
+            qnnue.init_accumulator(bb, acc);
+        } else if let Some(ref nnue) = self.nnue {
             let acc = self.acc_stack.current_mut();
             for i in 0..nnue.hidden1 {
                 acc.pre_activation[i] = nnue.fc1_bias[i];
@@ -3434,8 +4641,26 @@ impl BitBoardEngine {
                 let mut new_bb = *bb;
                 new_bb.make_move(&mv);
 
-                // Oppdater accumulator
-                if self.nnue.is_some() {
+                // Oppdater accumulator (halfpail, quantized, or float)
+                if self.halfpail_nnue.is_some() {
+                    let hp = self.halfpail_nnue.as_ref().unwrap();
+                    let (w_deltas, b_deltas, w_recomp, b_recomp) = hp.compute_move_deltas(bb, &mv);
+                    self.dual_acc_stack.push();
+                    if w_recomp || b_recomp {
+                        let hp = self.halfpail_nnue.as_ref().unwrap();
+                        hp.init_accumulators(&new_bb, self.dual_acc_stack.current_mut());
+                    } else {
+                        let hp = self.halfpail_nnue.as_ref().unwrap();
+                        let dual_acc = self.dual_acc_stack.current_mut();
+                        hp.apply_deltas(&mut dual_acc.white_pre, &w_deltas);
+                        hp.apply_deltas(&mut dual_acc.black_pre, &b_deltas);
+                    }
+                } else if let Some(ref qnnue) = self.quantized_nnue {
+                    let deltas = compute_nnue_move_deltas(bb, &mv);
+                    self.qacc_stack.push();
+                    let acc = self.qacc_stack.current_mut();
+                    qnnue.apply_deltas_q(acc, &deltas);
+                } else if self.nnue.is_some() {
                     let nnue = self.nnue.as_ref().unwrap();
                     let deltas = nnue.compute_move_deltas(bb, &mv);
                     self.acc_stack.push();
@@ -3445,7 +4670,11 @@ impl BitBoardEngine {
 
                 let score = self.quiesce(&new_bb, alpha, beta, false, qsdepth + 1);
 
-                if self.nnue.is_some() {
+                if self.halfpail_nnue.is_some() {
+                    self.dual_acc_stack.pop();
+                } else if self.quantized_nnue.is_some() {
+                    self.qacc_stack.pop();
+                } else if self.nnue.is_some() {
                     self.acc_stack.pop();
                 }
 
@@ -3462,8 +4691,26 @@ impl BitBoardEngine {
                 let mut new_bb = *bb;
                 new_bb.make_move(&mv);
 
-                // Oppdater accumulator
-                if self.nnue.is_some() {
+                // Oppdater accumulator (halfpail, quantized, or float)
+                if self.halfpail_nnue.is_some() {
+                    let hp = self.halfpail_nnue.as_ref().unwrap();
+                    let (w_deltas, b_deltas, w_recomp, b_recomp) = hp.compute_move_deltas(bb, &mv);
+                    self.dual_acc_stack.push();
+                    if w_recomp || b_recomp {
+                        let hp = self.halfpail_nnue.as_ref().unwrap();
+                        hp.init_accumulators(&new_bb, self.dual_acc_stack.current_mut());
+                    } else {
+                        let hp = self.halfpail_nnue.as_ref().unwrap();
+                        let dual_acc = self.dual_acc_stack.current_mut();
+                        hp.apply_deltas(&mut dual_acc.white_pre, &w_deltas);
+                        hp.apply_deltas(&mut dual_acc.black_pre, &b_deltas);
+                    }
+                } else if let Some(ref qnnue) = self.quantized_nnue {
+                    let deltas = compute_nnue_move_deltas(bb, &mv);
+                    self.qacc_stack.push();
+                    let acc = self.qacc_stack.current_mut();
+                    qnnue.apply_deltas_q(acc, &deltas);
+                } else if self.nnue.is_some() {
                     let nnue = self.nnue.as_ref().unwrap();
                     let deltas = nnue.compute_move_deltas(bb, &mv);
                     self.acc_stack.push();
@@ -3473,7 +4720,11 @@ impl BitBoardEngine {
 
                 let score = self.quiesce(&new_bb, alpha, beta, true, qsdepth + 1);
 
-                if self.nnue.is_some() {
+                if self.halfpail_nnue.is_some() {
+                    self.dual_acc_stack.pop();
+                } else if self.quantized_nnue.is_some() {
+                    self.qacc_stack.pop();
+                } else if self.nnue.is_some() {
                     self.acc_stack.pop();
                 }
 
@@ -3701,8 +4952,91 @@ impl BitBoardEngine {
             let mut new_bb = *bb;
             let _undo = new_bb.make_move(&mv);
 
-            // Oppdater accumulator inkrementelt
-            if self.nnue.is_some() {
+            // Oppdater accumulator inkrementelt (halfpail, quantized, or float)
+            if self.halfpail_nnue.is_some() {
+                let hp = self.halfpail_nnue.as_ref().unwrap();
+                let (w_deltas, b_deltas, w_recompute, b_recompute) = hp.compute_move_deltas(bb, &mv);
+                self.dual_acc_stack.push();
+                let dual_acc = self.dual_acc_stack.current_mut();
+                if w_recompute || b_recompute {
+                    // One or both perspectives need full recompute (pail placement)
+                    let hp = self.halfpail_nnue.as_ref().unwrap();
+                    if w_recompute && b_recompute {
+                        hp.init_accumulators(&new_bb, dual_acc);
+                    } else if w_recompute {
+                        // Recompute white, apply deltas to black
+                        let hp = self.halfpail_nnue.as_ref().unwrap();
+                        // Reset white to bias and rebuild
+                        for i in 0..hp.hidden1 {
+                            dual_acc.white_pre[i] = hp.fc1_bias[i];
+                        }
+                        // Re-init white perspective from new_bb
+                        let w_bucket = if new_bb.white_pail != 0 {
+                            new_bb.white_pail.trailing_zeros() as usize
+                        } else { 36 };
+                        let mut barrels = new_bb.white_barrels;
+                        while barrels != 0 {
+                            let sq = barrels.trailing_zeros() as usize;
+                            hp.add_feature(&mut dual_acc.white_pre,
+                                halfpail_feature_index(w_bucket, sq, 0) as usize);
+                            barrels &= barrels - 1;
+                        }
+                        barrels = new_bb.black_barrels;
+                        while barrels != 0 {
+                            let sq = barrels.trailing_zeros() as usize;
+                            hp.add_feature(&mut dual_acc.white_pre,
+                                halfpail_feature_index(w_bucket, sq, 1) as usize);
+                            barrels &= barrels - 1;
+                        }
+                        if new_bb.black_pail != 0 {
+                            let sq = new_bb.black_pail.trailing_zeros() as usize;
+                            hp.add_feature(&mut dual_acc.white_pre,
+                                halfpail_feature_index(w_bucket, sq, 2) as usize);
+                        }
+                        // Apply deltas to black
+                        hp.apply_deltas(&mut dual_acc.black_pre, &b_deltas);
+                    } else {
+                        // b_recompute: recompute black, apply deltas to white
+                        let hp = self.halfpail_nnue.as_ref().unwrap();
+                        for i in 0..hp.hidden1 {
+                            dual_acc.black_pre[i] = hp.fc1_bias[i];
+                        }
+                        let b_bucket = if new_bb.black_pail != 0 {
+                            new_bb.black_pail.trailing_zeros() as usize
+                        } else { 36 };
+                        let mut barrels = new_bb.black_barrels;
+                        while barrels != 0 {
+                            let sq = barrels.trailing_zeros() as usize;
+                            hp.add_feature(&mut dual_acc.black_pre,
+                                halfpail_feature_index(b_bucket, sq, 0) as usize);
+                            barrels &= barrels - 1;
+                        }
+                        barrels = new_bb.white_barrels;
+                        while barrels != 0 {
+                            let sq = barrels.trailing_zeros() as usize;
+                            hp.add_feature(&mut dual_acc.black_pre,
+                                halfpail_feature_index(b_bucket, sq, 1) as usize);
+                            barrels &= barrels - 1;
+                        }
+                        if new_bb.white_pail != 0 {
+                            let sq = new_bb.white_pail.trailing_zeros() as usize;
+                            hp.add_feature(&mut dual_acc.black_pre,
+                                halfpail_feature_index(b_bucket, sq, 2) as usize);
+                        }
+                        // Apply deltas to white
+                        hp.apply_deltas(&mut dual_acc.white_pre, &w_deltas);
+                    }
+                } else {
+                    let hp = self.halfpail_nnue.as_ref().unwrap();
+                    hp.apply_deltas(&mut dual_acc.white_pre, &w_deltas);
+                    hp.apply_deltas(&mut dual_acc.black_pre, &b_deltas);
+                }
+            } else if let Some(ref qnnue) = self.quantized_nnue {
+                let deltas = compute_nnue_move_deltas(bb, &mv);
+                self.qacc_stack.push();
+                let acc = self.qacc_stack.current_mut();
+                qnnue.apply_deltas_q(acc, &deltas);
+            } else if self.nnue.is_some() {
                 let nnue = self.nnue.as_ref().unwrap();
                 let deltas = nnue.compute_move_deltas(bb, &mv);
                 self.acc_stack.push();
@@ -3773,7 +5107,11 @@ impl BitBoardEngine {
             }
 
             // Pop accumulator
-            if self.nnue.is_some() {
+            if self.halfpail_nnue.is_some() {
+                self.dual_acc_stack.pop();
+            } else if self.quantized_nnue.is_some() {
+                self.qacc_stack.pop();
+            } else if self.nnue.is_some() {
                 self.acc_stack.pop();
             }
 
@@ -3956,6 +5294,187 @@ impl BitBoardEngine {
 // PYTHON MODUL
 // ============================================================================
 
+/// Decode a 164-feature dense row into HalfPail sparse indices + dense features.
+///
+/// This is the hot path for training data preparation — called ~63M times per epoch.
+/// Moving it from Python to Rust gives ~20-50x speedup.
+///
+/// Accepts either a list of 164 floats or raw bytes (656 bytes = 164 × f32).
+///
+/// Returns: (white_indices: list[int], black_indices: list[int], dense_6: list[float])
+#[pyfunction]
+fn decode_halfpail(data: &Bound<'_, pyo3::types::PyAny>) -> PyResult<(Vec<u16>, Vec<u16>, Vec<f32>)> {
+    let row: Vec<f32> = if let Ok(bytes) = data.extract::<Vec<u8>>() {
+        // Fast path: raw bytes (656 bytes = 164 × f32 little-endian)
+        if bytes.len() != 164 * 4 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                format!("Expected 656 bytes (164×f32), got {}", bytes.len())
+            ));
+        }
+        bytes.chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect()
+    } else if let Ok(list) = data.extract::<Vec<f32>>() {
+        // Fallback: list of floats
+        if list.len() != 164 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                format!("Expected 164 features, got {}", list.len())
+            ));
+        }
+        list
+    } else {
+        return Err(pyo3::exceptions::PyTypeError::new_err(
+            "Expected list of 164 floats or 656 bytes"
+        ));
+    };
+
+    // Decode board from first 144 features (36 squares × 4 piece types)
+    let mut white_barrels: Vec<usize> = Vec::with_capacity(5);
+    let mut black_barrels: Vec<usize> = Vec::with_capacity(5);
+    let mut white_pail: Option<usize> = None;
+    let mut black_pail: Option<usize> = None;
+
+    for sq in 0..NUM_SQUARES {
+        let base = sq * 4;
+        if row[base] > 0.5 { white_barrels.push(sq); }
+        if row[base + 1] > 0.5 { black_barrels.push(sq); }
+        if row[base + 2] > 0.5 { white_pail = Some(sq); }
+        if row[base + 3] > 0.5 { black_pail = Some(sq); }
+    }
+
+    // Extract scored counts and current player from relational features
+    let rel = &row[144..];
+    let white_scored = (rel[8] * 4.0).round() as i32;
+    let black_scored = (rel[9] * 4.0).round() as i32;
+    let current_player: f32 = if rel[12] > 0.0 { 1.0 } else { -1.0 };
+
+    // White perspective: bucket = white pail position
+    let w_bucket = white_pail.unwrap_or(NUM_SQUARES);
+    let mut white_indices: Vec<u16> = Vec::with_capacity(10);
+    for &sq in &white_barrels {
+        white_indices.push(halfpail_feature_index(w_bucket, sq, 0));
+    }
+    for &sq in &black_barrels {
+        white_indices.push(halfpail_feature_index(w_bucket, sq, 1));
+    }
+    if let Some(bp) = black_pail {
+        white_indices.push(halfpail_feature_index(w_bucket, bp, 2));
+    }
+
+    // Black perspective: bucket = black pail position
+    let b_bucket = black_pail.unwrap_or(NUM_SQUARES);
+    let mut black_indices: Vec<u16> = Vec::with_capacity(10);
+    for &sq in &black_barrels {
+        black_indices.push(halfpail_feature_index(b_bucket, sq, 0));
+    }
+    for &sq in &white_barrels {
+        black_indices.push(halfpail_feature_index(b_bucket, sq, 1));
+    }
+    if let Some(wp) = white_pail {
+        black_indices.push(halfpail_feature_index(b_bucket, wp, 2));
+    }
+
+    // Dense features (6 values)
+    let wb_on_board = white_barrels.len() as f32;
+    let bb_on_board = black_barrels.len() as f32;
+    let dense = vec![
+        white_scored as f32 / 4.0,
+        black_scored as f32 / 4.0,
+        (white_scored - black_scored) as f32 / 4.0,
+        current_player,
+        wb_on_board / 4.0,
+        bb_on_board / 4.0,
+    ];
+
+    Ok((white_indices, black_indices, dense))
+}
+
+/// Batch-decode multiple 164-feature rows into packed HalfPail tensors.
+///
+/// Accepts raw bytes from numpy arrays (via .tobytes()) for zero-copy transfer,
+/// or falls back to list-of-float for compatibility.
+///
+/// Returns everything the collate_fn would produce, skipping all Python-level overhead:
+///   (white_indices, white_offsets, black_indices, black_offsets, dense_flat, labels)
+/// All as flat Vec ready to be wrapped in torch tensors.
+#[pyfunction]
+fn decode_halfpail_batch(
+    data: Vec<f32>,      // N * 164 floats, row-major (from numpy .ravel().tolist())
+    labels: Vec<f32>,    // N floats
+) -> PyResult<(Vec<i64>, Vec<i64>, Vec<i64>, Vec<i64>, Vec<f32>, Vec<f32>)> {
+    let n = labels.len();
+    if data.len() != n * 164 {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            format!("Expected {} floats ({}×164), got {}", n * 164, n, data.len())
+        ));
+    }
+    let data_owned = data;
+
+    let mut all_w_idx: Vec<i64> = Vec::with_capacity(n * 10);
+    let mut all_b_idx: Vec<i64> = Vec::with_capacity(n * 10);
+    let mut w_offsets: Vec<i64> = Vec::with_capacity(n);
+    let mut b_offsets: Vec<i64> = Vec::with_capacity(n);
+    let mut dense_flat: Vec<f32> = Vec::with_capacity(n * HALFPAIL_DENSE);
+    let mut labels_out: Vec<f32> = Vec::with_capacity(n);
+
+    for i in 0..n {
+        let row = &data_owned[i * 164..(i + 1) * 164];
+
+        // Record offsets before adding indices
+        w_offsets.push(all_w_idx.len() as i64);
+        b_offsets.push(all_b_idx.len() as i64);
+
+        // Decode board (BARRELS_PER_PLAYER=4, but use extra space for safety)
+        let mut white_barrels: [usize; 8] = [0; 8];
+        let mut black_barrels: [usize; 8] = [0; 8];
+        let mut n_wb: usize = 0;
+        let mut n_bb: usize = 0;
+        let mut white_pail: usize = NUM_SQUARES; // 36 = not placed
+        let mut black_pail: usize = NUM_SQUARES;
+
+        for sq in 0..NUM_SQUARES {
+            let base = sq * 4;
+            if row[base] > 0.5 && n_wb < 8 { white_barrels[n_wb] = sq; n_wb += 1; }
+            if row[base + 1] > 0.5 && n_bb < 8 { black_barrels[n_bb] = sq; n_bb += 1; }
+            if row[base + 2] > 0.5 { white_pail = sq; }
+            if row[base + 3] > 0.5 { black_pail = sq; }
+        }
+
+        let rel = &row[144..];
+
+        // White perspective
+        for j in 0..n_wb {
+            all_w_idx.push(halfpail_feature_index(white_pail, white_barrels[j], 0) as i64);
+        }
+        for j in 0..n_bb {
+            all_w_idx.push(halfpail_feature_index(white_pail, black_barrels[j], 1) as i64);
+        }
+        if black_pail < NUM_SQUARES {
+            all_w_idx.push(halfpail_feature_index(white_pail, black_pail, 2) as i64);
+        }
+
+        // Black perspective
+        for j in 0..n_bb {
+            all_b_idx.push(halfpail_feature_index(black_pail, black_barrels[j], 0) as i64);
+        }
+        for j in 0..n_wb {
+            all_b_idx.push(halfpail_feature_index(black_pail, white_barrels[j], 1) as i64);
+        }
+        if white_pail < NUM_SQUARES {
+            all_b_idx.push(halfpail_feature_index(black_pail, white_pail, 2) as i64);
+        }
+
+        // Dense features: all 20 relational features from training data (features 144-163)
+        for k in 0..HALFPAIL_DENSE {
+            dense_flat.push(rel[k]);
+        }
+
+        labels_out.push(labels[i]);
+    }
+
+    Ok((all_w_idx, w_offsets, all_b_idx, b_offsets, dense_flat, labels_out))
+}
+
 /// Python-modul
 #[pymodule]
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -3966,8 +5485,13 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Board>()?;
     m.add_class::<Engine>()?;
     m.add_class::<SearchResult>()?;
+    m.add_function(wrap_pyfunction!(decode_halfpail, m)?)?;
+    m.add_function(wrap_pyfunction!(decode_halfpail_batch, m)?)?;
     m.add("BOARD_SIZE", BOARD_SIZE)?;
     m.add("BARRELS_PER_PLAYER", BARRELS_PER_PLAYER)?;
+    m.add("POLICY_SIZE", mcts::POLICY_SIZE)?;
+    m.add_class::<mcts::MCTSEngine>()?;
+    m.add_class::<mcts::MCTSSearchResult>()?;
     Ok(())
 }
 
