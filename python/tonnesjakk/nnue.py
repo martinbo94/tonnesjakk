@@ -1,21 +1,20 @@
 """
 NNUE Training for Tonnesjakk
 
-A neural network evaluator trained via self-play.
-Based on best practices from Stockfish NNUE and chess engine research.
+HalfPail NNUE training pipeline for Tonnesjakk. Uses dual-perspective sparse
+features inspired by Stockfish's HalfKP architecture.
 
 Key features:
 - Random opening moves for diversity (prevents all games being identical)
 - Outcome-based labeling with temporal discounting
-- Support for multiple architectures
+- HalfPail dual-perspective sparse feature encoding
 - Export to JSON for Rust inference
 - Balanced dataset validation
 
 Usage:
-    python -m tonnesjakk.nnue                    # Train with default settings
-    python -m tonnesjakk.nnue --games 10000     # Train with more games
-    python -m tonnesjakk.nnue --test            # Quick test
-    python -m tonnesjakk.nnue --benchmark       # Run benchmark
+    python -m tonnesjakk.nnue --load-data data.bin --epochs 50  # Train on data
+    python -m tonnesjakk.nnue --games 10000 --save-data data.bin  # Generate data
+    python -m tonnesjakk.nnue --compare a.json heuristic --depth 6  # Compare
 """
 
 import json
@@ -794,49 +793,8 @@ def export_halfpail_json(model: HalfPailNNUE, output_path: str):
 
 
 # =============================================================================
-# Neural Network Architectures
+# Feature Encoding (164-dim dense format for data generation)
 # =============================================================================
-
-class TonnesjakkNNUE(nn.Module):
-    """
-    NNUE-inspired network for Tonnesjakk.
-
-    Architecture options:
-        - 144 -> 64 -> 32 -> 1  (no relational, ~11K params)
-        - 147 -> 64 -> 32 -> 1  (with relational, ~11K params)
-        - 147 -> 128 -> 32 -> 1 (wider, ~21K params)
-
-    The first layer is most important - it learns piece-square relationships.
-    """
-
-    def __init__(self, hidden1: int = 64, hidden2: int = 32, input_size: int = INPUT_SIZE):
-        super().__init__()
-        self.hidden1 = hidden1
-        self.hidden2 = hidden2
-        self.input_size = input_size
-
-        self.net = nn.Sequential(
-            nn.Linear(input_size, hidden1),
-            nn.ReLU(),
-            nn.Linear(hidden1, hidden2),
-            nn.ReLU(),
-            nn.Linear(hidden2, 1),
-            nn.Tanh()  # Output between -1 and +1
-        )
-
-        # Xavier initialization
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight)
-                nn.init.zeros_(m.bias)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
-
-    @property
-    def num_parameters(self) -> int:
-        return sum(p.numel() for p in self.parameters())
-
 
 def board_to_tensor(
     board_array: List[List[int]],
@@ -956,30 +914,6 @@ def board_to_tensor(
 def flip_board_horizontal(board_array: List[List[int]]) -> List[List[int]]:
     """Flip board horizontally for data augmentation (exploits symmetry)."""
     return [[board_array[r][5 - c] for c in range(6)] for r in range(6)]
-
-
-def board_to_tensor_base_only(board_array: List[List[int]]) -> torch.Tensor:
-    """Base features only (144-dim). No relational features, no padding."""
-    x = np.zeros((BOARD_SIZE, BOARD_SIZE, NUM_PIECE_TYPES), dtype=np.float32)
-    for row in range(BOARD_SIZE):
-        for col in range(BOARD_SIZE):
-            val = board_array[row][col]
-            if val == 1:
-                x[row, col, 0] = 1.0
-            elif val == -1:
-                x[row, col, 1] = 1.0
-            elif val == 2:
-                x[row, col, 2] = 1.0
-            elif val == -2:
-                x[row, col, 3] = 1.0
-    return torch.from_numpy(x.flatten())
-
-
-def board_to_tensor_simple(board_array: List[List[int]]) -> torch.Tensor:
-    """Simple version for backward compatibility (base features only, padded to 147)."""
-    features = board_to_tensor_base_only(board_array)
-    # Pad with zeros for relational features
-    return torch.cat([features, torch.zeros(RELATIONAL_FEATURES)])
 
 
 # =============================================================================
@@ -1636,341 +1570,6 @@ def wdl_cross_entropy(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     return -torch.mean(t * torch.log(p) + (1 - t) * torch.log(1 - p))
 
 
-def train_model(
-    X,  # torch.Tensor or np.memmap
-    y,  # torch.Tensor or np.memmap
-    hidden1: int = 64,
-    hidden2: int = 32,
-    input_size: int = INPUT_SIZE,
-    epochs: int = 200,
-    batch_size: int = 4096,
-    learning_rate: float = 0.001,
-    validation_split: float = 0.1,
-    verbose: bool = True,
-    loss_fn: str = "wdl-ce"
-) -> Tuple[TonnesjakkNNUE, Dict]:
-    """
-    Train the NNUE model.
-
-    Supports both in-memory tensors and memory-mapped numpy arrays.
-    When using mmap, loads only one batch at a time into RAM.
-
-    Args:
-        X: Input data (N, input_size) — torch.Tensor or np.memmap
-        y: Labels (N,) or (N, 1) — torch.Tensor or np.memmap
-        hidden1: First hidden layer size
-        hidden2: Second hidden layer size
-        input_size: Number of input features
-        epochs: Number of training epochs
-        batch_size: Mini-batch size
-        learning_rate: Adam learning rate
-        validation_split: Fraction for validation
-        verbose: Print progress
-        loss_fn: Loss function - "mse" or "wdl-ce" (cross-entropy in WDL space)
-
-    Returns:
-        (model, history) - trained model and training history
-    """
-    streaming = isinstance(X, np.memmap)
-    n = len(X)
-
-    # Create model
-    model = TonnesjakkNNUE(hidden1, hidden2, input_size=input_size)
-    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
-    if loss_fn == "wdl-ce":
-        criterion = wdl_cross_entropy
-    else:
-        criterion = nn.MSELoss()
-
-    history = {'train_loss': [], 'val_loss': []}
-    best_val_loss = float('inf')
-    best_model_state = None
-
-    if streaming:
-        # Streaming mode: use contiguous slices to avoid random memmap access.
-        # Data from many independent games is already well-shuffled, so a
-        # contiguous train/val split is fine.
-        split = int((1 - validation_split) * n)
-        train_n = split
-
-        if verbose:
-            print(f"  Training set: {train_n:,} positions")
-            print(f"  Validation set: {n - split:,} positions")
-            print(f"  Mode: streaming (memory-mapped, contiguous reads)")
-            print(f"  Loss: {loss_fn} ({'WDL cross-entropy' if loss_fn == 'wdl-ce' else 'mean squared error'})")
-            print(f"  Model: {input_size} -> {hidden1} -> {hidden2} -> 1 "
-                  f"({model.num_parameters:,} parameters)")
-
-        # Load validation set as one contiguous sequential read
-        X_val = torch.tensor(np.array(X[split:n]), dtype=torch.float32)
-        y_val_np = np.array(y[split:n])
-        y_val = torch.tensor(y_val_np, dtype=torch.float32).unsqueeze(1) if y_val_np.ndim == 1 else torch.tensor(y_val_np, dtype=torch.float32)
-
-        # Pre-compute chunk layout for training
-        n_chunks = (train_n + batch_size - 1) // batch_size
-        chunk_order = np.arange(n_chunks)
-
-        train_start = time.time()
-        for epoch in range(epochs):
-            epoch_start = time.time()
-            model.train()
-            np.random.shuffle(chunk_order)  # shuffle chunk ORDER, not indices
-
-            total_loss = 0.0
-            num_batches = 0
-
-            for ci in chunk_order:
-                start = ci * batch_size
-                end = min(start + batch_size, train_n)
-                # Contiguous sequential read from memmap (fast)
-                batch_X = torch.tensor(np.array(X[start:end]), dtype=torch.float32)
-                batch_y_np = np.array(y[start:end])
-                batch_y = torch.tensor(batch_y_np, dtype=torch.float32).unsqueeze(1) if batch_y_np.ndim == 1 else torch.tensor(batch_y_np, dtype=torch.float32)
-
-                optimizer.zero_grad()
-                pred = model(batch_X)
-                loss = criterion(pred, batch_y)
-                loss.backward()
-                optimizer.step()
-
-                total_loss += loss.item()
-                num_batches += 1
-
-            # -- end of streaming epoch: validate and log --
-            train_loss = total_loss / num_batches
-            model.eval()
-            with torch.no_grad():
-                val_pred = model(X_val)
-                val_loss = criterion(val_pred, y_val).item()
-
-            history['train_loss'].append(train_loss)
-            history['val_loss'].append(val_loss)
-
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
-                best_model_state = model.state_dict().copy()
-                marker = " *"
-            else:
-                marker = ""
-
-            if verbose:
-                epoch_time = time.time() - epoch_start
-                elapsed = time.time() - train_start
-                eta = epoch_time * (epochs - epoch - 1)
-                print(f"  Epoch {epoch+1:3d}/{epochs}: "
-                      f"train={train_loss:.4f}, val={val_loss:.4f} "
-                      f"({epoch_time:.0f}s, total {elapsed:.0f}s, ETA {eta/60:.0f}m){marker}", flush=True)
-    else:
-        # In-memory mode: random index shuffling is fine
-        indices = np.arange(n)
-        np.random.shuffle(indices)
-        split = int((1 - validation_split) * n)
-        train_idx = indices[:split]
-        val_idx = indices[split:]
-
-        if verbose:
-            print(f"  Training set: {len(train_idx):,} positions")
-            print(f"  Validation set: {len(val_idx):,} positions")
-            print(f"  Loss: {loss_fn} ({'WDL cross-entropy' if loss_fn == 'wdl-ce' else 'mean squared error'})")
-            print(f"  Model: {input_size} -> {hidden1} -> {hidden2} -> 1 "
-                  f"({model.num_parameters:,} parameters)")
-
-        X_val, y_val = X[val_idx], y[val_idx]
-
-        train_start = time.time()
-        for epoch in range(epochs):
-            epoch_start = time.time()
-            model.train()
-            np.random.shuffle(train_idx)
-
-            total_loss = 0.0
-            num_batches = 0
-
-            for i in range(0, len(train_idx), batch_size):
-                batch_idx = train_idx[i: i + batch_size]
-                batch_X = X[batch_idx]
-                batch_y = y[batch_idx]
-
-                optimizer.zero_grad()
-                pred = model(batch_X)
-                loss = criterion(pred, batch_y)
-                loss.backward()
-                optimizer.step()
-
-                total_loss += loss.item()
-                num_batches += 1
-
-            # -- end of in-memory epoch: validate and log --
-            train_loss = total_loss / num_batches
-            model.eval()
-            with torch.no_grad():
-                val_pred = model(X_val)
-                val_loss = criterion(val_pred, y_val).item()
-
-            history['train_loss'].append(train_loss)
-            history['val_loss'].append(val_loss)
-
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
-                best_model_state = model.state_dict().copy()
-                marker = " *"
-            else:
-                marker = ""
-
-            if verbose:
-                epoch_time = time.time() - epoch_start
-                elapsed = time.time() - train_start
-                eta = epoch_time * (epochs - epoch - 1)
-                print(f"  Epoch {epoch+1:3d}/{epochs}: "
-                      f"train={train_loss:.4f}, val={val_loss:.4f} "
-                      f"({epoch_time:.0f}s, total {elapsed:.0f}s, ETA {eta/60:.0f}m){marker}", flush=True)
-
-    # Restore best model
-    if best_model_state is not None:
-        model.load_state_dict(best_model_state)
-
-    if verbose:
-        print(f"  Best validation loss: {best_val_loss:.4f}")
-
-    return model, history
-
-
-# =============================================================================
-# Export
-# =============================================================================
-
-def export_to_json(model: TonnesjakkNNUE, output_path: str):
-    """
-    Export model weights to JSON for Rust inference.
-
-    The JSON format matches what the Rust IncrementalNNUE expects.
-    """
-    state_dict = model.state_dict()
-    weights = {}
-
-    for name, tensor in state_dict.items():
-        if "0.weight" in name:
-            weights["fc1_weight"] = tensor.tolist()
-        elif "0.bias" in name:
-            weights["fc1_bias"] = tensor.tolist()
-        elif "2.weight" in name:
-            weights["fc2_weight"] = tensor.tolist()
-        elif "2.bias" in name:
-            weights["fc2_bias"] = tensor.tolist()
-        elif "4.weight" in name:
-            weights["fc3_weight"] = tensor.tolist()
-        elif "4.bias" in name:
-            weights["fc3_bias"] = tensor.tolist()
-
-    output = {
-        "hidden1": model.hidden1,
-        "hidden2": model.hidden2,
-        "weights": weights
-    }
-
-    with open(output_path, "w") as f:
-        json.dump(output, f)
-
-    print(f"Exported to {output_path}")
-
-
-def export_quantized_json(
-    model: TonnesjakkNNUE,
-    output_path: str,
-    fc1_scale: int = 512,
-    fc2_scale: int = 64,
-    fc3_scale: int = 64,
-    crelu_shift: int = 4,
-):
-    """
-    Export model weights in quantized int16 format for fast Rust inference.
-
-    Quantization scheme (Stockfish-style fixed-point):
-    - FC1 weights/bias: i16 at fc1_scale (default 512)
-    - FC2 weights: i16 at fc2_scale (default 64), bias: i32
-    - FC3 weights: i16 at fc3_scale (default 64), bias: i32
-    - ClippedReLU between FC1 and FC2: clamp(acc >> crelu_shift, 0, 127)
-
-    The accumulator (FC1 output) holds values at scale fc1_scale.
-    After ClippedReLU with right-shift, values are in [0, 127].
-    FC2 dot product produces i32 at scale (fc1_scale >> crelu_shift) * fc2_scale.
-    FC3 produces the final i32 output, converted to f32 via output_scale.
-    """
-    state_dict = model.state_dict()
-
-    # Extract f32 weights
-    fc1_w = state_dict['net.0.weight']  # [hidden1, input_size]
-    fc1_b = state_dict['net.0.bias']    # [hidden1]
-    fc2_w = state_dict['net.2.weight']  # [hidden2, hidden1]
-    fc2_b = state_dict['net.2.bias']    # [hidden2]
-    fc3_w = state_dict['net.4.weight']  # [1, hidden2]
-    fc3_b = state_dict['net.4.bias']    # [1]
-
-    # Quantize FC1: i16 at fc1_scale
-    fc1_w_q = torch.clamp(torch.round(fc1_w * fc1_scale), -32768, 32767).to(torch.int32)
-    fc1_b_q = torch.clamp(torch.round(fc1_b * fc1_scale), -32768, 32767).to(torch.int32)
-
-    # Quantize FC2: i16 weights at fc2_scale
-    fc2_w_q = torch.clamp(torch.round(fc2_w * fc2_scale), -32768, 32767).to(torch.int32)
-
-    # FC2 bias: i32 at scale (fc1_scale >> crelu_shift) * fc2_scale
-    # This matches the scale of dot(clipped_relu_output, fc2_weight)
-    fc2_bias_scale = (fc1_scale >> crelu_shift) * fc2_scale
-    fc2_b_q = torch.round(fc2_b * fc2_bias_scale).to(torch.int32)
-
-    # Quantize FC3: i16 weights at fc3_scale
-    fc3_w_q = torch.clamp(torch.round(fc3_w * fc3_scale), -32768, 32767).to(torch.int32)
-
-    # FC3 bias: i32 at scale that matches FC3 input * fc3_scale
-    # FC3 input comes from FC2 output after ReLU + rescaling.
-    # We convert FC2 output to a clipped range before FC3, so FC3 bias scale
-    # matches: fc3_scale * FC2_CRELU_DIVISOR (we use a second clamp for FC2 output)
-    # For simplicity: FC3 bias = round(bias * fc2_bias_scale * fc3_scale / fc2_scale)
-    # Actually, FC3 input scale = fc2_bias_scale (since we just ReLU, no shift for FC2->FC3)
-    # So FC3 output scale = fc2_bias_scale * fc3_scale
-    fc3_output_scale = fc2_bias_scale * fc3_scale
-    fc3_b_q = torch.round(fc3_b * fc3_output_scale).to(torch.int32)
-
-    # output_scale converts the final i32 output back to the [-1, 1] tanh input range
-    output_scale = 1.0 / fc3_output_scale
-
-    output = {
-        "quantized": True,
-        "hidden1": model.hidden1,
-        "hidden2": model.hidden2,
-        "input_size": model.input_size,
-        "fc1_weight_scale": fc1_scale,
-        "fc2_weight_scale": fc2_scale,
-        "fc3_weight_scale": fc3_scale,
-        "crelu_shift": crelu_shift,
-        "output_scale": output_scale,
-        "weights": {
-            "fc1_weight": fc1_w_q.tolist(),
-            "fc1_bias": fc1_b_q.tolist(),
-            "fc2_weight": fc2_w_q.tolist(),
-            "fc2_bias": fc2_b_q.tolist(),
-            "fc3_weight": fc3_w_q.squeeze(0).tolist(),  # [hidden2] not [1, hidden2]
-            "fc3_bias": int(fc3_b_q.item()),
-        }
-    }
-
-    with open(output_path, "w") as f:
-        json.dump(output, f)
-
-    # Print quantization stats
-    fc1_w_list = fc1_w_q.flatten().tolist()
-    fc2_w_list = fc2_w_q.flatten().tolist()
-    fc3_w_list = fc3_w_q.flatten().tolist()
-    print(f"Exported quantized weights to {output_path}")
-    print(f"  FC1 weights: i16 range [{min(fc1_w_list)}, {max(fc1_w_list)}] (scale={fc1_scale})")
-    print(f"  FC1 bias: i16 range [{min(fc1_b_q.tolist())}, {max(fc1_b_q.tolist())}]")
-    print(f"  FC2 weights: i16 range [{min(fc2_w_list)}, {max(fc2_w_list)}] (scale={fc2_scale})")
-    print(f"  FC2 bias: i32 (scale={fc2_bias_scale})")
-    print(f"  FC3 weights: i16 range [{min(fc3_w_list)}, {max(fc3_w_list)}] (scale={fc3_scale})")
-    print(f"  ClippedReLU shift: {crelu_shift}")
-    print(f"  Output scale: {output_scale:.10f}")
-
-
 # =============================================================================
 # Main Training Pipeline
 # =============================================================================
@@ -1979,7 +1578,7 @@ def train_nnue(
     num_games: int = 10000,
     depth: int = 6,
     random_moves: int = 4,
-    hidden1: int = 64,
+    hidden1: int = 128,
     hidden2: int = 32,
     epochs: int = 200,
     output_dir: str = ".",
@@ -1994,56 +1593,37 @@ def train_nnue(
     save_every: int = 0,
     generate_only: bool = False,
     workers: int = 1,
-    no_relational: bool = False,
     batch_size: int = 4096,
-    rescale_labels: Optional[float] = None,
     lambda_blend: Optional[float] = None,
     loss_fn: str = "wdl-ce",
     learning_rate: float = 0.001,
-    halfpail: bool = False,
     num_workers: int = 0,
     resume_from: Optional[str] = None,
 ) -> Optional[nn.Module]:
     """
-    Complete NNUE training pipeline.
+    Complete HalfPail NNUE training pipeline.
 
     Recommended settings:
     - num_games: 10,000 - 20,000 for good results
     - depth: 6-8 (higher = better quality, slower generation)
     - random_moves: 4-6 (ensures diverse openings)
-    - hidden1: 64-128 (first layer is most important)
-    - hidden2: 32 (second layer can be smaller)
+    - hidden1: 128 (EmbeddingBag output dimension)
+    - hidden2: 32 (second hidden layer)
     - use_nnue: Path to existing NNUE weights for self-play (self-improvement loop)
     - use_search_scores: Use engine search scores (True) vs game outcomes (False)
     - augment: Apply horizontal flip augmentation (doubles training data)
     - save_data: Save generated positions to file for reuse
     - load_data: Load positions from file instead of generating
-    - halfpail: Use HalfPail dual-perspective sparse feature architecture
     """
-    # Determine input size based on relational feature mode
-    input_size = BASE_FEATURES if no_relational else INPUT_SIZE
-    rel_count = 0 if no_relational else RELATIONAL_FEATURES
-
     print("=" * 60)
-    if halfpail:
-        print("HALFPAIL NNUE TRAINING FOR TONNESJAKK")
-    else:
-        print("NNUE TRAINING FOR TONNESJAKK")
+    print("HALFPAIL NNUE TRAINING FOR TONNESJAKK")
     print("=" * 60)
     print(f"\nSettings:")
-    if halfpail:
-        print(f"  Architecture: HalfPail EmbeddingBag({HALFPAIL_FEATURES}, {hidden1}) -> FC2({2*hidden1+HALFPAIL_DENSE}, {hidden2}) -> 1")
-    else:
-        print(f"  Architecture: {input_size} -> {hidden1} -> {hidden2} -> 1")
+    print(f"  Architecture: HalfPail EmbeddingBag({HALFPAIL_FEATURES}, {hidden1}) -> FC2({2*hidden1+HALFPAIL_DENSE}, {hidden2}) -> 1")
     if resume_from:
         print(f"  Resuming from: {resume_from}")
     print(f"  Loss: {loss_fn} ({'WDL cross-entropy' if loss_fn == 'wdl-ce' else 'mean squared error'})")
-    if halfpail:
-        print(f"  Features: HalfPail sparse ({HALFPAIL_FEATURES} perspective features, {HALFPAIL_DENSE} dense)")
-    elif no_relational:
-        print(f"  Features: {BASE_FEATURES} base (no relational)")
-    else:
-        print(f"  Features: {BASE_FEATURES} base + {RELATIONAL_FEATURES} relational")
+    print(f"  Features: HalfPail sparse ({HALFPAIL_FEATURES} perspective features, {HALFPAIL_DENSE} dense)")
 
     # Step 1: Generate or load data
     if load_data:
@@ -2057,17 +1637,6 @@ def train_nnue(
         print(f"  {stats}")
         if loaded_config:
             print(f"  Original config: {loaded_config.get('games', '?')} games, depth {loaded_config.get('depth', '?')}")
-
-        # Rescale labels (e.g. fix /10000 -> /1000 normalization on old data)
-        if rescale_labels is not None and rescale_labels != 1.0:
-            print(f"  Rescaling labels by {rescale_labels}x (old range: [{y.min():.4f}, {y.max():.4f}])")
-            y = torch.clamp(y * rescale_labels, -1.0, 1.0)
-            print(f"  New range: [{y.min():.4f}, {y.max():.4f}], std={y.std():.4f}")
-
-        # Slice off relational features if training without them
-        if no_relational and X.shape[1] > BASE_FEATURES:
-            print(f"  Slicing features {X.shape[1]} -> {BASE_FEATURES} (dropping relational)")
-            X = X[:, :BASE_FEATURES]
     else:
         print(f"  Games: {num_games:,}")
         print(f"  Search depth: {depth}")
@@ -2135,29 +1704,17 @@ def train_nnue(
 
     # Step 2: Train
     print(f"\n[2/3] Training model...")
-    if halfpail:
-        model, history = train_halfpail_model(
-            X, y,
-            hidden1=hidden1,
-            hidden2=hidden2,
-            epochs=epochs,
-            batch_size=batch_size,
-            learning_rate=learning_rate,
-            loss_fn=loss_fn,
-            num_workers=num_workers,
-            resume_from=resume_from,
-        )
-    else:
-        model, history = train_model(
-            X, y,
-            hidden1=hidden1,
-            hidden2=hidden2,
-            input_size=input_size,
-            epochs=epochs,
-            batch_size=batch_size,
-            loss_fn=loss_fn,
-            learning_rate=learning_rate
-        )
+    model, history = train_halfpail_model(
+        X, y,
+        hidden1=hidden1,
+        hidden2=hidden2,
+        epochs=epochs,
+        batch_size=batch_size,
+        learning_rate=learning_rate,
+        loss_fn=loss_fn,
+        num_workers=num_workers,
+        resume_from=resume_from,
+    )
 
     # Step 3: Export
     print(f"\n[3/3] Exporting...")
@@ -2183,10 +1740,7 @@ def train_nnue(
     print(f"  PyTorch model: {torch_path}")
 
     # Save JSON for Rust
-    if halfpail:
-        export_halfpail_json(model, str(json_path))
-    else:
-        export_to_json(model, str(json_path))
+    export_halfpail_json(model, str(json_path))
     print(f"  JSON weights: {json_path}")
 
     # Step 4: Compare with heuristic baseline (and optionally previous version)
@@ -2244,10 +1798,7 @@ def train_nnue(
             "used_nnue": use_nnue is not None,
             "search_scores": use_search_scores,
             "augment": augment,
-            "input_size": input_size,
-            "no_relational": no_relational,
             "loss_fn": loss_fn,
-            "halfpail": halfpail
         }
         add_training_result(generation, config, comparison, str(history_path))
         print(f"\n  Training history saved (generation {generation})")
@@ -2455,85 +2006,17 @@ def print_training_history(history_path: str = "nnue_history.json"):
 
 
 # =============================================================================
-# Testing and Benchmarking
-# =============================================================================
-
-def quick_test():
-    """Quick test of NNUE implementation."""
-    print("Testing NNUE...")
-
-    model = TonnesjakkNNUE()
-    print(f"Model parameters: {model.num_parameters:,}")
-
-    # Test with empty board
-    empty_board = [[0] * 6 for _ in range(6)]
-    x = board_to_tensor(empty_board).unsqueeze(0)
-    score = model(x).item()
-    print(f"Empty board score: {score:.4f} (expected: ~0)")
-
-    # Test with some pieces
-    board = [[0] * 6 for _ in range(6)]
-    board[5][2] = 1   # White barrel
-    board[0][3] = -1  # Black barrel
-    x = board_to_tensor(board).unsqueeze(0)
-    score = model(x).item()
-    print(f"Board with pieces: {score:.4f}")
-
-    print("Test OK!")
-
-
-def benchmark():
-    """Benchmark data generation and training speed."""
-    print("Benchmarking...")
-
-    generator = DataGenerator()
-
-    # Benchmark game generation
-    print("\n1. Game generation speed:")
-    for depth in [4, 6, 8]:
-        start = time.time()
-        for _ in range(10):
-            generator.play_game(depth=depth, random_opening_moves=4)
-        elapsed = time.time() - start
-        print(f"  Depth {depth}: {10/elapsed:.1f} games/sec")
-
-    # Benchmark training
-    print("\n2. Training speed (1000 positions):")
-    X = torch.randn(1000, INPUT_SIZE)
-    y = torch.randn(1000, 1)
-
-    for arch in [(64, 32), (128, 32), (64, 16)]:
-        model = TonnesjakkNNUE(arch[0], arch[1])
-        optimizer = optim.Adam(model.parameters())
-        criterion = nn.MSELoss()
-
-        start = time.time()
-        for _ in range(10):
-            optimizer.zero_grad()
-            loss = criterion(model(X), y)
-            loss.backward()
-            optimizer.step()
-        elapsed = time.time() - start
-
-        print(f"  144->{arch[0]}->{arch[1]}->1: {10/elapsed:.1f} epochs/sec "
-              f"({model.num_parameters:,} params)")
-
-    print("\nBenchmark complete!")
-
-
-# =============================================================================
 # CLI
 # =============================================================================
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Train NNUE for Tonnesjakk",
+        description="Train HalfPail NNUE for Tonnesjakk",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python -m tonnesjakk.nnue                    # Default training (10K games)
-  python -m tonnesjakk.nnue --load-data data.npz --epochs 100  # Reuse positions
-  python -m tonnesjakk.nnue --load-data data.npz --no-relational  # Train without relational features
+  python -m tonnesjakk.nnue --load-data data.bin --epochs 50   # Train on existing data
+  python -m tonnesjakk.nnue --games 10000 --save-data data.bin  # Generate training data
   python -m tonnesjakk.nnue --use-nnue nnue_weights.json  # Self-improvement loop
   python -m tonnesjakk.nnue --compare a.json b.json --depth 6  # Equal-depth comparison
   python -m tonnesjakk.nnue --compare-timed 500 a.json b.json  # Equal-time comparison (500ms/move)
@@ -2546,9 +2029,9 @@ Examples:
                         help="Search depth for self-play (default: 6)")
     parser.add_argument("--random-moves", type=int, default=4,
                         help="Random opening moves (default: 4)")
-    parser.add_argument("--arch", type=int, nargs=2, default=[64, 32],
+    parser.add_argument("--arch", type=int, nargs=2, default=[128, 32],
                         metavar=("H1", "H2"),
-                        help="Hidden layer sizes (default: 64 32)")
+                        help="Hidden layer sizes (default: 128 32)")
     parser.add_argument("--epochs", type=int, default=200,
                         help="Training epochs (default: 200)")
     parser.add_argument("--batch-size", type=int, default=4096,
@@ -2562,11 +2045,9 @@ Examples:
     parser.add_argument("--use-nnue", type=str, default=None,
                         help="Use existing NNUE weights for self-play (self-improvement loop)")
     parser.add_argument("--save-data", type=str, default=None,
-                        help="Save generated positions to .npz file for reuse")
+                        help="Save generated positions to file for reuse")
     parser.add_argument("--load-data", type=str, default=None,
-                        help="Load positions from .npz file instead of generating")
-    parser.add_argument("--no-search-scores", action="store_true",
-                        help="Use game outcomes instead of search scores for labels")
+                        help="Load positions from file instead of generating")
     parser.add_argument("--no-augment", action="store_true",
                         help="Disable horizontal flip data augmentation")
     parser.add_argument("--no-compare", action="store_true",
@@ -2583,55 +2064,25 @@ Examples:
                         help="Number of parallel worker processes (default: 1)")
     parser.add_argument("--history", action="store_true",
                         help="Show training history and exit")
-    parser.add_argument("--no-relational", action="store_true",
-                        help="Train without relational features (144 inputs instead of 147)")
-    parser.add_argument("--rescale-labels", type=float, default=None,
-                        help="Multiply labels by this factor (e.g. 10 to fix /10000 -> /1000 normalization)")
     parser.add_argument("--lambda", type=float, default=None, dest="lambda_blend",
                         help="Lambda blend: mix search scores and game outcomes (0.85 = 85%% eval + 15%% outcome)")
-    parser.add_argument("--quantize", type=str, nargs=2, metavar=("INPUT", "OUTPUT"),
-                        help="Quantize f32 weights to int16: --quantize input.json output_q.json")
     parser.add_argument("--compare", type=str, nargs=2, metavar=("NNUE_A", "NNUE_B"),
                         help="Compare two NNUE versions (use 'heuristic' for no NNUE)")
     parser.add_argument("--compare-timed", type=str, nargs=3, metavar=("MS", "NNUE_A", "NNUE_B"),
                         help="Equal-time comparison: MS per move (use 'heuristic' for no NNUE)")
     parser.add_argument("--halfpail", action="store_true",
-                        help="Use HalfPail dual-perspective sparse feature architecture")
+                        help="Use HalfPail architecture (default, kept for backward compatibility)")
     parser.add_argument("--resume-from", type=str, default=None,
                         help="Resume training from a saved .pt model file")
     parser.add_argument("--num-workers", type=int, default=0,
-                        help="DataLoader workers for HalfPail training (0=main process, 4+ recommended)")
-    parser.add_argument("--test", action="store_true",
-                        help="Run quick test")
+                        help="DataLoader workers for training (0=main process, 4+ recommended)")
     parser.add_argument("--test-halfpail", action="store_true",
                         help="Run HalfPail decoding round-trip test")
-    parser.add_argument("--benchmark", action="store_true",
-                        help="Run benchmark")
 
     args = parser.parse_args()
 
     if args.test_halfpail:
         test_halfpail_decoding(1000)
-    elif args.test:
-        quick_test()
-    elif args.quantize:
-        input_path, output_path = args.quantize
-        # Load f32 weights from JSON and recreate PyTorch model
-        with open(input_path, 'r') as f:
-            data = json.load(f)
-        input_size = len(data['weights']['fc1_weight'][0])
-        model = TonnesjakkNNUE(data['hidden1'], data['hidden2'], input_size=input_size)
-        state_dict = {}
-        state_dict['net.0.weight'] = torch.tensor(data['weights']['fc1_weight'])
-        state_dict['net.0.bias'] = torch.tensor(data['weights']['fc1_bias'])
-        state_dict['net.2.weight'] = torch.tensor(data['weights']['fc2_weight'])
-        state_dict['net.2.bias'] = torch.tensor(data['weights']['fc2_bias'])
-        state_dict['net.4.weight'] = torch.tensor(data['weights']['fc3_weight'])
-        state_dict['net.4.bias'] = torch.tensor(data['weights']['fc3_bias'])
-        model.load_state_dict(state_dict)
-        export_quantized_json(model, output_path)
-    elif args.benchmark:
-        benchmark()
     elif args.history:
         print_training_history(str(Path(args.output) / "nnue_history.json"))
     elif args.compare_timed:
@@ -2668,7 +2119,6 @@ Examples:
             epochs=args.epochs,
             output_dir=args.output,
             use_nnue=args.use_nnue,
-            use_search_scores=not args.no_search_scores,
             augment=not args.no_augment,
             compare=not args.no_compare,
             compare_games=args.compare_games,
@@ -2678,13 +2128,10 @@ Examples:
             save_every=args.save_every,
             generate_only=args.generate_only,
             workers=args.workers,
-            no_relational=args.no_relational,
             batch_size=args.batch_size,
-            rescale_labels=args.rescale_labels,
             lambda_blend=args.lambda_blend,
             loss_fn=args.loss,
             learning_rate=args.lr,
-            halfpail=args.halfpail,
             num_workers=args.num_workers,
             resume_from=args.resume_from,
         )
