@@ -525,12 +525,30 @@
         </div>
 
         <div class="option-group">
+            <label>AI-motor:</label>
+            <select id="engine-select" onchange="onEngineTypeChange()">
+                <option value="heuristic" selected>Heuristikk (alpha-beta)</option>
+                <option value="alphazero">AlphaZero (MCTS + nettverk)</option>
+            </select>
+        </div>
+
+        <div class="option-group" id="depth-group">
             <label>AI-vanskelighetsgrad:</label>
             <select id="depth-select">
                 <option value="3">Lett (dybde 3)</option>
                 <option value="5">Medium (dybde 5)</option>
                 <option value="6" selected>Vanskelig (dybde 6)</option>
                 <option value="7">Ekspert (dybde 7)</option>
+            </select>
+        </div>
+
+        <div class="option-group" id="simulations-group" style="display:none;">
+            <label>MCTS simuleringer:</label>
+            <select id="simulations-select">
+                <option value="100">100 (rask)</option>
+                <option value="200">200</option>
+                <option value="400" selected>400 (standard)</option>
+                <option value="800">800 (sterk)</option>
             </select>
         </div>
 
@@ -717,10 +735,21 @@
             return res.json();
         }
 
+        // Toggle engine-specific options
+        function onEngineTypeChange() {
+            const engineType = document.getElementById('engine-select').value;
+            document.getElementById('depth-group').style.display =
+                engineType === 'heuristic' ? '' : 'none';
+            document.getElementById('simulations-group').style.display =
+                engineType === 'alphazero' ? '' : 'none';
+        }
+
         // Start new game
         async function startGame() {
             playerColor = document.getElementById('color-select').value;
             const depth = parseInt(document.getElementById('depth-select').value);
+            const engineType = document.getElementById('engine-select').value;
+            const simulations = parseInt(document.getElementById('simulations-select').value);
 
             document.getElementById('start-screen').style.display = 'none';
             document.getElementById('game-container').style.display = 'flex';
@@ -731,10 +760,15 @@
             document.getElementById('legend-pail').innerHTML = PIECE_SVG[2];
 
             try {
-                const data = await api('/api/new-game', 'POST', {
+                const body = {
                     player_color: playerColor,
-                    ai_depth: depth
-                });
+                    ai_depth: depth,
+                    engine_type: engineType,
+                };
+                if (engineType === 'alphazero') {
+                    body.mcts_simulations = simulations;
+                }
+                const data = await api('/api/new-game', 'POST', body);
 
                 gameId = data.game_id;
                 gameState = data.state;

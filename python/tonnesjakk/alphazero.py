@@ -32,7 +32,7 @@ import torch.nn.functional as F
 
 from tonnesjakk import Board, Engine
 from tonnesjakk._core import MCTSEngine as _RustMCTSEngine, POLICY_SIZE as _RUST_POLICY_SIZE
-from tonnesjakk.mcts import MCTSNode, _is_white, _is_white_winner, _safe_str, elo_with_ci
+from tonnesjakk.utils import is_white as _is_white, is_white_winner as _is_white_winner, safe_str as _safe_str, elo_with_ci
 
 SCORE_SCALING = 600.0  # tanh(score/600) normalization, matches NNUE training
 
@@ -44,6 +44,44 @@ SCORE_SCALING = 600.0  # tanh(score/600) normalization, matches NNUE training
 POLICY_SIZE = 37 * 36  # 1332: from_idx (0-36) x to_idx (0-35)
 BOARD_PLANES = 6       # 4 piece planes + current player + bias
 BOARD_SIZE = 6
+
+
+# Device detection — imported from utils
+from tonnesjakk.utils import get_device  # noqa: E402
+
+
+# ---------------------------------------------------------------------------
+# Board symmetry augmentation (#8)
+# ---------------------------------------------------------------------------
+
+MIRROR_COL = [5, 4, 3, 2, 1, 0]
+
+
+def _mirror_sq(sq: int) -> int:
+    """Mirror a square index (0-35) or off-board (36) left-right."""
+    if sq == 36:
+        return 36
+    row, col = sq // 6, sq % 6
+    return row * 6 + MIRROR_COL[col]
+
+
+# Build policy mirror mapping once at module load
+_POLICY_MIRROR = np.zeros(POLICY_SIZE, dtype=np.int64)
+for _from_idx in range(37):
+    for _to_idx in range(36):
+        _old_idx = _from_idx * 36 + _to_idx
+        _new_idx = _mirror_sq(_from_idx) * 36 + _mirror_sq(_to_idx)
+        _POLICY_MIRROR[_old_idx] = _new_idx
+
+
+def mirror_planes(planes: np.ndarray) -> np.ndarray:
+    """Mirror board planes left-right. Input shape: (6, 6, 6) or (N, 6, 6, 6)."""
+    return np.ascontiguousarray(planes[..., ::-1])
+
+
+def mirror_policy(policy: np.ndarray) -> np.ndarray:
+    """Mirror a policy vector using precomputed mapping. Shape: (1332,) or (N, 1332)."""
+    return policy[..., _POLICY_MIRROR]
 
 
 # ---------------------------------------------------------------------------
@@ -286,6 +324,7 @@ class NetworkMCTS:
         batch_size: int = 8,
         dirichlet_alpha: float = 0.5,
         dirichlet_epsilon: float = 0.25,
+        device: torch.device = None,
     ):
         self.network = network
         self.simulations = simulations
@@ -293,6 +332,7 @@ class NetworkMCTS:
         self.batch_size = batch_size
         self.dirichlet_alpha = dirichlet_alpha
         self.dirichlet_epsilon = dirichlet_epsilon
+        self.device = device or torch.device("cpu")
         self._engine = _RustMCTSEngine(simulations, c_puct)
         self._batch_eval_fn = self._make_batch_eval_fn()
 
@@ -302,13 +342,14 @@ class NetworkMCTS:
         Accepts a list of plane vectors (one per leaf), returns batched results.
         """
         net = self.network
+        device = self.device
 
         def batch_eval_fn(batch_planes: list) -> tuple:
             # batch_planes: list of N lists of 216 floats
-            tensor = torch.tensor(batch_planes, dtype=torch.float32)  # (N, 216)
+            tensor = torch.tensor(batch_planes, dtype=torch.float32, device=device)
             with torch.no_grad():
                 policy_logits, values = net(tensor)
-            return policy_logits.tolist(), values.tolist()
+            return policy_logits.cpu().tolist(), values.cpu().tolist()
 
         return batch_eval_fn
 
@@ -568,9 +609,13 @@ class AlphaZeroTrainer:
         train_window: int = 20000,
         network_type: str = "resnet",
         num_blocks: int = 5,
+        policy_weight: float = 1.0,
+        device: str = "auto",
     ):
         self.network_type = network_type
+        self.device = get_device(device)
         self.network = make_network(network_type, hidden=hidden, num_blocks=num_blocks)
+        self.network.to(self.device)
         self.simulations = simulations
         self.c_puct = c_puct
         self.lr = lr
@@ -580,11 +625,21 @@ class AlphaZeroTrainer:
         self.temperature = temperature
         self.buffer_max = buffer_max
         self.train_window = train_window
+        self.policy_weight = policy_weight
 
         self.optimizer = torch.optim.Adam(self.network.parameters(), lr=lr, weight_decay=1e-4)
+        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            self.optimizer, T_max=100, eta_min=lr * 0.01
+        )
         self.replay_buffer: List[Tuple[np.ndarray, np.ndarray, float]] = []
 
-        print(f"AlphaZero network: {self.network.num_parameters:,} parameters")
+        print(f"AlphaZero network: {self.network.num_parameters:,} parameters ({self.device})")
+
+    def set_lr_schedule(self, total_steps: int):
+        """Update LR schedule T_max for known total iteration count."""
+        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            self.optimizer, T_max=max(1, total_steps), eta_min=self.lr * 0.01
+        )
 
     def run(
         self,
@@ -625,6 +680,7 @@ class AlphaZeroTrainer:
                 self.network,
                 simulations=self.simulations,
                 c_puct=self.c_puct,
+                device=self.device,
             )
 
             new_examples = []
@@ -679,16 +735,20 @@ class AlphaZeroTrainer:
             train_start = time.time()
             self.network.train()
             policy_loss, value_loss = self._train_epoch()
+            self.scheduler.step()
             train_time = time.time() - train_start
 
+            current_lr = self.optimizer.param_groups[0]["lr"]
             if verbose:
                 h_str = f" ({n_heuristic}h+{n_network}n)" if n_heuristic > 0 else ""
+                pw_str = f" pw={self.policy_weight:.1f}" if self.policy_weight != 1.0 else ""
                 print(
                     f"Iter {iteration:3d}/{iterations} | "
                     f"games: {self.games_per_iter}{h_str} "
                     f"(W:{results['white']} B:{results['black']} D:{results['draw']}) | "
                     f"buf: {len(self.replay_buffer):,} (train {min(len(self.replay_buffer), self.train_window):,}) | "
-                    f"loss: p={policy_loss:.4f} v={value_loss:.4f} | "
+                    f"loss: p={policy_loss:.4f} v={value_loss:.4f}{pw_str} | "
+                    f"lr={current_lr:.6f} | "
                     f"time: {selfplay_time:.0f}s play + {train_time:.0f}s train",
                     flush=True,
                 )
@@ -760,9 +820,9 @@ class AlphaZeroTrainer:
         policies = np.array([self.replay_buffer[i][1] for i in indices])
         values = np.array([self.replay_buffer[i][2] for i in indices], dtype=np.float32)
 
-        boards_t = torch.tensor(boards)
-        policies_t = torch.tensor(policies)
-        values_t = torch.tensor(values)
+        boards_t = torch.tensor(boards, device=self.device)
+        policies_t = torch.tensor(policies, device=self.device)
+        values_t = torch.tensor(values, device=self.device)
 
         dataset_size = len(indices)
         total_policy_loss = 0.0
@@ -771,7 +831,7 @@ class AlphaZeroTrainer:
 
         for epoch in range(self.training_epochs):
             # Shuffle
-            perm = torch.randperm(dataset_size)
+            perm = torch.randperm(dataset_size, device=self.device)
             boards_t = boards_t[perm]
             policies_t = policies_t[perm]
             values_t = values_t[perm]
@@ -780,6 +840,15 @@ class AlphaZeroTrainer:
                 batch_boards = boards_t[i:i+self.batch_size]
                 batch_policies = policies_t[i:i+self.batch_size]
                 batch_values = values_t[i:i+self.batch_size]
+
+                # Symmetry augmentation: mirror 50% of examples (#8)
+                mirror_mask = torch.rand(batch_boards.size(0), device=self.device) < 0.5
+                if mirror_mask.any():
+                    # Mirror planes: flip last dimension (cols)
+                    batch_boards[mirror_mask] = batch_boards[mirror_mask].flip(-1)
+                    # Mirror policy using precomputed mapping
+                    mirror_idx = torch.tensor(_POLICY_MIRROR, dtype=torch.long, device=self.device)
+                    batch_policies[mirror_mask] = batch_policies[mirror_mask][:, mirror_idx]
 
                 # Forward
                 policy_logits, value_pred = self.network(batch_boards)
@@ -792,8 +861,8 @@ class AlphaZeroTrainer:
                 # Value loss: MSE
                 value_loss = F.mse_loss(value_pred, batch_values)
 
-                # Combined loss
-                loss = policy_loss + value_loss
+                # Combined loss with policy weight (#6)
+                loss = self.policy_weight * policy_loss + value_loss
 
                 self.optimizer.zero_grad()
                 loss.backward()
@@ -819,6 +888,7 @@ class AlphaZeroTrainer:
             self.network,
             simulations=self.simulations,
             c_puct=self.c_puct,
+            device=self.device,
         )
         rust_engine = _RustMCTSEngine(self.simulations, self.c_puct)
         result = rust_engine.play_eval_match(
@@ -838,6 +908,7 @@ class AlphaZeroTrainer:
         torch.save({
             "model_state_dict": self.network.state_dict(),
             "optimizer_state_dict": self.optimizer.state_dict(),
+            "scheduler_state_dict": self.scheduler.state_dict(),
             "buffer_size": len(self.replay_buffer),
             "network_type": self.network_type,
         }, path)
@@ -851,7 +922,7 @@ class AlphaZeroTrainer:
 
     def load(self, path: str, load_buffer: bool = True):
         """Load model checkpoint + optionally replay buffer."""
-        checkpoint = torch.load(path, map_location="cpu", weights_only=True)
+        checkpoint = torch.load(path, map_location=self.device, weights_only=True)
         # Check network type matches
         saved_type = checkpoint.get("network_type", "mlp")
         if saved_type != self.network_type:
@@ -861,6 +932,8 @@ class AlphaZeroTrainer:
             self.network.load_state_dict(checkpoint["model_state_dict"])
             if "optimizer_state_dict" in checkpoint:
                 self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+            if "scheduler_state_dict" in checkpoint:
+                self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
         # Load replay buffer if available
         buf_path = Path(str(path) + ".buffer.npz")
         if load_buffer and buf_path.exists():
@@ -964,6 +1037,10 @@ Examples:
                         help="Network architecture (default: resnet)")
     parser.add_argument("--num-blocks", type=int, default=5,
                         help="Residual blocks for resnet (default: 5)")
+    parser.add_argument("--policy-weight", type=float, default=1.0,
+                        help="Policy loss weight (default: 1.0)")
+    parser.add_argument("--device", type=str, default="auto",
+                        help="Device: auto, cpu, cuda, mps (default: auto)")
 
     # Evaluation
     parser.add_argument("--eval-every", type=int, default=5,
@@ -997,6 +1074,7 @@ Examples:
             c_puct=args.c_puct,
             network_type=args.network,
             num_blocks=args.num_blocks,
+            device=args.device,
         )
         trainer.load(args.evaluate)
         elo, elo_lo, elo_hi, w, d, l = trainer._evaluate(
@@ -1023,7 +1101,9 @@ Examples:
         print(f"  Iterations: {args.iterations}")
         print(f"  Games/iter: {args.games_per_iter}")
         print(f"  Simulations: {args.simulations}")
-        print(f"  LR: {args.lr}")
+        print(f"  LR: {args.lr} (cosine annealing)")
+        print(f"  Policy weight: {args.policy_weight}")
+        print(f"  Device: {trainer.device}")
         print(f"  Eval every: {args.eval_every} iters (depth {args.eval_depth})")
         print(f"  Save dir: {args.save_dir}")
         print()
@@ -1040,6 +1120,8 @@ Examples:
             buffer_max=args.buffer_max,
             network_type=args.network,
             num_blocks=args.num_blocks,
+            policy_weight=args.policy_weight,
+            device=args.device,
         )
 
         if args.resume:

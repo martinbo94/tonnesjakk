@@ -14,11 +14,30 @@ from typing import Optional
 
 # Importer fra installert pakke (via pip install)
 from tonnesjakk import Board, Engine, Player, Position, Move
+from tonnesjakk._core import MCTSEngine
 
 app = FastAPI(title="Tonnesjakk")
 
 # Game state (enkel in-memory lagring)
 games: dict[str, dict] = {}
+
+
+def _load_alphazero_eval(model_path: str):
+    """Load an AlphaZero model and return an eval function for MCTS."""
+    from tonnesjakk.alphazero import make_network
+    import torch
+    checkpoint = torch.load(model_path, map_location="cpu", weights_only=True)
+    net = make_network(checkpoint.get("network_type", "resnet"))
+    net.load_state_dict(checkpoint["model_state_dict"])
+    net.eval()
+
+    def eval_fn(batch_planes):
+        tensor = torch.tensor(batch_planes, dtype=torch.float32)
+        with torch.no_grad():
+            policy, value = net(tensor)
+        return policy.tolist(), value.tolist()
+
+    return eval_fn
 
 
 class MoveRequest(BaseModel):
@@ -34,6 +53,9 @@ class MoveRequest(BaseModel):
 class NewGameRequest(BaseModel):
     player_color: str = "white"  # "white" eller "black"
     ai_depth: int = 6
+    engine_type: str = "heuristic"   # "heuristic" | "alphazero"
+    model_path: Optional[str] = None  # for AlphaZero
+    mcts_simulations: int = 400       # for AlphaZero only
 
 
 def board_to_dict(board: Board) -> dict:
@@ -93,16 +115,38 @@ def new_game(req: NewGameRequest):
     board = Board()
     engine = Engine()
 
-    games[game_id] = {
+    game_data = {
         "board": board,
         "engine": engine,
         "player_color": req.player_color,
         "ai_depth": req.ai_depth,
+        "engine_type": req.engine_type,
     }
+
+    # Set up AlphaZero if requested
+    if req.engine_type == "alphazero":
+        model_path = req.model_path
+        if not model_path:
+            # Default model path
+            model_path = str(Path(__file__).resolve().parent.parent / "nnue_halfpail" / "nnue_model.pt")
+        try:
+            eval_fn = _load_alphazero_eval(model_path)
+            mcts_engine = MCTSEngine(req.mcts_simulations, 1.4)
+            game_data["eval_fn"] = eval_fn
+            game_data["mcts_engine"] = mcts_engine
+            game_data["mcts_simulations"] = req.mcts_simulations
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Failed to load AlphaZero model: {e}")
+
+    games[game_id] = game_data
+
+    engine_label = req.engine_type
+    if req.engine_type == "alphazero":
+        engine_label += f" ({req.mcts_simulations} sims)"
 
     print(f"\n{'#'*50}")
     print(f"# NYTT SPILL: {game_id}")
-    print(f"# Spiller: {req.player_color}, AI dybde: {req.ai_depth}")
+    print(f"# Spiller: {req.player_color}, Engine: {engine_label}, Dybde: {req.ai_depth}")
     print(f"{'#'*50}\n")
 
     result = {
@@ -114,12 +158,11 @@ def new_game(req: NewGameRequest):
 
     # Hvis spilleren er svart, la AI gjore forste trekk
     if req.player_color == "black":
-        ai_result = engine.search(board, req.ai_depth)
-        if ai_result.best_move:
-            board.make_move(ai_result.best_move)
+        ai_move_result = _do_ai_move(game_data)
+        if ai_move_result:
             result["state"] = board_to_dict(board)
             result["valid_moves"] = get_valid_moves(board)
-            result["ai_move"] = move_to_dict(ai_result.best_move)
+            result["ai_move"] = ai_move_result["ai_move"]
 
     return result
 
@@ -221,6 +264,79 @@ def make_move(req: MoveRequest):
     }
 
 
+def _do_ai_move(game: dict) -> Optional[dict]:
+    """Execute AI move for the given game. Returns move info dict or None."""
+    import time
+    board = game["board"]
+    engine_type = game.get("engine_type", "heuristic")
+
+    if board.check_winner() is not None:
+        return None
+
+    start_time = time.time()
+
+    if engine_type == "alphazero" and "eval_fn" in game:
+        # AlphaZero: use MCTS with neural network
+        mcts_engine = game["mcts_engine"]
+        eval_fn = game["eval_fn"]
+        mcts_result = mcts_engine.search_network_batched(board, eval_fn, 8)
+        elapsed = time.time() - start_time
+
+        if mcts_result.best_move:
+            move = mcts_result.best_move
+            move_str = _format_move(move)
+            score_cp = int(mcts_result.root_value * 1000)
+
+            print(f"\n{'='*50}")
+            print(f"info alphazero sims={game.get('mcts_simulations', 400)} value={mcts_result.root_value:.3f} time {int(elapsed*1000)}ms")
+            print(f"bestmove {move_str}")
+            print(f"{'='*50}\n")
+
+            board.make_move(move)
+            return {
+                "ai_move": move_to_dict(move),
+                "ai_score": score_cp,
+            }
+    else:
+        # Heuristic: use alpha-beta search
+        engine = game["engine"]
+        ai_result = engine.search(board, game["ai_depth"])
+        elapsed = time.time() - start_time
+
+        if ai_result.best_move:
+            move = ai_result.best_move
+            move_str = _format_move(move)
+            score_str = f"+{ai_result.score}" if ai_result.score >= 0 else str(ai_result.score)
+            nps = int(ai_result.nodes_searched / elapsed) if elapsed > 0 else 0
+
+            print(f"\n{'='*50}")
+            print(f"info depth {ai_result.depth} score cp {ai_result.score} nodes {ai_result.nodes_searched} nps {nps} time {int(elapsed*1000)}ms")
+            print(f"info string eval: {score_str} ({'hvit' if ai_result.score > 0 else 'svart' if ai_result.score < 0 else 'likt'} leder)")
+            print(f"info string tt_hits: {ai_result.tt_hits} cutoffs: {ai_result.cutoffs}")
+            print(f"bestmove {move_str}")
+            print(f"{'='*50}\n")
+
+            board.make_move(move)
+            return {
+                "ai_move": move_to_dict(move),
+                "ai_score": ai_result.score,
+                "ai_nodes": ai_result.nodes_searched,
+            }
+
+    return None
+
+
+def _format_move(move) -> str:
+    """Format a Move object as a human-readable string."""
+    if move.is_barrel_placement:
+        move_str = f"place ({move.barrel_to.row},{move.barrel_to.col})"
+    else:
+        move_str = f"({move.barrel_from.row},{move.barrel_from.col})->({move.barrel_to.row},{move.barrel_to.col})"
+    if move.place_pail:
+        move_str = f"pail@({move.place_pail.row},{move.place_pail.col}) " + move_str
+    return move_str
+
+
 @app.post("/api/ai-move/{game_id}")
 def ai_move(game_id: str):
     """La AI gjore sitt trekk."""
@@ -229,7 +345,6 @@ def ai_move(game_id: str):
 
     game = games[game_id]
     board = game["board"]
-    engine = game["engine"]
 
     # Sjekk om spillet er over
     if board.check_winner() is not None:
@@ -240,12 +355,6 @@ def ai_move(game_id: str):
             "ai_score": None,
         }
 
-    # AI-trekk
-    import time
-    start_time = time.time()
-    ai_result = engine.search(board, game["ai_depth"])
-    elapsed = time.time() - start_time
-
     result = {
         "state": board_to_dict(board),
         "valid_moves": get_valid_moves(board),
@@ -253,31 +362,9 @@ def ai_move(game_id: str):
         "ai_score": None,
     }
 
-    if ai_result.best_move:
-        result["ai_move"] = move_to_dict(ai_result.best_move)
-        result["ai_score"] = ai_result.score
-        result["ai_nodes"] = ai_result.nodes_searched
-
-        # Stockfish-lignende output
-        score_str = f"+{ai_result.score}" if ai_result.score >= 0 else str(ai_result.score)
-        nps = int(ai_result.nodes_searched / elapsed) if elapsed > 0 else 0
-
-        move = ai_result.best_move
-        if move.is_barrel_placement:
-            move_str = f"place ({move.barrel_to.row},{move.barrel_to.col})"
-        else:
-            move_str = f"({move.barrel_from.row},{move.barrel_from.col})->({move.barrel_to.row},{move.barrel_to.col})"
-        if move.place_pail:
-            move_str = f"pail@({move.place_pail.row},{move.place_pail.col}) " + move_str
-
-        print(f"\n{'='*50}")
-        print(f"info depth {ai_result.depth} score cp {ai_result.score} nodes {ai_result.nodes_searched} nps {nps} time {int(elapsed*1000)}ms")
-        print(f"info string eval: {score_str} ({'hvit' if ai_result.score > 0 else 'svart' if ai_result.score < 0 else 'likt'} leder)")
-        print(f"info string tt_hits: {ai_result.tt_hits} cutoffs: {ai_result.cutoffs}")
-        print(f"bestmove {move_str}")
-        print(f"{'='*50}\n")
-
-        board.make_move(ai_result.best_move)
+    ai_result = _do_ai_move(game)
+    if ai_result:
+        result.update(ai_result)
         result["state"] = board_to_dict(board)
         result["valid_moves"] = get_valid_moves(board)
 
