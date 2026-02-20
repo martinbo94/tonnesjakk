@@ -3,6 +3,8 @@ use std::fmt;
 use std::time::{Duration, Instant};
 use wide::{f32x8, i16x16, i32x8};
 
+pub mod mcts;
+
 // ============================================================================
 // KONSTANTER
 // ============================================================================
@@ -1135,6 +1137,19 @@ impl Move {
         };
         format!("Move({}{})", pail_str, barrel_str)
     }
+
+    /// Policy index for AlphaZero training: encodes from/to as index in [0, 1331].
+    fn policy_index(&self) -> u16 {
+        let to_idx = (self.barrel_to.row * 6 + self.barrel_to.col) as u16;
+        let from_idx = if self.is_barrel_placement {
+            36u16
+        } else if let Some(pos) = &self.barrel_from {
+            (pos.row * 6 + pos.col) as u16
+        } else {
+            36u16
+        };
+        from_idx * 36 + to_idx
+    }
 }
 
 /// Spillbrettet og tilstanden
@@ -1487,6 +1502,18 @@ impl Board {
     /// Vis brettet som ASCII
     fn display(&self) -> String {
         format!("{}", self)
+    }
+
+    /// Create a copy of the board (needed for MCTS tree search)
+    fn copy(&self) -> Board {
+        self.clone()
+    }
+
+    /// Convert board to 6x6x6 float planes for neural network input.
+    /// Planes: [white_barrels, black_barrels, white_pail, black_pail, current_player, ones]
+    fn to_planes(&self) -> Vec<f32> {
+        let bb = BitBoard::from_board(self);
+        mcts::bb_to_planes(&bb)
     }
 }
 
@@ -1962,6 +1989,14 @@ impl Engine {
             quiesce_nodes: self.inner.quiesce_nodes,
             depth: depth_reached,
         }
+    }
+
+    /// Expose heuristic evaluation to Python (for MCTS leaf evaluation).
+    /// Always uses the hand-crafted heuristic, not NNUE.
+    /// Returns score from White's perspective.
+    fn evaluate_position(&self, board: &Board) -> i32 {
+        let bb = BitBoard::from_board(board);
+        self.inner.evaluate_heuristic(&bb)
     }
 }
 
@@ -4169,7 +4204,7 @@ impl BitBoardEngine {
     }
 
     /// Heuristisk evaluering (fallback når NNUE ikke er lastet)
-    fn evaluate_heuristic(&self, bb: &BitBoard) -> i32 {
+    pub fn evaluate_heuristic(&self, bb: &BitBoard) -> i32 {
         if let Some(winner) = bb.check_winner() {
             return match winner {
                 Player::White => 100_000,
@@ -5454,6 +5489,9 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(decode_halfpail_batch, m)?)?;
     m.add("BOARD_SIZE", BOARD_SIZE)?;
     m.add("BARRELS_PER_PLAYER", BARRELS_PER_PLAYER)?;
+    m.add("POLICY_SIZE", mcts::POLICY_SIZE)?;
+    m.add_class::<mcts::MCTSEngine>()?;
+    m.add_class::<mcts::MCTSSearchResult>()?;
     Ok(())
 }
 

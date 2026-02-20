@@ -144,6 +144,56 @@ Raw search scores (integers like +350, -1200) are mapped to the [-1, +1] range u
 **4. Training loop:**
 Standard supervised learning: MSE loss, Adam optimizer, ~50 epochs. The trained PyTorch model is exported as a JSON weight file that the Rust engine loads at runtime.
 
+## AlphaZero Training
+
+In addition to the supervised NNUE approach, the project includes a full [AlphaZero](https://en.wikipedia.org/wiki/AlphaZero)-style training pipeline that learns entirely from self-play using Monte Carlo Tree Search (MCTS) guided by a neural network.
+
+### How It Works
+
+1. **Self-play:** The current network plays games against itself using MCTS. At each move, the tree search runs hundreds of simulations, using the network's policy head to guide exploration and value head to evaluate leaf positions.
+2. **Data collection:** Each position records the board state, the MCTS visit count distribution (policy target), and the eventual game outcome (value target).
+3. **Training:** The network is trained on the accumulated replay buffer to better predict the MCTS policy and game outcomes.
+4. **Repeat:** The improved network produces better self-play data, creating a positive feedback loop.
+
+### Network Architecture
+
+Two architectures are available:
+
+**ResNet CNN (default)** — 5 residual blocks with 128 channels (~1.6M parameters). Uses 3x3 convolutions over a 6-plane spatial board representation (white barrels, black barrels, white pail, black pail, current player, bias). The convolutional structure learns spatial patterns like jump sequences and pail blocking.
+
+**MLP** — 3-layer fully-connected network with 128 hidden units (~240K parameters). Faster inference but no spatial inductive bias.
+
+Both have separate policy (1332 move logits) and value (scalar in [-1, +1]) heads.
+
+### MCTS Engine (Rust)
+
+The MCTS implementation (`src/mcts.rs`) runs in Rust for speed:
+
+- **Arena-based tree:** Nodes stored in a `Vec<MCTSNode>` with `u32` indices for cache-friendly traversal
+- **PUCT selection:** AlphaZero's variant of UCB, using network policy priors to focus exploration
+- **Batched evaluation with virtual loss:** Multiple MCTS leaves are selected per batch using virtual loss to force path diversity, then evaluated in a single network forward pass. This reduces Python-Rust round-trips by ~16x, achieving a 4.4x wall-clock speedup for ResNet inference
+- **Heuristic mode:** Can also use the hand-crafted heuristic for leaf evaluation (~700K simulations/sec), used for bootstrapping early in training
+
+### Training Features
+
+- **Heuristic game seeding:** Early training mixes fast heuristic MCTS games (which produce decisive wins/losses) with network self-play to bootstrap the value head
+- **Decaying heuristic ratio:** Linearly shifts from imitation to pure self-play over the training run
+- **Windowed training:** Samples a fixed window of examples per iteration (biased 75% toward recent data), keeping training time constant as the replay buffer grows
+- **Chunked training:** Training runs in resumable chunks with checkpoint + replay buffer persistence
+
+### Running AlphaZero Training
+
+```bash
+# Full training run (ResNet, ~8h overnight)
+python scripts/train_alphazero.py --chunks 60 --network resnet --simulations 200 --save-dir alphazero_resnet
+
+# Quick test run (MLP, ~30min)
+python scripts/train_alphazero.py --chunks 5 --network mlp --simulations 200 --save-dir az_test
+
+# Evaluate a trained model
+python -m tonnesjakk.alphazero --evaluate alphazero_resnet/best_model.pt --games 50 --opponent-depth 5
+```
+
 ## Architecture Overview
 
 ```
@@ -154,24 +204,25 @@ Standard supervised learning: MSE loss, Adam optimizer, ~50 epochs. The trained 
 └───────────────────────┬──────────────────────────────┘
                         │ PyO3
 ┌───────────────────────▼──────────────────────────────┐
-│                Rust Core (src/lib.rs)                 │
+│                Rust Core (src/lib.rs + mcts.rs)       │
 │                                                      │
 │  Board / BitBoard        Game state & move generation│
 │  BitBoardEngine          Search (PVS, LMR, TT, ...) │
 │  IncrementalNNUE         SIMD neural net evaluation  │
+│  MCTSEngine              MCTS with batched NN eval   │
 │  Engine                  Python-facing API wrapper   │
 └──────────────────────────────────────────────────────┘
                         │ PyO3
 ┌───────────────────────▼──────────────────────────────┐
-│           Python (python/tonnesjakk/nnue.py)         │
+│           Python Training Pipelines                   │
 │                                                      │
-│  Self-play data generation (parallel workers)        │
-│  PyTorch NNUE training & export to JSON              │
-│  Model comparison & benchmarking                     │
+│  nnue.py       Supervised NNUE training & export     │
+│  alphazero.py  AlphaZero self-play + ResNet/MLP      │
+│  mcts.py       Python MCTS (reference implementation)│
 └──────────────────────────────────────────────────────┘
 ```
 
-The Rust engine (~5,750 lines) handles everything performance-critical: board representation, move generation, search, and NNUE inference. Python handles the training pipeline and the web UI. The two communicate through [PyO3](https://pyo3.rs/) bindings, compiled with [maturin](https://github.com/PyO3/maturin).
+The Rust engine (~6,000 lines) handles everything performance-critical: board representation, move generation, search, NNUE inference, and MCTS tree search. Python handles neural network training and the web UI. The two communicate through [PyO3](https://pyo3.rs/) bindings, compiled with [maturin](https://github.com/PyO3/maturin).
 
 ### Board Representation: Bitboards
 
@@ -254,21 +305,25 @@ The HalfPail NNUE is currently undertrained (5 epochs). Poor eval quality causes
 
 ```
 tonnesjakk/
-├── src/lib.rs                    # Rust engine (~5,750 lines)
+├── src/
+│   ├── lib.rs                    # Rust engine (~6,000 lines)
+│   └── mcts.rs                   # Rust MCTS with batched NN eval
 ├── python/tonnesjakk/
-│   ├── nnue.py                   # NNUE training pipeline (PyTorch)
+│   ├── nnue.py                   # Supervised NNUE training pipeline
+│   ├── alphazero.py              # AlphaZero self-play training
+│   ├── mcts.py                   # Python MCTS (reference impl)
 │   └── __init__.py               # Python package init
 ├── web/
 │   ├── server.py                 # FastAPI web backend
 │   └── index.html                # Browser-based game UI
 ├── scripts/
+│   ├── train_alphazero.py        # Chunked AlphaZero training runner
 │   ├── test_model.py             # Time-based model comparison
 │   ├── bench_engine.py           # Engine speed benchmarks
 │   └── diagnose_wdl.py           # Per-move NNUE diagnostic tool
 ├── nnue_halfpail/
 │   ├── nnue_weights.json         # Trained HalfPail NNUE weights
 │   └── nnue_model.pt             # PyTorch model checkpoint
-├── training_consolidator_d9.bin  # 70M positions at depth 9
 ├── ENGINE_IMPROVEMENTS.md        # Search optimization roadmap
 ├── CLAUDE.md                     # AI assistant project context
 ├── Cargo.toml                    # Rust dependencies
