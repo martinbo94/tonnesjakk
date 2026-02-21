@@ -79,24 +79,22 @@
             display: flex;
             align-items: center;
             justify-content: center;
-            font-weight: bold;
-            font-size: 12px;
             cursor: pointer;
             transition: all 0.2s;
+            filter: drop-shadow(0 2px 3px rgba(0,0,0,0.3));
+        }
+
+        .off-board-barrel svg {
+            width: 100%;
+            height: 100%;
         }
 
         .off-board-barrel:hover {
             transform: scale(1.1);
         }
 
-        .off-board-barrel svg {
-            width: 100%;
-            height: 100%;
-            filter: drop-shadow(0 2px 3px rgba(0,0,0,0.3));
-        }
-
         .off-board-barrel.selected {
-            box-shadow: 0 0 0 3px #4CAF50;
+            filter: drop-shadow(0 0 4px #4CAF50);
         }
 
         #board {
@@ -679,8 +677,8 @@
             <div id="legend" style="margin-top:15px; padding:10px; background:#1a1a2e; border-radius:5px;">
                 <h4 style="color:#64b5f6; margin-bottom:8px;">Brikker:</h4>
                 <div style="display:flex; gap:15px; align-items:center; font-size:0.9em;">
-                    <span style="display:inline-flex; align-items:center; gap:4px;"><span id="legend-barrel" style="display:inline-block;width:24px;height:24px;"></span> Tonne</span>
-                    <span style="display:inline-flex; align-items:center; gap:4px;"><span id="legend-pail" style="display:inline-block;width:24px;height:24px;"></span> Melkespann</span>
+                    <span style="display:inline-flex;align-items:center;gap:4px;"><span style="display:inline-block;width:22px;height:22px;" id="legend-barrel"></span> Tonne</span>
+                    <span style="display:inline-flex;align-items:center;gap:4px;"><span style="display:inline-block;width:22px;height:22px;" id="legend-pail"></span> Melkespann</span>
                 </div>
             </div>
 
@@ -710,100 +708,35 @@
     <script>
         const BOARD_SIZE = 6;
 
-        // Shared SVG gradient definitions — injected once into the page
-        // Using a hidden SVG block avoids duplicate gradient IDs when multiple pieces exist
-        document.addEventListener('DOMContentLoaded', () => {
-            const defs = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
-            defs.setAttribute('width', '0');
-            defs.setAttribute('height', '0');
-            defs.setAttribute('style', 'position:absolute');
-            defs.innerHTML = `<defs>
-                <linearGradient id="wbBody" x1="0" y1="0" x2="1" y2="0.8">
-                    <stop offset="0%" stop-color="#f5edd5"/>
-                    <stop offset="50%" stop-color="#e8d9b0"/>
-                    <stop offset="100%" stop-color="#d4c28a"/>
-                </linearGradient>
-                <linearGradient id="wbTop" x1="0" y1="0" x2="0" y2="1">
-                    <stop offset="0%" stop-color="#f9f3e0"/>
-                    <stop offset="100%" stop-color="#e8d9b0"/>
-                </linearGradient>
-                <linearGradient id="bbBody" x1="0" y1="0" x2="1" y2="0.8">
-                    <stop offset="0%" stop-color="#4a4040"/>
-                    <stop offset="50%" stop-color="#3a3030"/>
-                    <stop offset="100%" stop-color="#2a2020"/>
-                </linearGradient>
-                <linearGradient id="bbTop" x1="0" y1="0" x2="0" y2="1">
-                    <stop offset="0%" stop-color="#5a4a4a"/>
-                    <stop offset="100%" stop-color="#3a3030"/>
-                </linearGradient>
-                <linearGradient id="wpBody" x1="0" y1="0" x2="1" y2="0.8">
-                    <stop offset="0%" stop-color="#fff8e1"/>
-                    <stop offset="50%" stop-color="#ffecb3"/>
-                    <stop offset="100%" stop-color="#ffe082"/>
-                </linearGradient>
-                <linearGradient id="bpBody" x1="0" y1="0" x2="1" y2="0.8">
-                    <stop offset="0%" stop-color="#455a64"/>
-                    <stop offset="50%" stop-color="#37474f"/>
-                    <stop offset="100%" stop-color="#263238"/>
-                </linearGradient>
-            </defs>`;
-            document.body.prepend(defs);
-
-            // Populate legend icons
-            document.getElementById('legend-barrel').innerHTML = PIECE_SVG.whiteBarrel;
-            document.getElementById('legend-pail').innerHTML = PIECE_SVG.whitePail;
-        });
-
-        // SVG piece definitions (gradients reference shared <defs> above)
+        // SVG piece icons (flat 2D style)
         const PIECE_SVG = {
-            whiteBarrel: `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 50 50">
-                <path d="M14,10 Q10,25 14,40 L36,40 Q40,25 36,10 Z" fill="url(#wbBody)" stroke="#8b7355" stroke-width="1.5"/>
-                <ellipse cx="25" cy="10" rx="11" ry="4.5" fill="url(#wbTop)" stroke="#8b7355" stroke-width="1.5"/>
-                <ellipse cx="25" cy="40" rx="11" ry="4.5" fill="#d4c28a" stroke="#8b7355" stroke-width="1.5"/>
-                <path d="M13,18 L37,18" stroke="#7a6840" stroke-width="2.2" fill="none" stroke-linecap="round"/>
-                <path d="M13,32 L37,32" stroke="#7a6840" stroke-width="2.2" fill="none" stroke-linecap="round"/>
-                <line x1="20" y1="10" x2="19" y2="40" stroke="#c9b88a" stroke-width="0.6" opacity="0.5"/>
-                <line x1="30" y1="10" x2="31" y2="40" stroke="#c9b88a" stroke-width="0.6" opacity="0.5"/>
-                <line x1="25" y1="10" x2="25" y2="40" stroke="#c9b88a" stroke-width="0.6" opacity="0.4"/>
+            // White barrel (tønne) - light wood with metal bands
+            1: `<svg viewBox="0 0 44 44">
+                <path d="M13,6 C8,6 6,13 6,22 C6,31 8,38 13,38 L31,38 C36,38 38,31 38,22 C38,13 36,6 31,6 Z" fill="#DEB760" stroke="#8B6914" stroke-width="1.5"/>
+                <ellipse cx="22" cy="7" rx="9" ry="3.5" fill="#EBD888" stroke="#8B6914" stroke-width="1"/>
+                <rect x="6" y="16" width="32" height="2.5" rx="1" fill="#A8A8A8"/>
+                <rect x="6" y="27" width="32" height="2.5" rx="1" fill="#A8A8A8"/>
             </svg>`,
-
-            blackBarrel: `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 50 50">
-                <path d="M14,10 Q10,25 14,40 L36,40 Q40,25 36,10 Z" fill="url(#bbBody)" stroke="#1a1010" stroke-width="1.5"/>
-                <ellipse cx="25" cy="10" rx="11" ry="4.5" fill="url(#bbTop)" stroke="#1a1010" stroke-width="1.5"/>
-                <ellipse cx="25" cy="40" rx="11" ry="4.5" fill="#2a2020" stroke="#1a1010" stroke-width="1.5"/>
-                <path d="M13,18 L37,18" stroke="#6a5a50" stroke-width="2.2" fill="none" stroke-linecap="round"/>
-                <path d="M13,32 L37,32" stroke="#6a5a50" stroke-width="2.2" fill="none" stroke-linecap="round"/>
-                <line x1="20" y1="10" x2="19" y2="40" stroke="#4a3a30" stroke-width="0.6" opacity="0.5"/>
-                <line x1="30" y1="10" x2="31" y2="40" stroke="#4a3a30" stroke-width="0.6" opacity="0.5"/>
-                <line x1="25" y1="10" x2="25" y2="40" stroke="#4a3a30" stroke-width="0.6" opacity="0.4"/>
+            // Black barrel (tønne) - dark wood with metal bands
+            '-1': `<svg viewBox="0 0 44 44">
+                <path d="M13,6 C8,6 6,13 6,22 C6,31 8,38 13,38 L31,38 C36,38 38,31 38,22 C38,13 36,6 31,6 Z" fill="#5A3D20" stroke="#2E1E0C" stroke-width="1.5"/>
+                <ellipse cx="22" cy="7" rx="9" ry="3.5" fill="#6B4E30" stroke="#2E1E0C" stroke-width="1"/>
+                <rect x="6" y="16" width="32" height="2.5" rx="1" fill="#808080"/>
+                <rect x="6" y="27" width="32" height="2.5" rx="1" fill="#808080"/>
             </svg>`,
-
-            whitePail: `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 50 50">
-                <path d="M31,8 A10,4 0 0,0 19,8" fill="none" stroke="#b8860b" stroke-width="2" stroke-linecap="round"/>
-                <path d="M15,14 L12,42 L38,42 L35,14 Z" fill="url(#wpBody)" stroke="#b8860b" stroke-width="1.5"/>
-                <ellipse cx="25" cy="14" rx="10" ry="3.5" fill="#fff8e1" stroke="#b8860b" stroke-width="1.5"/>
-                <path d="M14,22 L36,22" stroke="#daa520" stroke-width="2" fill="none" stroke-linecap="round"/>
-                <path d="M13,36 L37,36" stroke="#daa520" stroke-width="1.5" fill="none" stroke-linecap="round"/>
+            // White pail (melkespann) - light bucket with handle
+            2: `<svg viewBox="0 0 44 44">
+                <path d="M11,14 L9,38 L35,38 L33,14 Z" fill="#FFE8A0" stroke="#DAA520" stroke-width="1.5" stroke-linejoin="round"/>
+                <rect x="10" y="12" width="24" height="3.5" rx="1.5" fill="#F0D870" stroke="#DAA520" stroke-width="1"/>
+                <path d="M15,13 C15,3 29,3 29,13" fill="none" stroke="#C89020" stroke-width="2.5" stroke-linecap="round"/>
             </svg>`,
-
-            blackPail: `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 50 50">
-                <path d="M31,8 A10,4 0 0,0 19,8" fill="none" stroke="#90a4ae" stroke-width="2" stroke-linecap="round"/>
-                <path d="M15,14 L12,42 L38,42 L35,14 Z" fill="url(#bpBody)" stroke="#546e7a" stroke-width="1.5"/>
-                <ellipse cx="25" cy="14" rx="10" ry="3.5" fill="#455a64" stroke="#546e7a" stroke-width="1.5"/>
-                <path d="M14,22 L36,22" stroke="#78909c" stroke-width="2" fill="none" stroke-linecap="round"/>
-                <path d="M13,36 L37,36" stroke="#78909c" stroke-width="1.5" fill="none" stroke-linecap="round"/>
+            // Black pail (melkespann) - dark bucket with handle
+            '-2': `<svg viewBox="0 0 44 44">
+                <path d="M11,14 L9,38 L35,38 L33,14 Z" fill="#37474F" stroke="#1A2A30" stroke-width="1.5" stroke-linejoin="round"/>
+                <rect x="10" y="12" width="24" height="3.5" rx="1.5" fill="#455A64" stroke="#1A2A30" stroke-width="1"/>
+                <path d="M15,13 C15,3 29,3 29,13" fill="none" stroke="#607D8B" stroke-width="2.5" stroke-linecap="round"/>
             </svg>`,
         };
-
-        function getPieceSvg(val) {
-            switch (val) {
-                case 1: return PIECE_SVG.whiteBarrel;
-                case -1: return PIECE_SVG.blackBarrel;
-                case 2: return PIECE_SVG.whitePail;
-                case -2: return PIECE_SVG.blackPail;
-                default: return '';
-            }
-        }
 
         // Game state
         let gameId = null;
@@ -816,6 +749,7 @@
         let selectedBarrelAction = null;  // { type: 'place' } or { type: 'move', from: [r,c] }
         let phase = 'select-pail';  // 'select-pail', 'select-barrel', 'select-dest'
         let skipPail = false;  // User chose to skip pail placement this turn
+        let pendingMove = null;  // { from: [r,c], currentPos: [r,c], pieceVal: 1|-1 } during animation/optimistic render
 
         let lastAiMove = null;
 
@@ -858,6 +792,10 @@
             document.getElementById('game-container').style.display = 'flex';
             document.getElementById('your-color').textContent = playerColor === 'white' ? 'Hvit' : 'Svart';
 
+            // Populate legend with SVG icons
+            document.getElementById('legend-barrel').innerHTML = PIECE_SVG[1];
+            document.getElementById('legend-pail').innerHTML = PIECE_SVG[2];
+
             try {
                 const body = {
                     player_color: playerColor,
@@ -892,10 +830,12 @@
         }
 
         // Reset selection state
-        // If pail not yet placed, must select pail position first (engine requires it)
+        // If pail hasn't been placed yet, the engine requires pail placement
+        // as part of every move — so we must start in 'select-pail' phase.
         function resetSelection() {
             selectedPailDest = null;
             selectedBarrelAction = null;
+            pendingMove = null;
             if (canPlacePail()) {
                 phase = 'select-pail';
                 skipPail = false;
@@ -924,7 +864,12 @@
         }
 
         // Cancel pail placement and go back to barrel selection
+        // Only allowed if pail placement is truly optional (pail already placed)
         function cancelPailPlacement() {
+            if (canPlacePail()) {
+                // Pail placement is mandatory — can't skip
+                return;
+            }
             skipPail = true;
             selectedPailDest = null;
             phase = 'select-barrel';
@@ -1027,10 +972,9 @@
                 }
             } else if (gameState.current_player === playerColor) {
                 if (phase === 'select-pail') {
-                    setStatus('Klikk pa en rute for a plassere melkespannet', 'your-turn');
-                    // Show cancel button
-                    document.getElementById('pail-action').innerHTML =
-                        '<button class="skip-pail" onclick="cancelPailPlacement()">Avbryt</button>';
+                    setStatus('Plasser melkespannet forst (klikk pa en rute)', 'your-turn');
+                    // No cancel button — pail placement is mandatory
+                    document.getElementById('pail-action').innerHTML = '';
                 } else if (phase === 'select-barrel') {
                     const barrelsOff = playerColor === 'white'
                         ? gameState.white_barrels_off_board
@@ -1106,7 +1050,7 @@
                     if (val !== 0) {
                         const piece = document.createElement('div');
                         piece.className = 'piece';
-                        piece.innerHTML = getPieceSvg(val);
+                        piece.innerHTML = PIECE_SVG[val] || '';
                         cell.appendChild(piece);
                     }
 
@@ -1343,6 +1287,7 @@
                     .forEach(m => destinations.push(m.barrel_to));
             } else {
                 const from = selectedBarrelAction.from;
+                const destSet = new Set();
                 validMoves
                     .filter(m =>
                         pailMatch(m) &&
@@ -1351,10 +1296,58 @@
                         m.barrel_from[0] === from[0] &&
                         m.barrel_from[1] === from[1]
                     )
-                    .forEach(m => destinations.push(m.barrel_to));
+                    .forEach(m => {
+                        const key = `${m.barrel_to[0]},${m.barrel_to[1]}`;
+                        if (!destSet.has(key)) {
+                            destSet.add(key);
+                            destinations.push(m.barrel_to);
+                        }
+                    });
             }
 
             return destinations;
+        }
+
+        // Find the matching move for a barrel move to a specific destination
+        function findMoveForDest(from, dest) {
+            const pailMatch = m => {
+                if (skipPail || !canPlacePail()) return m.place_pail === null;
+                if (selectedPailDest === null) return true;
+                if (m.place_pail === null) return false;
+                return m.place_pail[0] === selectedPailDest[0] && m.place_pail[1] === selectedPailDest[1];
+            };
+            return validMoves.find(m =>
+                pailMatch(m) &&
+                !m.is_barrel_placement &&
+                m.barrel_from &&
+                m.barrel_from[0] === from[0] && m.barrel_from[1] === from[1] &&
+                m.barrel_to[0] === dest[0] && m.barrel_to[1] === dest[1]
+            );
+        }
+
+        // Animate a barrel hopping through its path, then send the move
+        function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+        async function animateAndSendMove(placePail, from, dest) {
+            const move = findMoveForDest(from, dest);
+            const pieceVal = playerColor === 'white' ? 1 : -1;
+
+            if (move && move.barrel_path.length > 1) {
+                // Multi-jump: animate through each intermediate hop
+                for (const pos of move.barrel_path) {
+                    pendingMove = { from, currentPos: pos, pieceVal };
+                    renderBoard();
+                    await sleep(200);
+                }
+            } else {
+                // Single step or single jump: show at destination instantly
+                pendingMove = { from, currentPos: dest, pieceVal };
+                renderBoard();
+            }
+
+            // Send the move (pendingMove stays set as optimistic render until server responds)
+            setStatus('AI tenker...', 'ai-turn');
+            await makeMove(placePail, false, from, dest);
         }
 
         // Handle off-board barrel click (to select for placement)
@@ -1373,6 +1366,7 @@
 
         // Handle cell click on board
         function onCellClick(row, col) {
+            if (pendingMove) return;  // Ignore clicks during animation
             if (gameState.winner) return;
             if (gameState.current_player !== playerColor) return;
 
@@ -1428,8 +1422,13 @@
                 if (isValidDest) {
                     const placePail = (skipPail || !canPlacePail()) ? null : selectedPailDest;
                     const isPlacement = selectedBarrelAction.type === 'place';
-                    const from = isPlacement ? null : selectedBarrelAction.from;
-                    makeMove(placePail, isPlacement, from, [row, col]);
+
+                    if (isPlacement) {
+                        makeMove(placePail, true, null, [row, col]);
+                    } else {
+                        // Animate through jump path, then send
+                        animateAndSendMove(placePail, selectedBarrelAction.from, [row, col]);
+                    }
                 }
                 // Click a different movable barrel → switch to it
                 else {
@@ -1511,14 +1510,28 @@
                         }
                     }
 
-                    // Add piece
-                    const val = gameState.board[row][col];
+                    // Add piece — during animation, show barrel at current hop position
+                    let val = gameState.board[row][col];
+                    if (pendingMove) {
+                        // Hide barrel at its original position
+                        if (pendingMove.from[0] === row && pendingMove.from[1] === col) {
+                            val = 0;
+                        }
+                        // Show barrel at its current animated position
+                        if (pendingMove.currentPos[0] === row && pendingMove.currentPos[1] === col && val === 0) {
+                            val = pendingMove.pieceVal;
+                        }
+                    }
                     if (val !== 0) {
                         const piece = document.createElement('div');
                         piece.className = 'piece';
-                        piece.innerHTML = getPieceSvg(val);
-                        piece.title = val === 1 ? 'Hvit tonne' : val === -1 ? 'Svart tonne'
-                            : val === 2 ? 'Hvit melkespann' : 'Svart melkespann';
+                        piece.innerHTML = PIECE_SVG[val] || '';
+
+                        if (val === 1) piece.title = 'Hvit tonne';
+                        else if (val === -1) piece.title = 'Svart tonne';
+                        else if (val === 2) piece.title = 'Hvit melkespann';
+                        else if (val === -2) piece.title = 'Svart melkespann';
+
                         cell.appendChild(piece);
                     }
 
@@ -1546,7 +1559,7 @@
             for (let i = 0; i < whiteOff; i++) {
                 const barrel = document.createElement('div');
                 barrel.className = 'off-board-barrel white';
-                barrel.innerHTML = PIECE_SVG.whiteBarrel;
+                barrel.innerHTML = PIECE_SVG[1];
                 barrel.title = 'Klikk for a plassere denne tonnen';
 
                 // If it's player's turn and they can place
@@ -1569,7 +1582,7 @@
             for (let i = 0; i < blackOff; i++) {
                 const barrel = document.createElement('div');
                 barrel.className = 'off-board-barrel black';
-                barrel.innerHTML = PIECE_SVG.blackBarrel;
+                barrel.innerHTML = PIECE_SVG['-1'];
                 barrel.title = 'Klikk for a plassere denne tonnen';
 
                 // If it's player's turn and they can place
@@ -1802,7 +1815,7 @@
                         const piece = document.createElement('div');
                         piece.className = 'piece';
 
-                        piece.innerHTML = getPieceSvg(val);
+                        piece.innerHTML = PIECE_SVG[val] || '';
                         cell.appendChild(piece);
                     }
 
