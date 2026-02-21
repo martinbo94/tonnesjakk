@@ -4,6 +4,8 @@ FastAPI backend for spillet
 """
 
 import json
+import threading
+import time
 
 from fastapi import FastAPI, HTTPException
 from fastapi.staticfiles import StaticFiles
@@ -121,6 +123,7 @@ def new_game(req: NewGameRequest):
         "player_color": req.player_color,
         "ai_depth": req.ai_depth,
         "engine_type": req.engine_type,
+        "board_history": [board.copy()],
     }
 
     # Set up AlphaZero if requested
@@ -255,6 +258,7 @@ def make_move(req: MoveRequest):
     print(f"\n>>> Spiller: {move_str}")
 
     board.make_move(matching_move)
+    game["board_history"].append(board.copy())
 
     # Returner state etter spillerens trekk (IKKE AI-trekk enna)
     return {
@@ -293,6 +297,8 @@ def _do_ai_move(game: dict) -> Optional[dict]:
             print(f"{'='*50}\n")
 
             board.make_move(move)
+            if "board_history" in game:
+                game["board_history"].append(board.copy())
             return {
                 "ai_move": move_to_dict(move),
                 "ai_score": score_cp,
@@ -317,6 +323,8 @@ def _do_ai_move(game: dict) -> Optional[dict]:
             print(f"{'='*50}\n")
 
             board.make_move(move)
+            if "board_history" in game:
+                game["board_history"].append(board.copy())
             return {
                 "ai_move": move_to_dict(move),
                 "ai_score": ai_result.score,
@@ -369,6 +377,171 @@ def ai_move(game_id: str):
         result["valid_moves"] = get_valid_moves(board)
 
     return result
+
+
+# ---------------------------------------------------------------------------
+# Post-game engine analysis
+# ---------------------------------------------------------------------------
+
+
+class AnalyzeRequest(BaseModel):
+    position_index: int
+
+
+def _get_analysis_state(game: dict) -> dict:
+    """Get or create analysis state for a game."""
+    if "analysis_state" not in game:
+        game["analysis_state"] = {
+            "analysis_id": 0,
+            "position_index": -1,
+            "current_result": None,
+            "is_running": False,
+            "lock": threading.Lock(),
+        }
+    return game["analysis_state"]
+
+
+def _run_analysis(game_id: str, position_index: int, analysis_id: int):
+    """Background worker: iterative deepening analysis for a position."""
+    game = games.get(game_id)
+    if not game:
+        print(f"[analysis] game {game_id} not found")
+        return
+
+    astate = game["analysis_state"]
+    board_history = game.get("board_history", [])
+    if position_index < 0 or position_index >= len(board_history):
+        print(f"[analysis] position {position_index} out of range (history has {len(board_history)})")
+        with astate["lock"]:
+            astate["is_running"] = False
+        return
+
+    board = board_history[position_index].copy()
+
+    # Create or reuse a dedicated analysis engine (separate TT from game engine)
+    if "analysis_engine" not in game:
+        game["analysis_engine"] = Engine()
+    engine = game["analysis_engine"]
+    engine.clear_tt()
+
+    print(f"[analysis] start pos={position_index} id={analysis_id}")
+
+    try:
+        for depth in range(1, 100):
+            # Check cancellation before search
+            with astate["lock"]:
+                if astate["analysis_id"] != analysis_id:
+                    print(f"[analysis] cancelled before depth {depth}")
+                    return
+
+            result = engine.search(board, depth)
+
+            # Check cancellation after search and store result
+            with astate["lock"]:
+                if astate["analysis_id"] != analysis_id:
+                    print(f"[analysis] cancelled after depth {depth}")
+                    return
+
+                best_move = None
+                if result.best_move:
+                    best_move = move_to_dict(result.best_move)
+
+                astate["current_result"] = {
+                    "best_move": best_move,
+                    "score": result.score,
+                    "depth": result.depth,
+                    "nodes": result.nodes_searched,
+                }
+
+            print(f"[analysis] depth {depth} score {result.score} nodes {result.nodes_searched}")
+
+            # Yield GIL so HTTP poll handlers can process between depths
+            time.sleep(0.01)
+
+            # Stop early if winning sequence found
+            if abs(result.score) > 90000:
+                print(f"[analysis] early stop: score {result.score}")
+                break
+    except Exception as e:
+        print(f"[analysis] ERROR: {e}")
+    finally:
+        # Always mark as not running when thread exits
+        with astate["lock"]:
+            if astate["analysis_id"] == analysis_id:
+                astate["is_running"] = False
+        print(f"[analysis] done pos={position_index} id={analysis_id}")
+
+
+def _analysis_response(astate: dict) -> dict:
+    """Build the JSON response from analysis state."""
+    with astate["lock"]:
+        return {
+            "analysis_id": astate["analysis_id"],
+            "position_index": astate["position_index"],
+            "result": astate["current_result"],
+            "is_running": astate["is_running"],
+        }
+
+
+@app.post("/api/analyze/{game_id}")
+def start_analysis(game_id: str, req: AnalyzeRequest):
+    """Start or restart engine analysis for a position."""
+    if game_id not in games:
+        raise HTTPException(status_code=404, detail="Spill ikke funnet")
+
+    game = games[game_id]
+    astate = _get_analysis_state(game)
+
+    start_new = False
+    new_id = 0
+    with astate["lock"]:
+        # If already analyzing the same position, just return current results
+        if astate["position_index"] == req.position_index and astate["is_running"]:
+            pass
+        else:
+            # Cancel previous analysis and start new one
+            astate["analysis_id"] += 1
+            astate["position_index"] = req.position_index
+            astate["current_result"] = None
+            astate["is_running"] = True
+            new_id = astate["analysis_id"]
+            start_new = True
+
+    if start_new:
+        thread = threading.Thread(
+            target=_run_analysis,
+            args=(game_id, req.position_index, new_id),
+            daemon=True,
+        )
+        thread.start()
+
+    return _analysis_response(astate)
+
+
+@app.get("/api/analyze/{game_id}")
+def poll_analysis(game_id: str):
+    """Poll current analysis results (no side effects)."""
+    if game_id not in games:
+        raise HTTPException(status_code=404, detail="Spill ikke funnet")
+
+    game = games[game_id]
+    astate = _get_analysis_state(game)
+    return _analysis_response(astate)
+
+
+@app.post("/api/analyze/{game_id}/stop")
+def stop_analysis(game_id: str):
+    """Cancel running analysis."""
+    if game_id not in games:
+        raise HTTPException(status_code=404, detail="Spill ikke funnet")
+
+    game = games[game_id]
+    astate = _get_analysis_state(game)
+    with astate["lock"]:
+        astate["analysis_id"] += 1
+        astate["is_running"] = False
+
+    return {"ok": True}
 
 
 # ---------------------------------------------------------------------------
