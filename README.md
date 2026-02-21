@@ -268,6 +268,8 @@ python server.py
 # Open http://localhost:8000
 ```
 
+After a game ends, use the arrow keys to step through moves. Each position is automatically analyzed by the engine with progressive deepening — the best move is highlighted on the board (cyan from-square, green to-square) and the eval/depth/nodes update live.
+
 ### Use from Python
 
 ```python
@@ -326,8 +328,8 @@ tonnesjakk/
 │   ├── utils.py                  # Shared helpers (ELO, device, etc.)
 │   └── __init__.py               # Python package init
 ├── web/
-│   ├── server.py                 # FastAPI web backend (heuristic + AlphaZero)
-│   └── index.html                # Browser-based game UI with engine selector
+│   ├── server.py                 # FastAPI web backend + post-game analysis API
+│   └── index.html                # Game UI with post-game engine analysis overlay
 ├── scripts/
 │   ├── train_alphazero.py        # Chunked AlphaZero training runner
 │   ├── test_model.py             # Time-based model comparison

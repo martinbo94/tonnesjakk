@@ -76,7 +76,6 @@
         .off-board-barrel {
             width: 40px;
             height: 40px;
-            border-radius: 50%;
             display: flex;
             align-items: center;
             justify-content: center;
@@ -90,16 +89,10 @@
             transform: scale(1.1);
         }
 
-        .off-board-barrel.white {
-            background: linear-gradient(145deg, #ffffff, #e0e0e0);
-            color: #333;
-            box-shadow: 0 3px 6px rgba(0,0,0,0.3);
-        }
-
-        .off-board-barrel.black {
-            background: linear-gradient(145deg, #444, #222);
-            color: #fff;
-            box-shadow: 0 3px 6px rgba(0,0,0,0.3);
+        .off-board-barrel svg {
+            width: 100%;
+            height: 100%;
+            filter: drop-shadow(0 2px 3px rgba(0,0,0,0.3));
         }
 
         .off-board-barrel.selected {
@@ -163,43 +156,16 @@
         .piece {
             width: 46px;
             height: 46px;
-            border-radius: 50%;
             display: flex;
             align-items: center;
             justify-content: center;
-            font-weight: bold;
-            font-size: 14px;
             transition: transform 0.2s;
+            filter: drop-shadow(0 2px 3px rgba(0,0,0,0.4));
         }
 
-        .piece.white-barrel {
-            background: linear-gradient(145deg, #ffffff, #e0e0e0);
-            color: #333;
-            box-shadow: 0 4px 8px rgba(0,0,0,0.3);
-        }
-
-        .piece.black-barrel {
-            background: linear-gradient(145deg, #444, #222);
-            color: #fff;
-            box-shadow: 0 4px 8px rgba(0,0,0,0.3);
-        }
-
-        .piece.white-pail {
-            background: linear-gradient(145deg, #fff8e1, #ffecb3);
-            color: #333;
-            border: 3px solid #ffc107;
-            width: 40px;
-            height: 40px;
-            font-size: 18px;
-        }
-
-        .piece.black-pail {
-            background: linear-gradient(145deg, #37474f, #263238);
-            color: #fff;
-            border: 3px solid #607d8b;
-            width: 40px;
-            height: 40px;
-            font-size: 18px;
+        .piece svg {
+            width: 100%;
+            height: 100%;
         }
 
         /* Info panel */
@@ -542,6 +508,23 @@
             color: #666;
         }
         .coord-label.top { top: 2px; right: 4px; }
+
+        /* Engine analysis overlay */
+        .cell.analysis-from {
+            box-shadow: inset 0 0 0 3px #00BCD4 !important;
+            background-color: rgba(0, 188, 212, 0.15) !important;
+        }
+        .cell.analysis-to {
+            box-shadow: inset 0 0 0 3px #00E676 !important;
+            background-color: rgba(0, 230, 118, 0.2) !important;
+        }
+        #analysis-info {
+            text-align: center;
+            padding: 8px;
+            font-size: 0.95em;
+            color: #4dd0e1;
+            min-height: 30px;
+        }
     </style>
 </head>
 <body>
@@ -654,6 +637,16 @@
             <div id="white-reserve" class="off-board-barrels bottom">
                 <span class="off-board-label">Hvit reserve:</span>
             </div>
+
+            <!-- Post-game replay controls -->
+            <div id="game-replay-controls" class="replay-controls" style="display: none;">
+                <button onclick="gameReplayFirst()" title="First (Home)">|&lt;</button>
+                <button onclick="gameReplayPrev()" title="Previous (Left arrow)">&lt;</button>
+                <span class="replay-move-label" id="game-replay-label">Move 0 / 0</span>
+                <button onclick="gameReplayNext()" title="Next (Right arrow)">&gt;</button>
+                <button onclick="gameReplayLast()" title="Last (End)">&gt;|</button>
+            </div>
+            <div id="analysis-info"></div>
         </div>
 
         <div id="info-panel">
@@ -686,8 +679,8 @@
             <div id="legend" style="margin-top:15px; padding:10px; background:#1a1a2e; border-radius:5px;">
                 <h4 style="color:#64b5f6; margin-bottom:8px;">Brikker:</h4>
                 <div style="display:flex; gap:15px; align-items:center; font-size:0.9em;">
-                    <span><span style="display:inline-block;width:20px;height:20px;background:#fff;border-radius:50%;vertical-align:middle;"></span> Tonne</span>
-                    <span><span style="display:inline-block;width:20px;height:20px;background:#ffecb3;border:2px solid #ffc107;border-radius:50%;vertical-align:middle;"></span> Melkespann</span>
+                    <span style="display:inline-flex; align-items:center; gap:4px;"><span id="legend-barrel" style="display:inline-block;width:24px;height:24px;"></span> Tonne</span>
+                    <span style="display:inline-flex; align-items:center; gap:4px;"><span id="legend-pail" style="display:inline-block;width:24px;height:24px;"></span> Melkespann</span>
                 </div>
             </div>
 
@@ -717,6 +710,101 @@
     <script>
         const BOARD_SIZE = 6;
 
+        // Shared SVG gradient definitions — injected once into the page
+        // Using a hidden SVG block avoids duplicate gradient IDs when multiple pieces exist
+        document.addEventListener('DOMContentLoaded', () => {
+            const defs = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+            defs.setAttribute('width', '0');
+            defs.setAttribute('height', '0');
+            defs.setAttribute('style', 'position:absolute');
+            defs.innerHTML = `<defs>
+                <linearGradient id="wbBody" x1="0" y1="0" x2="1" y2="0.8">
+                    <stop offset="0%" stop-color="#f5edd5"/>
+                    <stop offset="50%" stop-color="#e8d9b0"/>
+                    <stop offset="100%" stop-color="#d4c28a"/>
+                </linearGradient>
+                <linearGradient id="wbTop" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="0%" stop-color="#f9f3e0"/>
+                    <stop offset="100%" stop-color="#e8d9b0"/>
+                </linearGradient>
+                <linearGradient id="bbBody" x1="0" y1="0" x2="1" y2="0.8">
+                    <stop offset="0%" stop-color="#4a4040"/>
+                    <stop offset="50%" stop-color="#3a3030"/>
+                    <stop offset="100%" stop-color="#2a2020"/>
+                </linearGradient>
+                <linearGradient id="bbTop" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="0%" stop-color="#5a4a4a"/>
+                    <stop offset="100%" stop-color="#3a3030"/>
+                </linearGradient>
+                <linearGradient id="wpBody" x1="0" y1="0" x2="1" y2="0.8">
+                    <stop offset="0%" stop-color="#fff8e1"/>
+                    <stop offset="50%" stop-color="#ffecb3"/>
+                    <stop offset="100%" stop-color="#ffe082"/>
+                </linearGradient>
+                <linearGradient id="bpBody" x1="0" y1="0" x2="1" y2="0.8">
+                    <stop offset="0%" stop-color="#455a64"/>
+                    <stop offset="50%" stop-color="#37474f"/>
+                    <stop offset="100%" stop-color="#263238"/>
+                </linearGradient>
+            </defs>`;
+            document.body.prepend(defs);
+
+            // Populate legend icons
+            document.getElementById('legend-barrel').innerHTML = PIECE_SVG.whiteBarrel;
+            document.getElementById('legend-pail').innerHTML = PIECE_SVG.whitePail;
+        });
+
+        // SVG piece definitions (gradients reference shared <defs> above)
+        const PIECE_SVG = {
+            whiteBarrel: `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 50 50">
+                <path d="M14,10 Q10,25 14,40 L36,40 Q40,25 36,10 Z" fill="url(#wbBody)" stroke="#8b7355" stroke-width="1.5"/>
+                <ellipse cx="25" cy="10" rx="11" ry="4.5" fill="url(#wbTop)" stroke="#8b7355" stroke-width="1.5"/>
+                <ellipse cx="25" cy="40" rx="11" ry="4.5" fill="#d4c28a" stroke="#8b7355" stroke-width="1.5"/>
+                <path d="M13,18 L37,18" stroke="#7a6840" stroke-width="2.2" fill="none" stroke-linecap="round"/>
+                <path d="M13,32 L37,32" stroke="#7a6840" stroke-width="2.2" fill="none" stroke-linecap="round"/>
+                <line x1="20" y1="10" x2="19" y2="40" stroke="#c9b88a" stroke-width="0.6" opacity="0.5"/>
+                <line x1="30" y1="10" x2="31" y2="40" stroke="#c9b88a" stroke-width="0.6" opacity="0.5"/>
+                <line x1="25" y1="10" x2="25" y2="40" stroke="#c9b88a" stroke-width="0.6" opacity="0.4"/>
+            </svg>`,
+
+            blackBarrel: `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 50 50">
+                <path d="M14,10 Q10,25 14,40 L36,40 Q40,25 36,10 Z" fill="url(#bbBody)" stroke="#1a1010" stroke-width="1.5"/>
+                <ellipse cx="25" cy="10" rx="11" ry="4.5" fill="url(#bbTop)" stroke="#1a1010" stroke-width="1.5"/>
+                <ellipse cx="25" cy="40" rx="11" ry="4.5" fill="#2a2020" stroke="#1a1010" stroke-width="1.5"/>
+                <path d="M13,18 L37,18" stroke="#6a5a50" stroke-width="2.2" fill="none" stroke-linecap="round"/>
+                <path d="M13,32 L37,32" stroke="#6a5a50" stroke-width="2.2" fill="none" stroke-linecap="round"/>
+                <line x1="20" y1="10" x2="19" y2="40" stroke="#4a3a30" stroke-width="0.6" opacity="0.5"/>
+                <line x1="30" y1="10" x2="31" y2="40" stroke="#4a3a30" stroke-width="0.6" opacity="0.5"/>
+                <line x1="25" y1="10" x2="25" y2="40" stroke="#4a3a30" stroke-width="0.6" opacity="0.4"/>
+            </svg>`,
+
+            whitePail: `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 50 50">
+                <path d="M31,8 A10,4 0 0,0 19,8" fill="none" stroke="#b8860b" stroke-width="2" stroke-linecap="round"/>
+                <path d="M15,14 L12,42 L38,42 L35,14 Z" fill="url(#wpBody)" stroke="#b8860b" stroke-width="1.5"/>
+                <ellipse cx="25" cy="14" rx="10" ry="3.5" fill="#fff8e1" stroke="#b8860b" stroke-width="1.5"/>
+                <path d="M14,22 L36,22" stroke="#daa520" stroke-width="2" fill="none" stroke-linecap="round"/>
+                <path d="M13,36 L37,36" stroke="#daa520" stroke-width="1.5" fill="none" stroke-linecap="round"/>
+            </svg>`,
+
+            blackPail: `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 50 50">
+                <path d="M31,8 A10,4 0 0,0 19,8" fill="none" stroke="#90a4ae" stroke-width="2" stroke-linecap="round"/>
+                <path d="M15,14 L12,42 L38,42 L35,14 Z" fill="url(#bpBody)" stroke="#546e7a" stroke-width="1.5"/>
+                <ellipse cx="25" cy="14" rx="10" ry="3.5" fill="#455a64" stroke="#546e7a" stroke-width="1.5"/>
+                <path d="M14,22 L36,22" stroke="#78909c" stroke-width="2" fill="none" stroke-linecap="round"/>
+                <path d="M13,36 L37,36" stroke="#78909c" stroke-width="1.5" fill="none" stroke-linecap="round"/>
+            </svg>`,
+        };
+
+        function getPieceSvg(val) {
+            switch (val) {
+                case 1: return PIECE_SVG.whiteBarrel;
+                case -1: return PIECE_SVG.blackBarrel;
+                case 2: return PIECE_SVG.whitePail;
+                case -2: return PIECE_SVG.blackPail;
+                default: return '';
+            }
+        }
+
         // Game state
         let gameId = null;
         let gameState = null;
@@ -730,6 +818,16 @@
         let skipPail = false;  // User chose to skip pail placement this turn
 
         let lastAiMove = null;
+
+        // Move history for post-game replay
+        let moveHistory = [];      // Array of { state, move, player } snapshots
+        let historyViewIndex = -1; // -1 = live view, >= 0 = browsing history
+
+        // Engine analysis state
+        let analysisPollingTimer = null;
+        let analysisResult = null;
+        let analysisRunning = false;
+        let analysisGeneration = 0;  // Prevents stale async callbacks
 
         // API calls
         async function api(endpoint, method = 'GET', body = null) {
@@ -775,8 +873,14 @@
                 gameState = data.state;
                 validMoves = data.valid_moves;
 
+                // Record initial state for replay
+                moveHistory = [{ state: JSON.parse(JSON.stringify(data.state)), move: null, player: null }];
+                historyViewIndex = -1;
+
                 if (data.ai_move) {
                     lastAiMove = data.ai_move;
+                    // Record AI's opening move
+                    moveHistory.push({ state: JSON.parse(JSON.stringify(data.state)), move: data.ai_move, player: 'ai' });
                 }
 
                 resetSelection();
@@ -788,12 +892,17 @@
         }
 
         // Reset selection state
-        // Start alltid i 'select-barrel' fasen - melkespann er helt valgfritt
+        // If pail not yet placed, must select pail position first (engine requires it)
         function resetSelection() {
             selectedPailDest = null;
             selectedBarrelAction = null;
-            phase = 'select-barrel';  // Gå rett til tønnevalg
-            skipPail = !canPlacePail();  // Hvis allerede plassert, marker som hoppet over
+            if (canPlacePail()) {
+                phase = 'select-pail';
+                skipPail = false;
+            } else {
+                phase = 'select-barrel';
+                skipPail = true;
+            }
         }
 
         // Check if player can still place pail
@@ -838,6 +947,14 @@
                 // Oppdater brettet med spillerens trekk UMIDDELBART
                 gameState = playerData.state;
                 validMoves = playerData.valid_moves;
+
+                // Record player move for replay
+                moveHistory.push({
+                    state: JSON.parse(JSON.stringify(playerData.state)),
+                    move: { place_pail: placePail, is_barrel_placement: isPlacement, barrel_from: barrelFrom, barrel_to: barrelTo },
+                    player: 'human'
+                });
+
                 resetSelection();
                 renderBoard();
 
@@ -859,6 +976,13 @@
                     lastAiMove = aiData.ai_move;
                     document.getElementById('ai-eval').textContent =
                         (aiData.ai_score > 0 ? '+' : '') + aiData.ai_score;
+
+                    // Record AI move for replay
+                    moveHistory.push({
+                        state: JSON.parse(JSON.stringify(aiData.state)),
+                        move: aiData.ai_move,
+                        player: 'ai'
+                    });
                 }
 
                 renderBoard();
@@ -872,7 +996,7 @@
 
         // Update status display
         function updateStatus() {
-            document.getElementById('move-count').textContent = gameState.move_count;
+            document.getElementById('move-count').textContent = Math.floor(gameState.move_count / 2) + 1;
             document.getElementById('white-score').textContent = gameState.white_scored || 0;
             document.getElementById('black-score').textContent = gameState.black_scored || 0;
 
@@ -882,6 +1006,17 @@
                 pailAction.style.display = 'block';
             } else {
                 pailAction.style.display = 'none';
+            }
+
+            // Show/hide game replay controls
+            const replayCtrl = document.getElementById('game-replay-controls');
+            if (gameState.winner && moveHistory.length > 1) {
+                replayCtrl.style.display = 'flex';
+                historyViewIndex = moveHistory.length - 1;  // Start at final position
+                updateGameReplayLabel();
+                startAnalysis(historyViewIndex);
+            } else {
+                replayCtrl.style.display = 'none';
             }
 
             if (gameState.winner) {
@@ -923,6 +1058,196 @@
             const el = document.getElementById('status');
             el.textContent = text;
             el.className = className;
+        }
+
+        // ---- Post-game replay navigation ----
+
+        function updateGameReplayLabel() {
+            const label = document.getElementById('game-replay-label');
+            const totalPlies = moveHistory.length - 1;  // Exclude initial position
+            const fullMoveCurrent = historyViewIndex === 0 ? 0 : Math.ceil(historyViewIndex / 2);
+            const fullMoveTotal = Math.ceil(totalPlies / 2);
+            label.textContent = `Trekk ${fullMoveCurrent} / ${fullMoveTotal}`;
+        }
+
+        function renderHistoryState() {
+            if (historyViewIndex < 0 || historyViewIndex >= moveHistory.length) return;
+            const snapshot = moveHistory[historyViewIndex];
+            const boardEl = document.getElementById('board');
+            boardEl.innerHTML = '';
+
+            // Get move highlights
+            const move = snapshot.move;
+            let highlightFrom = null, highlightTo = null, highlightPail = null;
+            if (move) {
+                highlightFrom = move.barrel_from;
+                highlightTo = move.barrel_to;
+                highlightPail = move.place_pail;
+            }
+
+            for (let row = 0; row < BOARD_SIZE; row++) {
+                for (let col = 0; col < BOARD_SIZE; col++) {
+                    const cell = document.createElement('div');
+                    cell.className = 'cell ' + ((row + col) % 2 === 0 ? 'light' : 'dark');
+
+                    // Highlight move from/to
+                    if (highlightFrom && highlightFrom[0] === row && highlightFrom[1] === col) {
+                        cell.classList.add('last-move');
+                    }
+                    if (highlightTo && highlightTo[0] === row && highlightTo[1] === col) {
+                        cell.classList.add('last-move');
+                    }
+                    if (highlightPail && highlightPail[0] === row && highlightPail[1] === col) {
+                        cell.classList.add('valid-pail');
+                    }
+
+                    // Add piece
+                    const val = snapshot.state.board[row][col];
+                    if (val !== 0) {
+                        const piece = document.createElement('div');
+                        piece.className = 'piece';
+                        piece.innerHTML = getPieceSvg(val);
+                        cell.appendChild(piece);
+                    }
+
+                    boardEl.appendChild(cell);
+                }
+            }
+
+            // Update scores and move count from snapshot
+            document.getElementById('white-score').textContent = snapshot.state.white_scored || 0;
+            document.getElementById('black-score').textContent = snapshot.state.black_scored || 0;
+            document.getElementById('move-count').textContent = Math.floor(snapshot.state.move_count / 2) + 1;
+            updateGameReplayLabel();
+        }
+
+        function gameReplayNext() {
+            if (historyViewIndex < moveHistory.length - 1) {
+                historyViewIndex++;
+                renderHistoryState();
+                startAnalysis(historyViewIndex);
+            }
+        }
+
+        function gameReplayPrev() {
+            if (historyViewIndex > 0) {
+                historyViewIndex--;
+                renderHistoryState();
+                startAnalysis(historyViewIndex);
+            }
+        }
+
+        function gameReplayFirst() {
+            historyViewIndex = 0;
+            renderHistoryState();
+            startAnalysis(historyViewIndex);
+        }
+
+        function gameReplayLast() {
+            historyViewIndex = moveHistory.length - 1;
+            renderHistoryState();
+            startAnalysis(historyViewIndex);
+        }
+
+        // ---- Engine analysis ----
+
+        function startAnalysis(positionIndex) {
+            // Clear client state only — don't send stop API (start endpoint
+            // handles cancellation; sending stop would race and kill the new analysis)
+            clearAnalysisClient();
+            if (!gameId) return;
+            const gen = ++analysisGeneration;
+            api(`/api/analyze/${gameId}`, 'POST', { position_index: positionIndex })
+                .then(data => {
+                    if (gen !== analysisGeneration) return;  // Stale
+                    analysisResult = data.result;
+                    analysisRunning = data.is_running;
+                    renderAnalysisOverlay();
+                    if (!data.is_running) return;
+                    // Start polling
+                    analysisPollingTimer = setInterval(async () => {
+                        if (gen !== analysisGeneration) {
+                            clearInterval(analysisPollingTimer);
+                            analysisPollingTimer = null;
+                            return;
+                        }
+                        try {
+                            const poll = await api(`/api/analyze/${gameId}`);
+                            if (gen !== analysisGeneration) return;  // Stale
+                            analysisResult = poll.result;
+                            analysisRunning = poll.is_running;
+                            renderAnalysisOverlay();
+                            if (!poll.is_running) {
+                                clearInterval(analysisPollingTimer);
+                                analysisPollingTimer = null;
+                            }
+                        } catch (e) {
+                            clearInterval(analysisPollingTimer);
+                            analysisPollingTimer = null;
+                        }
+                    }, 500);
+                })
+                .catch(() => {});
+        }
+
+        function clearAnalysisClient() {
+            if (analysisPollingTimer) {
+                clearInterval(analysisPollingTimer);
+                analysisPollingTimer = null;
+            }
+            analysisResult = null;
+            analysisRunning = false;
+            const el = document.getElementById('analysis-info');
+            if (el) el.textContent = '';
+            document.querySelectorAll('.analysis-from, .analysis-to').forEach(c => {
+                c.classList.remove('analysis-from', 'analysis-to');
+            });
+        }
+
+        function stopAnalysis() {
+            clearAnalysisClient();
+            analysisGeneration++;  // Invalidate any in-flight callbacks
+            if (gameId) {
+                api(`/api/analyze/${gameId}/stop`, 'POST').catch(() => {});
+            }
+        }
+
+        function renderAnalysisOverlay() {
+            const el = document.getElementById('analysis-info');
+            if (!el) return;
+
+            // Remove old analysis highlights
+            document.querySelectorAll('.analysis-from, .analysis-to').forEach(c => {
+                c.classList.remove('analysis-from', 'analysis-to');
+            });
+
+            if (!analysisResult) {
+                el.innerHTML = analysisRunning ? 'Analyzing...' : '';
+                return;
+            }
+
+            const score = analysisResult.score;
+            const depth = analysisResult.depth;
+            const nodes = analysisResult.nodes;
+            const scoreStr = (score >= 0 ? '+' : '') + (score / 100).toFixed(2);
+            const nodesStr = nodes.toLocaleString();
+            const spinner = analysisRunning ? ' ...' : '';
+
+            el.innerHTML = `Eval: <strong>${scoreStr}</strong> | Depth: ${depth}${spinner} | Nodes: ${nodesStr}`;
+
+            // Highlight best move on the board
+            if (analysisResult.best_move) {
+                const bm = analysisResult.best_move;
+                const boardEl = document.getElementById('board');
+                const cells = boardEl.querySelectorAll('.cell');
+
+                if (bm.barrel_from) {
+                    const fromIdx = bm.barrel_from[0] * BOARD_SIZE + bm.barrel_from[1];
+                    if (cells[fromIdx]) cells[fromIdx].classList.add('analysis-from');
+                }
+                const toIdx = bm.barrel_to[0] * BOARD_SIZE + bm.barrel_to[1];
+                if (cells[toIdx]) cells[toIdx].classList.add('analysis-to');
+            }
         }
 
         // Get valid pail positions (where we can place the pail)
@@ -1086,6 +1411,16 @@
                 }
             }
             else if (phase === 'select-dest') {
+                // Click same barrel again → deselect, back to barrel selection
+                if (selectedBarrelAction && selectedBarrelAction.type === 'move'
+                    && selectedBarrelAction.from[0] === row && selectedBarrelAction.from[1] === col) {
+                    selectedBarrelAction = null;
+                    phase = 'select-barrel';
+                    renderBoard();
+                    updateStatus();
+                    return;
+                }
+
                 // Check if valid destination
                 const validDests = getValidDestinations();
                 const isValidDest = validDests.some(d => d[0] === row && d[1] === col);
@@ -1096,13 +1431,24 @@
                     const from = isPlacement ? null : selectedBarrelAction.from;
                     makeMove(placePail, isPlacement, from, [row, col]);
                 }
-                // Allow re-selecting barrel
+                // Click a different movable barrel → switch to it
                 else {
                     const movableBarrels = getMovableBarrels();
                     const isMovable = movableBarrels.some(b => b[0] === row && b[1] === col);
                     if (isMovable) {
                         selectedBarrelAction = { type: 'move', from: [row, col] };
+                        phase = 'select-dest';
                         renderBoard();
+                        updateStatus();
+                    }
+                    // Click a placement position → switch to placement
+                    else {
+                        const placementPos = getValidPlacementPositions();
+                        const isPlacement = placementPos.some(p => p[0] === row && p[1] === col);
+                        if (isPlacement && canPlaceFromReserve()) {
+                            const placePail = (skipPail || !canPlacePail()) ? null : selectedPailDest;
+                            makeMove(placePail, true, null, [row, col]);
+                        }
                     }
                 }
             }
@@ -1170,25 +1516,9 @@
                     if (val !== 0) {
                         const piece = document.createElement('div');
                         piece.className = 'piece';
-
-                        if (val === 1) {
-                            piece.classList.add('white-barrel');
-                            piece.textContent = '';  // Empty - just use the circle style
-                            piece.title = 'Hvit tonne';
-                        } else if (val === -1) {
-                            piece.classList.add('black-barrel');
-                            piece.textContent = '';
-                            piece.title = 'Svart tonne';
-                        } else if (val === 2) {
-                            piece.classList.add('white-pail');
-                            piece.textContent = 'M';  // Melkespann
-                            piece.title = 'Hvit melkespann - blokkerer hopp';
-                        } else if (val === -2) {
-                            piece.classList.add('black-pail');
-                            piece.textContent = 'M';
-                            piece.title = 'Svart melkespann - blokkerer hopp';
-                        }
-
+                        piece.innerHTML = getPieceSvg(val);
+                        piece.title = val === 1 ? 'Hvit tonne' : val === -1 ? 'Svart tonne'
+                            : val === 2 ? 'Hvit melkespann' : 'Svart melkespann';
                         cell.appendChild(piece);
                     }
 
@@ -1216,7 +1546,7 @@
             for (let i = 0; i < whiteOff; i++) {
                 const barrel = document.createElement('div');
                 barrel.className = 'off-board-barrel white';
-                barrel.textContent = '';  // Empty circle
+                barrel.innerHTML = PIECE_SVG.whiteBarrel;
                 barrel.title = 'Klikk for a plassere denne tonnen';
 
                 // If it's player's turn and they can place
@@ -1239,7 +1569,7 @@
             for (let i = 0; i < blackOff; i++) {
                 const barrel = document.createElement('div');
                 barrel.className = 'off-board-barrel black';
-                barrel.textContent = '';
+                barrel.innerHTML = PIECE_SVG.blackBarrel;
                 barrel.title = 'Klikk for a plassere denne tonnen';
 
                 // If it's player's turn and they can place
@@ -1275,6 +1605,7 @@
 
         // Reset game
         function resetGame() {
+            stopAnalysis();
             document.getElementById('start-screen').style.display = 'block';
             document.getElementById('game-container').style.display = 'none';
             gameId = null;
@@ -1471,18 +1802,7 @@
                         const piece = document.createElement('div');
                         piece.className = 'piece';
 
-                        if (val === 1) {
-                            piece.classList.add('white-barrel');
-                        } else if (val === -1) {
-                            piece.classList.add('black-barrel');
-                        } else if (val === 2) {
-                            piece.classList.add('white-pail');
-                            piece.textContent = 'M';
-                        } else if (val === -2) {
-                            piece.classList.add('black-pail');
-                            piece.textContent = 'M';
-                        }
-
+                        piece.innerHTML = getPieceSvg(val);
                         cell.appendChild(piece);
                     }
 
@@ -1542,7 +1862,29 @@
 
         // Keyboard navigation
         document.addEventListener('keydown', (e) => {
-            // Only handle when replay screen is visible
+            // Game replay (post-game)
+            if (gameState && gameState.winner && moveHistory.length > 1) {
+                switch (e.key) {
+                    case 'ArrowLeft':
+                        e.preventDefault();
+                        gameReplayPrev();
+                        return;
+                    case 'ArrowRight':
+                        e.preventDefault();
+                        gameReplayNext();
+                        return;
+                    case 'Home':
+                        e.preventDefault();
+                        gameReplayFirst();
+                        return;
+                    case 'End':
+                        e.preventDefault();
+                        gameReplayLast();
+                        return;
+                }
+            }
+
+            // Record replay screen
             if (document.getElementById('replay-screen').style.display === 'none') return;
             if (!replayData || replayGameIndex < 0) return;
 
