@@ -1,0 +1,13 @@
+{
+  "current":         {"progress": 80, "center_pail": 15, "blocking": 20, "scored": 700, "threat": 150, "threat2": 100, "mobility": 12},
+  "passed_30":       {"progress": 80, "center_pail": 15, "blocking": 20, "scored": 700, "threat": 150, "threat2": 100, "mobility": 12, "passed": 30},
+  "passed_60":       {"progress": 80, "center_pail": 15, "blocking": 20, "scored": 700, "threat": 150, "threat2": 100, "mobility": 12, "passed": 60},
+  "passed_100":      {"progress": 80, "center_pail": 15, "blocking": 20, "scored": 700, "threat": 150, "threat2": 100, "mobility": 12, "passed": 100},
+  "trapped_20":      {"progress": 80, "center_pail": 15, "blocking": 20, "scored": 700, "threat": 150, "threat2": 100, "mobility": 12, "trapped": 20},
+  "trapped_50":      {"progress": 80, "center_pail": 15, "blocking": 20, "scored": 700, "threat": 150, "threat2": 100, "mobility": 12, "trapped": 50},
+  "saccel_150":      {"progress": 80, "center_pail": 15, "blocking": 20, "scored": 700, "threat": 150, "threat2": 100, "mobility": 12, "score_accel": 150},
+  "saccel_300":      {"progress": 80, "center_pail": 15, "blocking": 20, "scored": 700, "threat": 150, "threat2": 100, "mobility": 12, "score_accel": 300},
+  "egthr_30":        {"progress": 80, "center_pail": 15, "blocking": 20, "scored": 700, "threat": 150, "threat2": 100, "mobility": 12, "eg_threat": 30},
+  "egthr_60":        {"progress": 80, "center_pail": 15, "blocking": 20, "scored": 700, "threat": 150, "threat2": 100, "mobility": 12, "eg_threat": 60},
+  "combo_v1":        {"progress": 80, "center_pail": 15, "blocking": 20, "scored": 700, "threat": 150, "threat2": 100, "mobility": 12, "passed": 60, "trapped": 30, "score_accel": 200, "eg_threat": 40}
+}

@@ -1,0 +1,10 @@
+{
+  "consolidator":  {"progress": 80, "center_pail": 15, "blocking": 20, "scored": 700, "threat": 150},
+  "mob_10":        {"progress": 80, "center_pail": 15, "blocking": 20, "scored": 700, "threat": 150, "mobility": 10},
+  "mob_12":        {"progress": 80, "center_pail": 15, "blocking": 20, "scored": 700, "threat": 150, "mobility": 12},
+  "mob_15":        {"progress": 80, "center_pail": 15, "blocking": 20, "scored": 700, "threat": 150, "mobility": 15},
+  "mob_18":        {"progress": 80, "center_pail": 15, "blocking": 20, "scored": 700, "threat": 150, "mobility": 18},
+  "mob_20":        {"progress": 80, "center_pail": 15, "blocking": 20, "scored": 700, "threat": 150, "mobility": 20},
+  "mob15_thr100":  {"progress": 80, "center_pail": 15, "blocking": 20, "scored": 700, "threat": 150, "mobility": 15, "threat2": 100},
+  "mob12_thr100":  {"progress": 80, "center_pail": 15, "blocking": 20, "scored": 700, "threat": 150, "mobility": 12, "threat2": 100}
+}
