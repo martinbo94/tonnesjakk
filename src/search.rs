@@ -631,7 +631,7 @@ impl BitBoardEngine {
             weight_threat2: 100,
             weight_adj_blocking: 0,
             weight_mobility: 12,
-            weight_passed: 100,
+            weight_passed: 80,
             weight_trapped: 0,
             weight_score_accel: 0,
             weight_eg_threat: 0,
