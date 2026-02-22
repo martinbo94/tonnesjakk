@@ -1,4 +1,6 @@
 use pyo3::prelude::*;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 
@@ -7,6 +9,7 @@ use crate::nnue::*;
 
 /// Størrelse på transposition table (antall entries)
 pub const TT_SIZE: usize = 1 << 20; // ~1 million entries
+const CORRECTION_TABLE_SIZE: usize = 16384; // 64KB correction history
 
 // ============================================================================
 // AI: EVALUERING OG SØK
@@ -150,6 +153,10 @@ pub struct SearchResult {
     pub quiesce_nodes: u64,
     #[pyo3(get)]
     pub depth: u8,
+
+    /// True if the search was aborted by an external stop signal
+    #[pyo3(get)]
+    pub was_stopped: bool,
 }
 
 #[pymethods]
@@ -177,6 +184,27 @@ impl SearchResult {
         } else {
             self.tt_hits as f64 / self.nodes_searched as f64
         }
+    }
+}
+
+/// Handle for cancelling a running search from Python.
+/// Holds a shared reference to the engine's atomic stop flag.
+/// Call stop() from any thread to abort the current search within ~1024 nodes.
+#[pyclass]
+pub struct StopHandle {
+    flag: Arc<AtomicBool>,
+}
+
+#[pymethods]
+impl StopHandle {
+    /// Signal the engine to stop searching. Takes effect within ~1024 nodes.
+    fn stop(&self) {
+        self.flag.store(true, Ordering::Relaxed);
+    }
+
+    /// Check if stop has been signalled.
+    fn is_stopped(&self) -> bool {
+        self.flag.load(Ordering::Relaxed)
     }
 }
 
@@ -211,17 +239,32 @@ impl Engine {
         self.inner.get_tt_stats()
     }
 
+    /// Get a StopHandle for cancelling searches from another thread.
+    /// The handle shares the engine's atomic stop flag.
+    fn get_stop_handle(&self) -> StopHandle {
+        StopHandle {
+            flag: self.inner.stop_flag.clone(),
+        }
+    }
+
     /// Søk etter beste trekk
-    /// Konverterer Board til BitBoard, kjører BitBoardEngine.search(), og returnerer SearchResult
-    fn search(&mut self, board: &Board, depth: u8) -> SearchResult {
-        // Konverter Board til BitBoard
+    /// Releases the GIL during search so Python threads (HTTP handlers) stay responsive.
+    /// Use get_stop_handle() to cancel from another thread.
+    fn search(&mut self, py: Python, board: &Board, depth: u8) -> SearchResult {
         let bb = BitBoard::from_board(board);
 
-        // Søk med BitBoardEngine
-        let (score, best_bitmove) = self.inner.search(&bb, depth);
+        // Clear stop flag before starting
+        self.inner.stop_flag.store(false, Ordering::Relaxed);
+        self.inner.search_stopped = false;
+        self.inner.nodes_since_check = 0;
 
-        // Konverter BitMove til Move
+        // Release GIL during Rust computation
+        let (score, best_bitmove) = py.allow_threads(|| {
+            self.inner.search(&bb, depth)
+        });
+
         let best_move = best_bitmove.map(|bm| bm.to_move());
+        let was_stopped = self.inner.search_stopped;
 
         SearchResult {
             best_move,
@@ -231,12 +274,19 @@ impl Engine {
             tt_hits: self.inner.tt_hits,
             quiesce_nodes: self.inner.quiesce_nodes,
             depth,
+            was_stopped,
         }
     }
 
-    /// Iterative deepening: Søk gradvis dypere
-    fn search_iterative(&mut self, board: &Board, max_depth: u8) -> SearchResult {
+    /// Iterative deepening: Søk gradvis dypere (releases GIL per depth)
+    fn search_iterative(&mut self, py: Python, board: &Board, max_depth: u8) -> SearchResult {
         let bb = BitBoard::from_board(board);
+
+        // Clear stop flag before starting
+        self.inner.stop_flag.store(false, Ordering::Relaxed);
+        self.inner.search_stopped = false;
+        self.inner.nodes_since_check = 0;
+
         let mut best_result = SearchResult {
             best_move: None,
             score: 0,
@@ -245,10 +295,20 @@ impl Engine {
             tt_hits: 0,
             quiesce_nodes: 0,
             depth: 0,
+            was_stopped: false,
         };
 
         for depth in 1..=max_depth {
-            let (score, best_bitmove) = self.inner.search(&bb, depth);
+            let (score, best_bitmove) = py.allow_threads(|| {
+                self.inner.search(&bb, depth)
+            });
+
+            // If stopped mid-depth, discard partial results
+            if self.inner.search_stopped {
+                best_result.was_stopped = true;
+                break;
+            }
+
             let best_move = best_bitmove.map(|bm| bm.to_move());
 
             best_result = SearchResult {
@@ -259,9 +319,9 @@ impl Engine {
                 tt_hits: best_result.tt_hits + self.inner.tt_hits,
                 quiesce_nodes: best_result.quiesce_nodes + self.inner.quiesce_nodes,
                 depth,
+                was_stopped: false,
             };
 
-            // Stopp tidlig hvis vi fant en vinnersekvens
             if score.abs() > 90_000 {
                 break;
             }
@@ -324,6 +384,76 @@ impl Engine {
         self.inner.weight_threat = value;
     }
 
+    #[getter]
+    fn weight_threat2(&self) -> i32 {
+        self.inner.weight_threat2
+    }
+
+    #[setter]
+    fn set_weight_threat2(&mut self, value: i32) {
+        self.inner.weight_threat2 = value;
+    }
+
+    #[getter]
+    fn weight_adj_blocking(&self) -> i32 {
+        self.inner.weight_adj_blocking
+    }
+
+    #[setter]
+    fn set_weight_adj_blocking(&mut self, value: i32) {
+        self.inner.weight_adj_blocking = value;
+    }
+
+    #[getter]
+    fn weight_mobility(&self) -> i32 {
+        self.inner.weight_mobility
+    }
+
+    #[setter]
+    fn set_weight_mobility(&mut self, value: i32) {
+        self.inner.weight_mobility = value;
+    }
+
+    #[getter]
+    fn weight_passed(&self) -> i32 {
+        self.inner.weight_passed
+    }
+
+    #[setter]
+    fn set_weight_passed(&mut self, value: i32) {
+        self.inner.weight_passed = value;
+    }
+
+    #[getter]
+    fn weight_trapped(&self) -> i32 {
+        self.inner.weight_trapped
+    }
+
+    #[setter]
+    fn set_weight_trapped(&mut self, value: i32) {
+        self.inner.weight_trapped = value;
+    }
+
+    #[getter]
+    fn weight_score_accel(&self) -> i32 {
+        self.inner.weight_score_accel
+    }
+
+    #[setter]
+    fn set_weight_score_accel(&mut self, value: i32) {
+        self.inner.weight_score_accel = value;
+    }
+
+    #[getter]
+    fn weight_eg_threat(&self) -> i32 {
+        self.inner.weight_eg_threat
+    }
+
+    #[setter]
+    fn set_weight_eg_threat(&mut self, value: i32) {
+        self.inner.weight_eg_threat = value;
+    }
+
     /// Load NNUE weights from JSON file
     /// After loading, the engine will use NNUE for evaluation instead of heuristics
     fn load_nnue(&mut self, path: &str) -> PyResult<()> {
@@ -344,9 +474,16 @@ impl Engine {
 
     /// Time-based search: iterative deepening that stops when time runs out.
     /// Returns SearchResult with the best move from the last fully completed depth.
-    fn search_timed(&mut self, board: &Board, time_ms: u64) -> SearchResult {
+    fn search_timed(&mut self, py: Python, board: &Board, time_ms: u64) -> SearchResult {
         let bb = BitBoard::from_board(board);
-        let (score, best_bitmove, depth_reached) = self.inner.search_timed(&bb, time_ms);
+
+        // Clear external stop flag (deadline is managed internally)
+        self.inner.stop_flag.store(false, Ordering::Relaxed);
+
+        let (score, best_bitmove, depth_reached) = py.allow_threads(|| {
+            self.inner.search_timed(&bb, time_ms)
+        });
+
         let best_move = best_bitmove.map(|bm| bm.to_move());
 
         SearchResult {
@@ -357,6 +494,7 @@ impl Engine {
             tt_hits: self.inner.tt_hits,
             quiesce_nodes: self.inner.quiesce_nodes,
             depth: depth_reached,
+            was_stopped: self.inner.search_stopped,
         }
     }
 
@@ -415,9 +553,18 @@ pub struct BitBoardEngine {
     search_stopped: bool,
     last_completed_depth: u8,
 
+    // External stop flag: set from Python (via StopHandle) to cancel search.
+    // Arc allows sharing between Engine wrapper and StopHandle objects.
+    // Checked every 1024 nodes alongside the deadline.
+    stop_flag: Arc<AtomicBool>,
+
     // LMR reduction table: lmr_table[depth][move_count] = reduction
     // Precomputed using ln(depth) * ln(move_count) / 2.5
     lmr_table: [[u8; 64]; 32],
+
+    // Correction history: tracks (search_score - static_eval) error per hash bucket.
+    // Applied to static_eval before pruning decisions (razoring, NMP, futility).
+    correction_history: [i32; CORRECTION_TABLE_SIZE],
 
     // Fallback heuristisk vekter
     pub weight_progress: i32,
@@ -425,6 +572,17 @@ pub struct BitBoardEngine {
     pub weight_blocking: i32,
     pub weight_scored: i32,
     pub weight_threat: i32,
+
+    // New eval terms (default 0 = no-op until tuned)
+    pub weight_threat2: i32,       // Barrels at dist==2 from goal
+    pub weight_adj_blocking: i32,  // Pail in adjacent column ahead of enemy barrel
+    pub weight_mobility: i32,      // Forward empty squares per barrel
+
+    // Research-based eval terms (default 0 = no-op until tuned)
+    pub weight_passed: i32,        // Bonus per barrel with clear column path to goal
+    pub weight_trapped: i32,       // Penalty per barrel with zero empty adjacent squares
+    pub weight_score_accel: i32,   // Non-linear scoring: extra reward for 2+ scored barrels
+    pub weight_eg_threat: i32,     // Endgame threat amplification (scaled by game phase)
 }
 
 impl Default for BitBoardEngine {
@@ -462,12 +620,21 @@ impl BitBoardEngine {
             nodes_since_check: 0,
             search_stopped: false,
             last_completed_depth: 0,
+            stop_flag: Arc::new(AtomicBool::new(false)),
             lmr_table,
+            correction_history: [0i32; CORRECTION_TABLE_SIZE],
             weight_progress: 80,
             weight_center_pail: 15,
             weight_blocking: 20,
             weight_scored: 700,
             weight_threat: 150,
+            weight_threat2: 100,
+            weight_adj_blocking: 0,
+            weight_mobility: 12,
+            weight_passed: 100,
+            weight_trapped: 0,
+            weight_score_accel: 0,
+            weight_eg_threat: 0,
         }
     }
 
@@ -475,6 +642,7 @@ impl BitBoardEngine {
     pub fn clear_history(&mut self) {
         self.history = [[0; NUM_SQUARES]; NUM_SQUARES];
         self.cont_history = [[0i32; NUM_SQUARES]; NUM_SQUARES];
+        self.correction_history = [0i32; CORRECTION_TABLE_SIZE];
         self.prev_move = None;
     }
 
@@ -485,6 +653,9 @@ impl BitBoardEngine {
                 self.history[from][to] /= 2;
                 self.cont_history[from][to] /= 2;
             }
+        }
+        for bucket in 0..CORRECTION_TABLE_SIZE {
+            self.correction_history[bucket] /= 2;
         }
     }
 
@@ -555,37 +726,125 @@ impl BitBoardEngine {
         // Poeng for scorede tønner (big bonus)
         score += (bb.white_scored as i32 - bb.black_scored as i32) * self.weight_scored;
 
+        // Non-linear scoring acceleration: extra reward for having 2+ scored barrels.
+        // A player with 3 scored (1 away from winning) deserves exponentially more credit.
+        // Table: [0, 0, 1, 3] means: 0 extra for 0-1 scored, 1x accel for 2, 3x for 3.
+        if self.weight_score_accel != 0 {
+            const ACCEL: [i32; 4] = [0, 0, 1, 3];
+            let ws = (bb.white_scored as usize).min(3);
+            let bs = (bb.black_scored as usize).min(3);
+            score += (ACCEL[ws] - ACCEL[bs]) * self.weight_score_accel;
+        }
+
         // Fremgang + trussel-bonus for tønner nær mål
         let mut white_progress = 0i32;
         let mut white_threats = 0i32; // Tønner på rad 1 (kan score neste trekk)
+        let mut white_threats2 = 0i32; // Tønner på rad 2 (dist==2 from goal)
+        let mut white_mobility = 0i32; // Forward empty squares
+        let mut white_passed = 0i32;  // Barrels with clear column path to goal
+        let mut white_trapped = 0i32; // Barrels with zero empty adjacent squares
+        let occupied = bb.occupied;
+        // Obstacles for passed barrel detection: enemy barrels + enemy pail
+        let white_obstacles = bb.black_barrels | bb.black_pail;
+        let black_obstacles = bb.white_barrels | bb.white_pail;
+        let empty = !occupied & ((1u64 << NUM_SQUARES) - 1);
         let mut bb_white = bb.white_barrels;
         while bb_white != 0 {
             let sq = bb_white.trailing_zeros() as usize;
-            let (row, _) = sq_to_coords(sq);
+            let (row, col) = sq_to_coords(sq);
             let dist_to_goal = row; // White's goal is row 0
             white_progress += (BOARD_SIZE - 1 - row) as i32;
             if dist_to_goal == 1 {
                 white_threats += 1; // Barrel can score next move
+            } else if dist_to_goal == 2 {
+                white_threats2 += 1;
+            }
+            // Passed barrel: no enemy barrels/pail in this column ahead (rows 0..row-1)
+            if self.weight_passed != 0 && row > 0 {
+                // Mask: all squares in this column with row < current row
+                let col_ahead = COL_MASK[col] & ((1u64 << (row * BOARD_SIZE)) - 1);
+                if col_ahead & white_obstacles == 0 {
+                    white_passed += 1;
+                }
+            }
+            // Trapped barrel: zero empty adjacent squares
+            if self.weight_trapped != 0 && ADJACENT[sq] & empty == 0 {
+                white_trapped += 1;
+            }
+            // Mobility: count empty adjacent squares toward goal (row - 1 for white)
+            if self.weight_mobility != 0 {
+                let adj = ADJACENT[sq] & empty;
+                let mut adj_bits = adj;
+                while adj_bits != 0 {
+                    let adj_sq = adj_bits.trailing_zeros() as usize;
+                    let (adj_row, _) = sq_to_coords(adj_sq);
+                    if adj_row < row { // toward goal for white
+                        white_mobility += 1;
+                    }
+                    adj_bits &= adj_bits - 1;
+                }
             }
             bb_white &= bb_white - 1;
         }
 
         let mut black_progress = 0i32;
         let mut black_threats = 0i32; // Tønner på rad 4 (kan score neste trekk)
+        let mut black_threats2 = 0i32;
+        let mut black_mobility = 0i32;
+        let mut black_passed = 0i32;
+        let mut black_trapped = 0i32;
         let mut bb_black = bb.black_barrels;
         while bb_black != 0 {
             let sq = bb_black.trailing_zeros() as usize;
-            let (row, _) = sq_to_coords(sq);
+            let (row, col) = sq_to_coords(sq);
             let dist_to_goal = (BOARD_SIZE - 1) - row; // Black's goal is row 5
             black_progress += row as i32;
             if dist_to_goal == 1 {
                 black_threats += 1; // Barrel can score next move
+            } else if dist_to_goal == 2 {
+                black_threats2 += 1;
+            }
+            // Passed barrel: no enemy barrels/pail in this column ahead (rows row+1..5)
+            if self.weight_passed != 0 && row < BOARD_SIZE - 1 {
+                let col_ahead = COL_MASK[col] & !((1u64 << ((row + 1) * BOARD_SIZE)) - 1);
+                if col_ahead & black_obstacles == 0 {
+                    black_passed += 1;
+                }
+            }
+            // Trapped barrel: zero empty adjacent squares
+            if self.weight_trapped != 0 && ADJACENT[sq] & empty == 0 {
+                black_trapped += 1;
+            }
+            // Mobility: count empty adjacent squares toward goal (row + 1 for black)
+            if self.weight_mobility != 0 {
+                let adj = ADJACENT[sq] & empty;
+                let mut adj_bits = adj;
+                while adj_bits != 0 {
+                    let adj_sq = adj_bits.trailing_zeros() as usize;
+                    let (adj_row, _) = sq_to_coords(adj_sq);
+                    if adj_row > row { // toward goal for black
+                        black_mobility += 1;
+                    }
+                    adj_bits &= adj_bits - 1;
+                }
             }
             bb_black &= bb_black - 1;
         }
 
         score += (white_progress - black_progress) * self.weight_progress;
         score += (white_threats - black_threats) * self.weight_threat; // Immediate threats are valuable
+        score += (white_threats2 - black_threats2) * self.weight_threat2;
+        score += (white_mobility - black_mobility) * self.weight_mobility;
+        score += (white_passed - black_passed) * self.weight_passed;
+        score -= (white_trapped - black_trapped) * self.weight_trapped; // Penalty: more trapped = worse
+
+        // Endgame threat amplification: threats become more valuable as game progresses.
+        // Phase = total scored barrels (0..8). At phase 0, no extra bonus.
+        // At phase 6 (e.g., 3-3), threats get weight_eg_threat * 6/4 extra per threat diff.
+        if self.weight_eg_threat != 0 {
+            let phase = (bb.white_scored + bb.black_scored) as i32;
+            score += (white_threats - black_threats) * self.weight_eg_threat * phase / 4;
+        }
 
         // Pail-posisjon: senterkontroll + blokkering
         // White's ideal pail position is in opponent's half (rows 0-2), centered
@@ -605,6 +864,9 @@ impl BitBoardEngine {
                 // Pail blocks if same column and ahead of opponent
                 if col == opp_col && row > opp_row {
                     blocking_bonus += self.weight_blocking;
+                } else if (col as i32 - opp_col as i32).abs() == 1 && row > opp_row {
+                    // Adjacent-column partial blocking
+                    blocking_bonus += self.weight_adj_blocking;
                 }
                 bb_opp &= bb_opp - 1;
             }
@@ -626,6 +888,9 @@ impl BitBoardEngine {
                 // Pail blocks if same column and ahead of opponent
                 if col == opp_col && row < opp_row {
                     blocking_bonus += self.weight_blocking;
+                } else if (col as i32 - opp_col as i32).abs() == 1 && row < opp_row {
+                    // Adjacent-column partial blocking
+                    blocking_bonus += self.weight_adj_blocking;
                 }
                 bb_opp &= bb_opp - 1;
             }
@@ -764,14 +1029,14 @@ impl BitBoardEngine {
         self.killer_moves[depth][0] = Some(*mv);
     }
 
-    /// Sorter trekk
-    fn order_moves(&self, mut moves: Vec<BitMove>, player: Player, depth: usize, tt_move: Option<&BitMove>) -> Vec<BitMove> {
-        moves.sort_by(|a, b| {
-            let score_a = self.score_move(a, player, depth, tt_move);
-            let score_b = self.score_move(b, player, depth, tt_move);
-            score_b.cmp(&score_a)
-        });
-        moves
+    /// Sorter trekk — precompute scores once, then sort on keys
+    fn order_moves(&self, moves: Vec<BitMove>, player: Player, depth: usize, tt_move: Option<&BitMove>) -> Vec<BitMove> {
+        let mut scored: Vec<(i32, BitMove)> = moves
+            .into_iter()
+            .map(|mv| (self.score_move(&mv, player, depth, tt_move), mv))
+            .collect();
+        scored.sort_unstable_by_key(|(s, _)| -*s);
+        scored.into_iter().map(|(_, mv)| mv).collect()
     }
 
     /// Søk etter beste trekk med Aspiration Windows
@@ -1085,6 +1350,12 @@ impl BitBoardEngine {
         // Static evaluation for pruning decisions
         let static_eval = self.evaluate(bb);
 
+        // Apply correction history: adjust static eval based on historical error
+        // at this hash bucket. Improves pruning decisions when static eval is
+        // systematically biased for positions that hash to this bucket.
+        let hash_bucket = (bb.hash as usize) & (CORRECTION_TABLE_SIZE - 1);
+        let corrected_eval = static_eval + self.correction_history[hash_bucket] / 256;
+
         // ═══════════════════════════════════════════════════════════════
         // RAZORING
         // ═══════════════════════════════════════════════════════════════
@@ -1093,13 +1364,13 @@ impl BitBoardEngine {
         // position, prune the entire subtree.
         if depth <= 3 && !is_endgame {
             let razor_margin = 200 + 150 * depth as i32;
-            if maximizing && static_eval + razor_margin < alpha {
+            if maximizing && corrected_eval + razor_margin < alpha {
                 let qscore = self.quiesce(bb, alpha, beta, maximizing, 0);
                 if qscore < alpha {
                     return (qscore, None);
                 }
             }
-            if !maximizing && static_eval - razor_margin > beta {
+            if !maximizing && corrected_eval - razor_margin > beta {
                 let qscore = self.quiesce(bb, alpha, beta, maximizing, 0);
                 if qscore > beta {
                     return (qscore, None);
@@ -1116,13 +1387,13 @@ impl BitBoardEngine {
         let nmp_margin = 50; // Only try NMP if we're at least this much better
         let nmp_allowed = depth >= 4
             && !is_endgame
-            && static_eval.abs() < 90_000
+            && corrected_eval.abs() < 90_000
             && !bb.has_barrel_near_goal()
             && beta.abs() < 90_000
             && if maximizing {
-                static_eval >= beta - nmp_margin
+                corrected_eval >= beta - nmp_margin
             } else {
-                static_eval <= alpha + nmp_margin
+                corrected_eval <= alpha + nmp_margin
             };
 
         if nmp_allowed {
@@ -1133,10 +1404,10 @@ impl BitBoardEngine {
                 r += 1;
             }
             // Eval-based boost: if eval strongly exceeds the bound, prune harder
-            if maximizing && static_eval >= beta + 150 {
+            if maximizing && corrected_eval >= beta + 150 {
                 r += 1;
             }
-            if !maximizing && static_eval <= alpha - 150 {
+            if !maximizing && corrected_eval <= alpha - 150 {
                 r += 1;
             }
             let null_depth = (depth as i16 - r as i16 - 1).max(1) as u8;
@@ -1173,11 +1444,11 @@ impl BitBoardEngine {
         // Use half the futility margin in endgame (prune less aggressively)
         let margin = if is_endgame { FUTILITY_MARGINS[depth.min(8) as usize] / 2 } else { FUTILITY_MARGINS[depth.min(8) as usize] };
         let futility_pruning = depth <= 8
-            && static_eval.abs() < 90_000 // Not near mate
+            && corrected_eval.abs() < 90_000 // Not near mate
             && if maximizing {
-                static_eval + margin < alpha
+                corrected_eval + margin < alpha
             } else {
-                static_eval - margin > beta
+                corrected_eval - margin > beta
             };
 
         // Generate and order moves
@@ -1411,6 +1682,14 @@ impl BitBoardEngine {
         // Restore prev_move for continuation history context
         self.prev_move = prev_mv;
 
+        // Update correction history: track (search_score - static_eval) error.
+        // Only at depth >= 3 and non-mate scores. Clamped to ±8192.
+        if depth >= 3 && best_score.abs() < 90_000 && static_eval.abs() < 90_000 {
+            let error = (best_score - static_eval) * depth as i32;
+            self.correction_history[hash_bucket] =
+                (self.correction_history[hash_bucket] + error).clamp(-8192, 8192);
+        }
+
         // Store in TT
         let flag = if best_score <= original_alpha {
             TTFlag::UpperBound
@@ -1449,19 +1728,25 @@ impl BitBoardEngine {
     // ═══════════════════════════════════════════════════════════════
     // Check deadline every 1024 nodes to avoid expensive Instant::now() calls.
 
-    /// Check if the search should stop due to time limit.
-    /// Uses a sticky `search_stopped` flag so that once the deadline is hit,
-    /// all subsequent calls return true immediately without rechecking the clock.
-    /// Only calls Instant::now() every 1024 nodes to minimize overhead.
+    /// Check if the search should stop (time limit or external stop flag).
+    /// Uses a sticky `search_stopped` flag so that once triggered,
+    /// all subsequent calls return true immediately.
+    /// Checks external stop flag and clock every 1024 nodes to minimize overhead.
     #[inline]
     fn should_stop(&mut self) -> bool {
         if self.search_stopped {
             return true;
         }
-        if let Some(deadline) = self.deadline {
-            self.nodes_since_check += 1;
-            if self.nodes_since_check >= 1024 {
-                self.nodes_since_check = 0;
+        self.nodes_since_check += 1;
+        if self.nodes_since_check >= 1024 {
+            self.nodes_since_check = 0;
+            // Check external stop flag (set from Python via StopHandle)
+            if self.stop_flag.load(Ordering::Relaxed) {
+                self.search_stopped = true;
+                return true;
+            }
+            // Check time deadline
+            if let Some(deadline) = self.deadline {
                 if Instant::now() >= deadline {
                     self.search_stopped = true;
                     return true;
@@ -1496,9 +1781,9 @@ impl BitBoardEngine {
         self.last_completed_depth = 0;
 
         for depth in 1..=max_depth {
-            // Check deadline before starting a new depth iteration
-            if self.deadline.is_some() && self.should_stop() {
-                break; // Use best result from previous completed depth
+            // Check stop flag / deadline before starting a new depth
+            if self.should_stop() {
+                break;
             }
 
             // Bruk forrige score for aspiration windows
@@ -1510,7 +1795,7 @@ impl BitBoardEngine {
             total_tt_hits += self.tt_hits;
 
             // If search was aborted mid-iteration, discard partial results
-            if self.deadline.is_some() && self.should_stop() {
+            if self.should_stop() {
                 break;
             }
 

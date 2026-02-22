@@ -44,6 +44,15 @@ CONFIGS: Dict[str, Dict[str, int]] = {
     "greedy":       {"progress": 100, "center_pail": 10, "blocking": 15, "scored": 800, "threat": 350},
     "minimalist":   {"progress": 150, "center_pail":  0, "blocking":  0, "scored": 400, "threat": 100},
     "allrounder":   {"progress": 130, "center_pail": 15, "blocking": 20, "scored": 550, "threat": 250},
+    # New eval feature variants (based on consolidator weights)
+    "cons_thr2_lo":  {"progress": 80, "center_pail": 15, "blocking": 20, "scored": 700, "threat": 150, "threat2": 30},
+    "cons_thr2_mid": {"progress": 80, "center_pail": 15, "blocking": 20, "scored": 700, "threat": 150, "threat2": 60},
+    "cons_thr2_hi":  {"progress": 80, "center_pail": 15, "blocking": 20, "scored": 700, "threat": 150, "threat2": 100},
+    "cons_ablk_lo":  {"progress": 80, "center_pail": 15, "blocking": 20, "scored": 700, "threat": 150, "adj_blocking": 5},
+    "cons_ablk_mid": {"progress": 80, "center_pail": 15, "blocking": 20, "scored": 700, "threat": 150, "adj_blocking": 10},
+    "cons_mob_lo":   {"progress": 80, "center_pail": 15, "blocking": 20, "scored": 700, "threat": 150, "mobility": 5},
+    "cons_mob_mid":  {"progress": 80, "center_pail": 15, "blocking": 20, "scored": 700, "threat": 150, "mobility": 15},
+    "cons_combo":    {"progress": 80, "center_pail": 15, "blocking": 20, "scored": 700, "threat": 150, "threat2": 50, "adj_blocking": 8, "mobility": 10},
 }
 
 
@@ -59,6 +68,13 @@ def make_engine_with_weights(weights: Dict[str, int]) -> Engine:
     engine.weight_blocking = weights["blocking"]
     engine.weight_scored = weights["scored"]
     engine.weight_threat = weights["threat"]
+    engine.weight_threat2 = weights.get("threat2", 0)
+    engine.weight_adj_blocking = weights.get("adj_blocking", 0)
+    engine.weight_mobility = weights.get("mobility", 0)
+    engine.weight_passed = weights.get("passed", 0)
+    engine.weight_trapped = weights.get("trapped", 0)
+    engine.weight_score_accel = weights.get("score_accel", 0)
+    engine.weight_eg_threat = weights.get("eg_threat", 0)
     return engine
 
 
@@ -259,7 +275,9 @@ def print_tournament_results(
     # ELO ranking table
     header = (
         f"  {'Rank':>4s}  {'Config':14s}  {'ELO':>6s}  {'W':>4s}  {'L':>4s}  {'D':>4s}  "
-        f"{'Score%':>6s}  {'Prog':>4s}  {'Cntr':>4s}  {'Blck':>4s}  {'Scrd':>4s}  {'Thrt':>4s}"
+        f"{'Score%':>6s}  {'Prog':>4s}  {'Cntr':>4s}  {'Blck':>4s}  {'Scrd':>4s}  {'Thrt':>4s}  "
+        f"{'Tht2':>4s}  {'ABlk':>4s}  {'Mob':>4s}  "
+        f"{'Pass':>4s}  {'Trap':>4s}  {'SAcl':>4s}  {'EgTh':>4s}"
     )
     print(header)
     print("  " + "-" * (len(header) - 2))
@@ -289,7 +307,9 @@ def print_tournament_results(
         print(
             f"  {rank:>4d}  {name:14s}  {ratings[name]:6.0f}  {total_w:4d}  {total_l:4d}  {total_d:4d}  "
             f"{score_pct:5.1f}%  {cfg['progress']:4d}  {cfg['center_pail']:4d}  {cfg['blocking']:4d}  "
-            f"{cfg['scored']:4d}  {cfg['threat']:4d}"
+            f"{cfg['scored']:4d}  {cfg['threat']:4d}  "
+            f"{cfg.get('threat2', 0):4d}  {cfg.get('adj_blocking', 0):4d}  {cfg.get('mobility', 0):4d}  "
+            f"{cfg.get('passed', 0):4d}  {cfg.get('trapped', 0):4d}  {cfg.get('score_accel', 0):4d}  {cfg.get('eg_threat', 0):4d}"
         )
 
     print()
@@ -412,7 +432,7 @@ Examples:
             sys.exit(1)
         with open(config_path, "r") as f:
             configs = json.load(f)
-        # Validate
+        # Validate (threat2, adj_blocking, mobility are optional, default 0)
         for name, params in configs.items():
             required = {"progress", "center_pail", "blocking", "scored", "threat"}
             missing = required - set(params.keys())

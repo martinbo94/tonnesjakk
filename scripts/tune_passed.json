@@ -1,0 +1,9 @@
+{
+  "current":      {"progress": 80, "center_pail": 15, "blocking": 20, "scored": 700, "threat": 150, "threat2": 100, "mobility": 12},
+  "pass_60":      {"progress": 80, "center_pail": 15, "blocking": 20, "scored": 700, "threat": 150, "threat2": 100, "mobility": 12, "passed": 60},
+  "pass_80":      {"progress": 80, "center_pail": 15, "blocking": 20, "scored": 700, "threat": 150, "threat2": 100, "mobility": 12, "passed": 80},
+  "pass_100":     {"progress": 80, "center_pail": 15, "blocking": 20, "scored": 700, "threat": 150, "threat2": 100, "mobility": 12, "passed": 100},
+  "pass_120":     {"progress": 80, "center_pail": 15, "blocking": 20, "scored": 700, "threat": 150, "threat2": 100, "mobility": 12, "passed": 120},
+  "pass_150":     {"progress": 80, "center_pail": 15, "blocking": 20, "scored": 700, "threat": 150, "threat2": 100, "mobility": 12, "passed": 150},
+  "pass_200":     {"progress": 80, "center_pail": 15, "blocking": 20, "scored": 700, "threat": 150, "threat2": 100, "mobility": 12, "passed": 200}
+}

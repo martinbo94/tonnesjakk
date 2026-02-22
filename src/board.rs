@@ -49,6 +49,23 @@ pub const ROW_MASK: [u64; BOARD_SIZE] = {
     masks
 };
 
+/// Maske for hver kolonne (1 bit per rad i den kolonnen)
+pub const COL_MASK: [u64; BOARD_SIZE] = {
+    let mut masks = [0u64; BOARD_SIZE];
+    let mut col = 0;
+    while col < BOARD_SIZE {
+        let mut mask = 0u64;
+        let mut row = 0;
+        while row < BOARD_SIZE {
+            mask |= 1u64 << (row * BOARD_SIZE + col);
+            row += 1;
+        }
+        masks[col] = mask;
+        col += 1;
+    }
+    masks
+};
+
 /// Naboer for hvert felt (alle 8 retninger: ortogonalt + diagonalt)
 pub const ADJACENT: [u64; NUM_SQUARES] = {
     let mut adj = [0u64; NUM_SQUARES];
@@ -649,8 +666,9 @@ impl BitBoard {
         pail_opt: Option<u8>,
         moves: &mut Vec<BitMove>,
     ) {
-        // Stack: (current_sq, visited_mask, path)
-        let mut stack: Vec<(u8, u64, Vec<u8>)> = Vec::with_capacity(16);
+        // Stack: (current_sq, visited_mask, path_buf, path_len)
+        // Fixed-size path buffer eliminates per-jump heap allocations
+        let mut stack: Vec<(u8, u64, [u8; 8], u8)> = Vec::with_capacity(16);
 
         // Start med alle retninger fra from_sq
         let all_barrels = self.all_barrels();
@@ -683,19 +701,20 @@ impl BitBoard {
                 && (opponent_pail & over_bit) == 0  // Cannot jump over opponent's pail
                 && (temp_occupied & landing_bit) == 0
             {
-                let path = vec![landing as u8];
+                let mut path = [0u8; 8];
+                path[0] = landing as u8;
                 let visited = visited_start | landing_bit;
 
                 // Legg til dette trekket
-                moves.push(BitMove::new_move(from_sq, landing as u8, &path, pail_opt));
+                moves.push(BitMove::new_move(from_sq, landing as u8, &path[..1], pail_opt));
 
                 // Push til stack for å fortsette søket
-                stack.push((landing as u8, visited, path));
+                stack.push((landing as u8, visited, path, 1));
             }
         }
 
         // DFS
-        while let Some((current, visited, path)) = stack.pop() {
+        while let Some((current, visited, path, path_len)) = stack.pop() {
             for dir in 0..NUM_JUMP_DIRS {
                 let over = JUMP_OVER[current as usize][dir];
                 let landing = JUMP_LANDING[current as usize][dir];
@@ -717,16 +736,18 @@ impl BitBoard {
                     && (opponent_pail & over_bit) == 0  // Cannot jump over opponent's pail
                     && (temp_occupied & landing_bit) == 0
                 {
-                    let mut new_path = path.clone();
-                    new_path.push(landing as u8);
+                    let mut new_path = path; // 8-byte stack copy (no heap alloc)
+                    let new_len = (path_len as usize).min(7); // safety cap
+                    new_path[new_len] = landing as u8;
+                    let new_path_len = (path_len + 1).min(8);
                     let new_visited = visited | landing_bit;
 
                     // Legg til trekket
                     let to = landing as u8;
-                    moves.push(BitMove::new_move(from_sq, to, &new_path, pail_opt));
+                    moves.push(BitMove::new_move(from_sq, to, &new_path[..new_path_len as usize], pail_opt));
 
                     // Fortsett søket
-                    stack.push((to, new_visited, new_path));
+                    stack.push((to, new_visited, new_path, new_path_len));
                 }
             }
         }
