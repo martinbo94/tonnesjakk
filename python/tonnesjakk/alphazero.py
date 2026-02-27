@@ -22,6 +22,8 @@ via MCTSEngine methods (play_network_game, play_heuristic_games, play_eval_match
 """
 
 import argparse
+import json
+import multiprocessing
 import time
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -41,7 +43,7 @@ from tonnesjakk.utils import elo_with_ci
 # ---------------------------------------------------------------------------
 
 POLICY_SIZE = 37 * 36  # 1332: from_idx (0-36) x to_idx (0-35)
-BOARD_PLANES = 6       # 4 piece planes + current player + bias
+BOARD_PLANES = 5       # 4 piece planes (my/opp relative encoding) + bias
 BOARD_SIZE = 6
 
 
@@ -74,7 +76,7 @@ for _from_idx in range(37):
 
 
 def mirror_planes(planes: np.ndarray) -> np.ndarray:
-    """Mirror board planes left-right. Input shape: (6, 6, 6) or (N, 6, 6, 6)."""
+    """Mirror board planes left-right. Input shape: (5, 6, 6) or (N, 5, 6, 6)."""
     return np.ascontiguousarray(planes[..., ::-1])
 
 
@@ -91,14 +93,14 @@ class AlphaZeroNet(nn.Module):
     """Dual-headed network for AlphaZero.
 
     Architecture: MLP with shared trunk, separate policy and value heads.
-    Input: 6x6x6 = 216 features (flattened board planes).
+    Input: 5x6x6 = 180 features (flattened board planes).
     Policy: 1332 logits (from x to square pairs).
     Value: scalar in [-1, +1] (White's perspective).
     """
 
     def __init__(self, hidden: int = 128):
         super().__init__()
-        input_size = BOARD_PLANES * BOARD_SIZE * BOARD_SIZE  # 216
+        input_size = BOARD_PLANES * BOARD_SIZE * BOARD_SIZE  # 180
 
         self.shared = nn.Sequential(
             nn.Linear(input_size, hidden),
@@ -111,7 +113,8 @@ class AlphaZeroNet(nn.Module):
 
         self.value_head = nn.Sequential(
             nn.Linear(hidden, 64),
-            nn.ReLU(),
+            nn.LeakyReLU(0.01),
+            nn.Dropout(0.25),
             nn.Linear(64, 1),
             nn.Tanh(),
         )
@@ -122,7 +125,7 @@ class AlphaZeroNet(nn.Module):
         """Forward pass.
 
         Args:
-            x: (batch, 6, 6, 6) or (batch, 216) board planes.
+            x: (batch, 5, 6, 6) or (batch, 180) board planes.
 
         Returns:
             (policy_logits, value): policy is (batch, 1332), value is (batch,).
@@ -164,7 +167,7 @@ class AlphaZeroResNet(nn.Module):
     - `num_blocks` residual blocks (each 2x conv + skip)
     - Separate policy head (1x1 conv -> FC -> 1332) and value head (1x1 conv -> FC -> tanh)
 
-    Input: 6x6x6 = (6 planes, 6 rows, 6 cols) board representation.
+    Input: 5x6x6 = (5 planes, 6 rows, 6 cols) board representation.
     Policy: 1332 logits (from x to square pairs).
     Value: scalar in [-1, +1] (White's perspective).
 
@@ -190,22 +193,23 @@ class AlphaZeroResNet(nn.Module):
         self.policy_bn = nn.BatchNorm2d(2)
         self.policy_fc = nn.Linear(2 * BOARD_SIZE * BOARD_SIZE, POLICY_SIZE)
 
-        # Value head: 1x1 conv -> batch norm -> ReLU -> flatten -> FC -> ReLU -> FC -> tanh
-        self.value_conv = nn.Conv2d(channels, 1, 1, bias=False)
-        self.value_bn = nn.BatchNorm2d(1)
-        self.value_fc1 = nn.Linear(BOARD_SIZE * BOARD_SIZE, channels)
+        # Value head: 1x1 conv(4) -> BN -> ReLU -> flatten -> FC -> LeakyReLU -> Dropout -> FC -> tanh
+        self.value_conv = nn.Conv2d(channels, 4, 1, bias=False)
+        self.value_bn = nn.BatchNorm2d(4)
+        self.value_fc1 = nn.Linear(4 * BOARD_SIZE * BOARD_SIZE, channels)
+        self.value_dropout = nn.Dropout(0.25)
         self.value_fc2 = nn.Linear(channels, 1)
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """Forward pass.
 
         Args:
-            x: (batch, 6, 6, 6) or (batch, 216) board planes.
+            x: (batch, 5, 6, 6) or (batch, 180) board planes.
 
         Returns:
             (policy_logits, value): policy is (batch, 1332), value is (batch,).
         """
-        # Reshape flat input to spatial: (batch, 6_planes, 6_rows, 6_cols)
+        # Reshape flat input to spatial: (batch, 5_planes, 6_rows, 6_cols)
         if x.dim() == 2:
             x = x.view(-1, BOARD_PLANES, BOARD_SIZE, BOARD_SIZE)
 
@@ -224,7 +228,8 @@ class AlphaZeroResNet(nn.Module):
         # Value head
         v = F.relu(self.value_bn(self.value_conv(x)))
         v = v.view(v.size(0), -1)
-        v = F.relu(self.value_fc1(v))
+        v = F.leaky_relu(self.value_fc1(v), 0.01)
+        v = self.value_dropout(v)
         v = torch.tanh(self.value_fc2(v)).squeeze(-1)
 
         return p, v
@@ -271,6 +276,7 @@ class NetworkMCTS:
         dirichlet_alpha: float = 0.5,
         dirichlet_epsilon: float = 0.25,
         device: torch.device = None,
+        use_amp: bool = False,
     ):
         self.network = network
         self.simulations = simulations
@@ -279,6 +285,7 @@ class NetworkMCTS:
         self.dirichlet_alpha = dirichlet_alpha
         self.dirichlet_epsilon = dirichlet_epsilon
         self.device = device or torch.device("cpu")
+        self.use_amp = use_amp
         self._engine = _RustMCTSEngine(simulations, c_puct)
         self._batch_eval_fn = self._make_batch_eval_fn()
 
@@ -286,16 +293,41 @@ class NetworkMCTS:
         """Create the batched Python callback for Rust MCTS leaf evaluation.
 
         Accepts a list of plane vectors (one per leaf), returns batched results.
+
+        Optimizations:
+        - Pre-allocated input buffer on device (eliminates per-call allocations)
+        - Zero-copy numpy→torch via as_tensor
+        - AMP (FP16) inference when enabled
+        - Bulk C-level .numpy().tolist() for output conversion
         """
         net = self.network
         device = self.device
+        use_amp = self.use_amp
+        amp_dtype = torch.float16
+        # Pre-allocate input buffer sized to max batch
+        plane_size = BOARD_PLANES * BOARD_SIZE * BOARD_SIZE
+        input_buffer = torch.zeros(self.batch_size, plane_size, dtype=torch.float32, device=device)
 
         def batch_eval_fn(batch_planes: list) -> tuple:
-            # batch_planes: list of N lists of 216 floats
-            tensor = torch.tensor(batch_planes, dtype=torch.float32, device=device)
+            # batch_planes: list of N lists of plane_size floats
+            n = len(batch_planes)
+            # Zero-copy: list → numpy → torch, then copy to pre-allocated device buffer
+            np_batch = np.array(batch_planes, dtype=np.float32)
+            cpu_tensor = torch.as_tensor(np_batch)
+            buf = input_buffer[:n]
+            buf.copy_(cpu_tensor)
+
             with torch.no_grad():
-                policy_logits, values = net(tensor)
-            return policy_logits.cpu().tolist(), values.cpu().tolist()
+                if use_amp:
+                    with torch.autocast(device_type=device.type, dtype=amp_dtype):
+                        policy_logits, values = net(buf)
+                    # Ensure FP32 output to Rust
+                    policy_logits = policy_logits.float()
+                    values = values.float()
+                else:
+                    policy_logits, values = net(buf)
+
+            return policy_logits.cpu().numpy().tolist(), values.cpu().numpy().tolist()
 
         return batch_eval_fn
 
@@ -325,6 +357,232 @@ class NetworkMCTS:
 
 
 # ---------------------------------------------------------------------------
+# Training logger (JSONL)
+# ---------------------------------------------------------------------------
+
+class TrainingLogger:
+    """Append-only JSONL logger for training metrics.
+
+    Writes one JSON object per line to ``{save_dir}/training.log``.
+    Three record types:
+      - ``config``    — training parameters, written once at start
+      - ``iteration`` — per-iteration metrics (losses, game results, search_score stats)
+      - ``eval``      — evaluation match results
+
+    This log captures aggregate search_score statistics per iteration. For
+    per-position search scores (e.g. to trace how the engine evaluated each
+    move in a game), load the replay buffer directly::
+
+        data = np.load("checkpoint.pt.buffer.npz")
+        search_scores = data["search_scores"]  # one score per position
+        values = data["values"]                 # game outcome per position
+    """
+
+    def __init__(self, save_dir: str):
+        path = Path(save_dir)
+        path.mkdir(parents=True, exist_ok=True)
+        self._path = path / "training.log"
+        self._file = open(self._path, "a")
+
+    def _write(self, record: dict):
+        self._file.write(json.dumps(record) + "\n")
+        self._file.flush()
+
+    def log_config(self, **kwargs):
+        self._write({"type": "config", "timestamp": time.time(), **kwargs})
+
+    def log_iteration(self, iteration: int, *, game_results: dict,
+                      buffer_size: int, policy_loss: float, value_loss: float,
+                      lr: float, selfplay_time: float, train_time: float,
+                      search_score_mean: float = 0.0, search_score_std: float = 0.0,
+                      search_score_mae: float = 0.0, n_heuristic: int = 0,
+                      n_network: int = 0):
+        self._write({
+            "type": "iteration",
+            "timestamp": time.time(),
+            "iteration": iteration,
+            "game_results": game_results,
+            "buffer_size": buffer_size,
+            "policy_loss": round(policy_loss, 6),
+            "value_loss": round(value_loss, 6),
+            "lr": lr,
+            "selfplay_time": round(selfplay_time, 1),
+            "train_time": round(train_time, 1),
+            "search_score_mean": round(search_score_mean, 4),
+            "search_score_std": round(search_score_std, 4),
+            "search_score_mae": round(search_score_mae, 4),
+            "n_heuristic": n_heuristic,
+            "n_network": n_network,
+        })
+
+    def log_eval(self, iteration: int, *, wins: int, draws: int, losses: int,
+                 elo: float, elo_lo: float, elo_hi: float, depth: int):
+        self._write({
+            "type": "eval",
+            "timestamp": time.time(),
+            "iteration": iteration,
+            "wins": wins,
+            "draws": draws,
+            "losses": losses,
+            "elo": round(elo, 1),
+            "elo_lo": round(elo_lo, 1),
+            "elo_hi": round(elo_hi, 1),
+            "depth": depth,
+        })
+
+    def close(self):
+        self._file.close()
+
+
+# ---------------------------------------------------------------------------
+# Multiprocessing workers (top-level for pickling)
+# ---------------------------------------------------------------------------
+
+def _play_alphabeta_games_worker(args):
+    """Worker for parallel alpha-beta game generation. Pure Rust, no model needed."""
+    num_games, depth, random_opening, max_moves, simulations, c_puct = args
+
+    engine = _RustMCTSEngine(simulations, c_puct)
+    results = engine.play_alphabeta_games(num_games, depth=depth,
+                                          random_opening=random_opening,
+                                          max_moves=max_moves)
+
+    all_planes = []
+    all_policies = []
+    all_values = []
+    all_search_scores = []
+    game_results = {"white": 0, "black": 0, "draw": 0}
+
+    for r in results:
+        for ex in r.examples:
+            all_planes.append(np.array(ex.planes, dtype=np.float32).reshape(BOARD_PLANES, BOARD_SIZE, BOARD_SIZE))
+            all_policies.append(np.array(ex.policy_target, dtype=np.float32))
+            all_values.append(ex.value_target)
+            all_search_scores.append(ex.search_score)
+        game_results[r.winner] += 1
+
+    planes_np = np.array(all_planes) if all_planes else np.empty((0, 6, 6, 6), dtype=np.float32)
+    policies_np = np.array(all_policies) if all_policies else np.empty((0, POLICY_SIZE), dtype=np.float32)
+    values_np = np.array(all_values, dtype=np.float32) if all_values else np.empty(0, dtype=np.float32)
+    search_scores_np = np.array(all_search_scores, dtype=np.float32) if all_search_scores else np.empty(0, dtype=np.float32)
+
+    return planes_np, policies_np, values_np, search_scores_np, game_results
+
+
+def _play_network_games_worker(args):
+    """Worker function for parallel network self-play.
+
+    Must be top-level (not a method) so it's picklable with spawn start method.
+    Each worker creates its own model (CPU) + MCTSEngine, plays games sequentially,
+    and returns numpy arrays.
+    """
+    (
+        num_games, model_state_dict, network_type, hidden, num_blocks,
+        simulations, c_puct, mcts_batch_size, temperature,
+        random_opening, max_moves, temp_moves,
+        full_search_fraction, cheap_sims,
+    ) = args
+
+    # Create fresh model on CPU
+    net = make_network(network_type, hidden=hidden, num_blocks=num_blocks)
+    net.load_state_dict(model_state_dict)
+    net.eval()
+    device = torch.device("cpu")
+    net.to(device)
+
+    # Create batch eval function (same as NetworkMCTS._make_batch_eval_fn but inline)
+    plane_size = BOARD_PLANES * BOARD_SIZE * BOARD_SIZE
+    input_buffer = torch.zeros(mcts_batch_size, plane_size, dtype=torch.float32, device=device)
+
+    def batch_eval_fn(batch_planes: list) -> tuple:
+        n = len(batch_planes)
+        np_batch = np.array(batch_planes, dtype=np.float32)
+        cpu_tensor = torch.as_tensor(np_batch)
+        buf = input_buffer[:n]
+        buf.copy_(cpu_tensor)
+        with torch.no_grad():
+            policy_logits, values = net(buf)
+        return policy_logits.numpy().tolist(), values.numpy().tolist()
+
+    engine = _RustMCTSEngine(simulations, c_puct)
+
+    all_planes = []
+    all_policies = []
+    all_values = []
+    all_search_scores = []
+    results = {"white": 0, "black": 0, "draw": 0}
+
+    for _ in range(num_games):
+        nr = engine.play_network_game(
+            batch_eval_fn, batch_size=mcts_batch_size,
+            random_opening=random_opening, max_moves=max_moves,
+            temp_moves=temp_moves, temperature=temperature,
+            full_search_fraction=full_search_fraction,
+            cheap_sims=cheap_sims,
+        )
+        for ex in nr.examples:
+            all_planes.append(np.array(ex.planes, dtype=np.float32).reshape(BOARD_PLANES, BOARD_SIZE, BOARD_SIZE))
+            all_policies.append(np.array(ex.policy_target, dtype=np.float32))
+            all_values.append(ex.value_target)
+            all_search_scores.append(ex.search_score)
+        results[nr.winner] += 1
+
+    planes_np = np.array(all_planes) if all_planes else np.empty((0, 6, 6, 6), dtype=np.float32)
+    policies_np = np.array(all_policies) if all_policies else np.empty((0, POLICY_SIZE), dtype=np.float32)
+    values_np = np.array(all_values, dtype=np.float32) if all_values else np.empty(0, dtype=np.float32)
+    search_scores_np = np.array(all_search_scores, dtype=np.float32) if all_search_scores else np.empty(0, dtype=np.float32)
+
+    return planes_np, policies_np, values_np, search_scores_np, results
+
+
+def _play_onnx_games_worker(args):
+    """Worker function for parallel ONNX self-play.
+
+    Runs entirely in Rust — no Python model, no GIL contention.
+    Each worker loads the ONNX model and plays games via MCTSEngine.
+    """
+    from tonnesjakk._core import OnnxSession as _OnnxSession
+
+    (
+        num_games, onnx_path, use_coreml,
+        simulations, c_puct, mcts_batch_size, temperature,
+        random_opening, max_moves, temp_moves,
+        full_search_fraction, cheap_sims,
+    ) = args
+
+    onnx_session = _OnnxSession(onnx_path, use_coreml=use_coreml)
+    engine = _RustMCTSEngine(simulations, c_puct)
+
+    all_planes = []
+    all_policies = []
+    all_values = []
+    all_search_scores = []
+    results = {"white": 0, "black": 0, "draw": 0}
+
+    for _ in range(num_games):
+        nr = engine.play_network_game_onnx(
+            onnx_session, batch_size=mcts_batch_size,
+            random_opening=random_opening, max_moves=max_moves,
+            temp_moves=temp_moves, temperature=temperature,
+            full_search_fraction=full_search_fraction,
+            cheap_sims=cheap_sims,
+        )
+        for ex in nr.examples:
+            all_planes.append(np.array(ex.planes, dtype=np.float32).reshape(BOARD_PLANES, BOARD_SIZE, BOARD_SIZE))
+            all_policies.append(np.array(ex.policy_target, dtype=np.float32))
+            all_values.append(ex.value_target)
+            all_search_scores.append(ex.search_score)
+        results[nr.winner] += 1
+
+    planes_np = np.array(all_planes) if all_planes else np.empty((0, 6, 6, 6), dtype=np.float32)
+    policies_np = np.array(all_policies) if all_policies else np.empty((0, POLICY_SIZE), dtype=np.float32)
+    values_np = np.array(all_values, dtype=np.float32) if all_values else np.empty(0, dtype=np.float32)
+    search_scores_np = np.array(all_search_scores, dtype=np.float32) if all_search_scores else np.empty(0, dtype=np.float32)
+
+    return planes_np, policies_np, values_np, search_scores_np, results
+
+
+# ---------------------------------------------------------------------------
 # Trainer
 # ---------------------------------------------------------------------------
 
@@ -350,21 +608,30 @@ class AlphaZeroTrainer:
     def __init__(
         self,
         hidden: int = 128,
-        simulations: int = 200,
-        c_puct: float = 1.4,
+        simulations: int = 200,       # 200 sufficient for branching factor ~16 (Wang et al. 2020)
+        c_puct: float = 1.0,
         lr: float = 0.001,
-        games_per_iter: int = 50,
-        training_epochs: int = 5,
+        games_per_iter: int = 100,    # maximize outer self-play loop (Wang et al. 2020)
+        training_epochs: int = 5,     # 3-5 to avoid overfitting (Wang et al. 2020)
         batch_size: int = 256,
         temperature: float = 1.0,
-        buffer_max: int = 100000,
+        buffer_max: int = 200000,
+        buffer_min: int = 20000,
         train_window: int = 20000,
         network_type: str = "resnet",
         num_blocks: int = 5,
-        policy_weight: float = 1.0,
+        policy_weight: float = 0.5,   # value-heavy loss for small games (Wang & Emmerich 2019)
         device: str = "auto",
+        mcts_batch_size: int = 8,
+        use_amp: bool = False,
+        num_workers: int = 1,
+        full_search_fraction: float = 1.0,
+        cheap_sims: int = 50,
+        gate_threshold: float = 0.0,
     ):
         self.network_type = network_type
+        self.hidden = hidden
+        self.num_blocks = num_blocks
         self.device = get_device(device)
         self.network = make_network(network_type, hidden=hidden, num_blocks=num_blocks)
         self.network.to(self.device)
@@ -376,8 +643,18 @@ class AlphaZeroTrainer:
         self.batch_size = batch_size
         self.temperature = temperature
         self.buffer_max = buffer_max
+        self.buffer_min = buffer_min
         self.train_window = train_window
         self.policy_weight = policy_weight
+        self.mcts_batch_size = mcts_batch_size
+        self.use_amp = use_amp
+        self.num_workers = num_workers
+        self.full_search_fraction = full_search_fraction
+        self.cheap_sims = cheap_sims
+        self.gate_threshold = gate_threshold
+
+        self._current_iteration = 0
+        self._total_iterations = 0
 
         self.optimizer = torch.optim.Adam(self.network.parameters(), lr=lr, weight_decay=1e-4)
         self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -385,13 +662,187 @@ class AlphaZeroTrainer:
         )
         self.replay_buffer: List[Tuple[np.ndarray, np.ndarray, float]] = []
 
-        print(f"AlphaZero network: {self.network.num_parameters:,} parameters ({self.device})")
+        amp_str = "FP16" if self.use_amp else "FP32"
+        workers_str = f", workers={self.num_workers}" if self.num_workers > 1 else ""
+        print(f"AlphaZero network: {self.network.num_parameters:,} parameters ({self.device}, {amp_str}, mcts_batch={self.mcts_batch_size}{workers_str})")
 
     def set_lr_schedule(self, total_steps: int):
         """Update LR schedule T_max for known total iteration count."""
+        self._total_iterations = total_steps
         self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             self.optimizer, T_max=max(1, total_steps), eta_min=self.lr * 0.01
         )
+
+    def _effective_buffer_max(self) -> int:
+        """Growing replay buffer: starts at buffer_min, grows linearly to buffer_max."""
+        if self._total_iterations <= 0 or self.buffer_min >= self.buffer_max:
+            return self.buffer_max
+        progress = min(1.0, self._current_iteration / self._total_iterations)
+        return int(self.buffer_min + (self.buffer_max - self.buffer_min) * progress)
+
+    def _play_network_games_parallel(self, n_network: int):
+        """Play network self-play games in parallel using multiprocessing.
+
+        Splits games across workers, each with its own model copy on CPU.
+        Returns (new_examples, results) matching the sequential path.
+        """
+        # Distribute games across workers
+        per_worker = n_network // self.num_workers
+        remainder = n_network % self.num_workers
+        game_counts = [per_worker + (1 if i < remainder else 0) for i in range(self.num_workers)]
+        # Filter out workers with 0 games
+        game_counts = [c for c in game_counts if c > 0]
+
+        # Copy model weights to CPU once
+        model_state_dict = {k: v.cpu() for k, v in self.network.state_dict().items()}
+
+        worker_args = [
+            (
+                count, model_state_dict, self.network_type, self.hidden, self.num_blocks,
+                self.simulations, self.c_puct, self.mcts_batch_size, self.temperature,
+                4, 80, 15,  # random_opening, max_moves, temp_moves
+                self.full_search_fraction, self.cheap_sims,
+            )
+            for count in game_counts
+        ]
+
+        with multiprocessing.Pool(processes=len(game_counts)) as pool:
+            results_list = pool.map(_play_network_games_worker, worker_args)
+
+        # Merge results
+        new_examples = []
+        results = {"white": 0, "black": 0, "draw": 0}
+        for planes_np, policies_np, values_np, search_scores_np, worker_results in results_list:
+            for i in range(len(values_np)):
+                new_examples.append((planes_np[i], policies_np[i], float(values_np[i]), float(search_scores_np[i])))
+            for k in results:
+                results[k] += worker_results[k]
+
+        return new_examples, results
+
+    def _play_onnx_games_parallel(self, n_network: int, onnx_path: str):
+        """Play network self-play games in parallel using ONNX (pure Rust).
+
+        Each worker loads the ONNX model independently — no Python model,
+        no GIL contention, no PyTorch overhead.
+        """
+        per_worker = n_network // self.num_workers
+        remainder = n_network % self.num_workers
+        game_counts = [per_worker + (1 if i < remainder else 0) for i in range(self.num_workers)]
+        game_counts = [c for c in game_counts if c > 0]
+
+        worker_args = [
+            (
+                count, onnx_path, False,  # use_coreml=False (CPU for workers)
+                self.simulations, self.c_puct, self.mcts_batch_size, self.temperature,
+                4, 80, 15,  # random_opening, max_moves, temp_moves
+                self.full_search_fraction, self.cheap_sims,
+            )
+            for count in game_counts
+        ]
+
+        with multiprocessing.Pool(processes=len(game_counts)) as pool:
+            results_list = pool.map(_play_onnx_games_worker, worker_args)
+
+        # Merge results
+        new_examples = []
+        results = {"white": 0, "black": 0, "draw": 0}
+        for planes_np, policies_np, values_np, search_scores_np, worker_results in results_list:
+            for i in range(len(values_np)):
+                new_examples.append((planes_np[i], policies_np[i], float(values_np[i]), float(search_scores_np[i])))
+            for k in results:
+                results[k] += worker_results[k]
+
+        return new_examples, results
+
+    def _play_onnx_games_sequential(self, n_network: int, onnx_path: str):
+        """Play network self-play games sequentially using ONNX (pure Rust)."""
+        from tonnesjakk._core import OnnxSession as _OnnxSession
+
+        onnx_session = _OnnxSession(onnx_path, use_coreml=False)
+        engine = _RustMCTSEngine(self.simulations, self.c_puct)
+
+        new_examples = []
+        results = {"white": 0, "black": 0, "draw": 0}
+        for _ in range(n_network):
+            nr = engine.play_network_game_onnx(
+                onnx_session, batch_size=self.mcts_batch_size,
+                random_opening=4, max_moves=80,
+                temp_moves=15, temperature=self.temperature,
+                full_search_fraction=self.full_search_fraction,
+                cheap_sims=self.cheap_sims,
+            )
+            for ex in nr.examples:
+                new_examples.append((
+                    np.array(ex.planes, dtype=np.float32).reshape(BOARD_PLANES, BOARD_SIZE, BOARD_SIZE),
+                    np.array(ex.policy_target, dtype=np.float32),
+                    ex.value_target,
+                    ex.search_score,
+                ))
+            results[nr.winner] += 1
+
+        return new_examples, results
+
+    def generate_bootstrap_games(self, num_games: int, depth: int = 7,
+                                  random_opening: int = 4, max_moves: int = 80):
+        """Generate alpha-beta self-play games for bootstrapping.
+
+        Uses multiprocessing to generate games in parallel. Each game uses
+        alpha-beta search (not MCTS) with soft policy targets from heuristic
+        evaluation of all moves. Results go directly into the replay buffer.
+        """
+        workers = max(1, self.num_workers)
+        # Generate in batches so we can print progress
+        batch_size = workers * 50  # ~50 games per worker per batch
+        games_done = 0
+        total_examples = 0
+        game_results = {"white": 0, "black": 0, "draw": 0}
+
+        t0 = time.time()
+        print(f"Generating {num_games} alpha-beta bootstrap games (depth {depth}, {workers} workers)...")
+
+        while games_done < num_games:
+            batch = min(batch_size, num_games - games_done)
+            per_worker = batch // workers
+            remainder = batch % workers
+            game_counts = [per_worker + (1 if i < remainder else 0) for i in range(workers)]
+            game_counts = [c for c in game_counts if c > 0]
+
+            worker_args = [
+                (count, depth, random_opening, max_moves, self.simulations, self.c_puct)
+                for count in game_counts
+            ]
+
+            if len(game_counts) == 1:
+                results_list = [_play_alphabeta_games_worker(worker_args[0])]
+            else:
+                with multiprocessing.Pool(processes=len(game_counts)) as pool:
+                    results_list = pool.map(_play_alphabeta_games_worker, worker_args)
+
+            # Merge into replay buffer
+            for planes_np, policies_np, values_np, search_scores_np, worker_results in results_list:
+                for i in range(len(values_np)):
+                    self.replay_buffer.append((planes_np[i], policies_np[i], float(values_np[i]), float(search_scores_np[i])))
+                    total_examples += 1
+                for k in game_results:
+                    game_results[k] += worker_results[k]
+
+            games_done += batch
+            elapsed = time.time() - t0
+            rate = games_done / elapsed
+            remaining = (num_games - games_done) / rate if rate > 0 else 0
+            print(f"  {games_done:,}/{num_games:,} games ({rate:.1f}/s) | "
+                  f"W:{game_results['white']} B:{game_results['black']} D:{game_results['draw']} | "
+                  f"{total_examples:,} examples | ~{remaining:.0f}s remaining",
+                  flush=True)
+
+        effective_max = self._effective_buffer_max()
+        if len(self.replay_buffer) > effective_max:
+            self.replay_buffer = self.replay_buffer[-effective_max:]
+
+        elapsed = time.time() - t0
+        print(f"Bootstrap complete: {num_games} games in {elapsed/60:.1f}m | "
+              f"buffer: {len(self.replay_buffer):,} examples")
 
     def run(
         self,
@@ -402,6 +853,7 @@ class AlphaZeroTrainer:
         save_dir: str = "alphazero_checkpoints",
         heuristic_ratio: float = 0.0,
         verbose: bool = True,
+        logger: Optional["TrainingLogger"] = None,
     ):
         """Run the full AlphaZero training loop.
 
@@ -424,64 +876,58 @@ class AlphaZeroTrainer:
         total_games = 0
 
         for iteration in range(1, iterations + 1):
+            self._current_iteration += 1
             iter_start = time.time()
 
             # --- Self-play ---
             self.network.eval()
-            mcts = NetworkMCTS(
-                self.network,
-                simulations=self.simulations,
-                c_puct=self.c_puct,
-                device=self.device,
-            )
+
+            # Export ONNX model for pure-Rust inference (no Python/GIL in self-play)
+            onnx_path = str(save_path / "_current.onnx")
+            self.export_onnx(onnx_path)
 
             new_examples = []
             results = {"white": 0, "black": 0, "draw": 0}
             n_heuristic = int(self.games_per_iter * heuristic_ratio)
             n_network = self.games_per_iter - n_heuristic
 
-            # Heuristic self-play games (fully in Rust, ~4ms each)
+            # Alpha-beta self-play games (fully in Rust, strong + balanced)
             if n_heuristic > 0:
-                rust_engine = _RustMCTSEngine(max(200, self.simulations), self.c_puct)
-                h_results = rust_engine.play_heuristic_games(
-                    n_heuristic, random_opening=6, max_moves=80, temp_moves=10,
+                rust_engine = _RustMCTSEngine(self.simulations, self.c_puct)
+                ab_results = rust_engine.play_alphabeta_games(
+                    n_heuristic, depth=7, random_opening=4, max_moves=80,
                 )
-                for hr in h_results:
-                    for ex in hr.examples:
+                for ar in ab_results:
+                    for ex in ar.examples:
                         new_examples.append((
-                            np.array(ex.planes, dtype=np.float32).reshape(6, 6, 6),
+                            np.array(ex.planes, dtype=np.float32).reshape(BOARD_PLANES, BOARD_SIZE, BOARD_SIZE),
                             np.array(ex.policy_target, dtype=np.float32),
                             ex.value_target,
+                            ex.search_score,
                         ))
-                    results[hr.winner] += 1
+                    results[ar.winner] += 1
                     total_games += 1
 
             heuristic_time = time.time() - iter_start
 
-            # Network self-play games (game loop in Rust, NN callback in Python)
-            rust_net_engine = _RustMCTSEngine(self.simulations, self.c_puct)
-            batch_eval_fn = mcts._batch_eval_fn
-            for g in range(n_network):
-                nr = rust_net_engine.play_network_game(
-                    batch_eval_fn, batch_size=mcts.batch_size,
-                    random_opening=4, max_moves=80,
-                    temp_moves=15, temperature=self.temperature,
-                )
-                for ex in nr.examples:
-                    new_examples.append((
-                        np.array(ex.planes, dtype=np.float32).reshape(6, 6, 6),
-                        np.array(ex.policy_target, dtype=np.float32),
-                        ex.value_target,
-                    ))
-                results[nr.winner] += 1
-                total_games += 1
+            # Network self-play games via ONNX (pure Rust, no Python/GIL)
+            if n_network > 0:
+                if self.num_workers > 1:
+                    par_examples, par_results = self._play_onnx_games_parallel(n_network, onnx_path)
+                else:
+                    par_examples, par_results = self._play_onnx_games_sequential(n_network, onnx_path)
+                new_examples.extend(par_examples)
+                for k in results:
+                    results[k] += par_results[k]
+                total_games += n_network
 
             selfplay_time = time.time() - iter_start
 
-            # Add to replay buffer
+            # Add to replay buffer (growing buffer: starts small, grows to buffer_max)
             self.replay_buffer.extend(new_examples)
-            if len(self.replay_buffer) > self.buffer_max:
-                self.replay_buffer = self.replay_buffer[-self.buffer_max:]
+            effective_max = self._effective_buffer_max()
+            if len(self.replay_buffer) > effective_max:
+                self.replay_buffer = self.replay_buffer[-effective_max:]
 
             # --- Training ---
             train_start = time.time()
@@ -505,10 +951,31 @@ class AlphaZeroTrainer:
                     flush=True,
                 )
 
+            # Compute search_score stats for logging
+            ss_mean = ss_std = ss_mae = 0.0
+            if new_examples:
+                ss = np.array([ex[3] for ex in new_examples], dtype=np.float32)
+                vt = np.array([ex[2] for ex in new_examples], dtype=np.float32)
+                ss_mean = float(np.mean(ss))
+                ss_std = float(np.std(ss))
+                ss_mae = float(np.mean(np.abs(ss - vt)))
+
+            if logger:
+                logger.log_iteration(
+                    iteration, game_results=results,
+                    buffer_size=len(self.replay_buffer),
+                    policy_loss=policy_loss, value_loss=value_loss,
+                    lr=current_lr, selfplay_time=selfplay_time,
+                    train_time=train_time,
+                    search_score_mean=ss_mean, search_score_std=ss_std,
+                    search_score_mae=ss_mae,
+                    n_heuristic=n_heuristic, n_network=n_network,
+                )
+
             # --- Evaluation ---
             if eval_every > 0 and iteration % eval_every == 0:
                 elo, elo_lo, elo_hi, w, d, l = self._evaluate(
-                    eval_games, eval_depth
+                    eval_games, eval_depth, onnx_path=onnx_path,
                 )
                 if verbose:
                     print(
@@ -517,11 +984,28 @@ class AlphaZeroTrainer:
                         f"ELO: {elo:+.0f} [{elo_lo:+.0f}, {elo_hi:+.0f}]",
                         flush=True,
                     )
+                if logger:
+                    logger.log_eval(
+                        iteration, wins=w, draws=d, losses=l,
+                        elo=elo, elo_lo=elo_lo, elo_hi=elo_hi, depth=eval_depth,
+                    )
                 if elo > best_elo:
                     best_elo = elo
                     self._save(save_path / "best_model.pt")
                     if verbose:
                         print(f"  >> New best ELO: {elo:+.0f}, saved.", flush=True)
+
+                # Model gating: revert to best checkpoint if win rate drops
+                if self.gate_threshold > 0:
+                    total = w + d + l
+                    win_rate = (w + 0.5 * d) / total if total > 0 else 0.5
+                    if win_rate < self.gate_threshold:
+                        best_path = save_path / "best_model.pt"
+                        if best_path.exists():
+                            self.load(str(best_path), load_buffer=False)
+                            if verbose:
+                                print(f"  >> Gating: win rate {win_rate:.1%} < {self.gate_threshold:.1%}, "
+                                      f"reverted to best model.", flush=True)
 
             # Save periodic checkpoint
             if iteration % 10 == 0:
@@ -602,22 +1086,24 @@ class AlphaZeroTrainer:
                     mirror_idx = torch.tensor(_POLICY_MIRROR, dtype=torch.long, device=self.device)
                     batch_policies[mirror_mask] = batch_policies[mirror_mask][:, mirror_idx]
 
-                # Forward
-                policy_logits, value_pred = self.network(batch_boards)
-
-                # Policy loss: cross-entropy with MCTS visit distribution
-                # -sum(target * log_softmax(logits))
-                log_probs = F.log_softmax(policy_logits, dim=-1)
-                policy_loss = -torch.sum(batch_policies * log_probs, dim=-1).mean()
-
-                # Value loss: MSE
-                value_loss = F.mse_loss(value_pred, batch_values)
-
-                # Combined loss with policy weight (#6)
-                loss = self.policy_weight * policy_loss + value_loss
+                # Forward (with optional AMP)
+                if self.use_amp:
+                    with torch.autocast(device_type=self.device.type, dtype=torch.float16):
+                        policy_logits, value_pred = self.network(batch_boards)
+                        log_probs = F.log_softmax(policy_logits, dim=-1)
+                        policy_loss = -torch.sum(batch_policies * log_probs, dim=-1).mean()
+                        value_loss = F.mse_loss(value_pred, batch_values)
+                        loss = self.policy_weight * policy_loss + value_loss
+                else:
+                    policy_logits, value_pred = self.network(batch_boards)
+                    log_probs = F.log_softmax(policy_logits, dim=-1)
+                    policy_loss = -torch.sum(batch_policies * log_probs, dim=-1).mean()
+                    value_loss = F.mse_loss(value_pred, batch_values)
+                    loss = self.policy_weight * policy_loss + value_loss
 
                 self.optimizer.zero_grad()
                 loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.network.parameters(), max_norm=1.0)
                 self.optimizer.step()
 
                 total_policy_loss += policy_loss.item()
@@ -629,34 +1115,59 @@ class AlphaZeroTrainer:
         return avg_p, avg_v
 
     def _evaluate(
-        self, num_games: int, opponent_depth: int
+        self, num_games: int, opponent_depth: int,
+        onnx_path: Optional[str] = None,
     ) -> Tuple[float, float, float, int, int, int]:
         """Play network MCTS vs alpha-beta engine (game loop in Rust).
 
+        If onnx_path is provided, uses ONNX inference (pure Rust, no Python).
         Returns (elo, elo_lo, elo_hi, wins, draws, losses).
         """
-        self.network.eval()
-        mcts = NetworkMCTS(
-            self.network,
-            simulations=self.simulations,
-            c_puct=self.c_puct,
-            device=self.device,
-        )
         rust_engine = _RustMCTSEngine(self.simulations, self.c_puct)
-        result = rust_engine.play_eval_match(
-            mcts._batch_eval_fn,
-            num_games=num_games,
-            opponent_depth=opponent_depth,
-            batch_size=mcts.batch_size,
-            random_opening=2,
-            max_moves=80,
-        )
+        if onnx_path:
+            from tonnesjakk._core import OnnxSession as _OnnxSession
+            onnx_session = _OnnxSession(onnx_path, use_coreml=False)
+            result = rust_engine.play_eval_match_onnx(
+                onnx_session,
+                num_games=num_games,
+                opponent_depth=opponent_depth,
+                batch_size=self.mcts_batch_size,
+                random_opening=2,
+                max_moves=80,
+            )
+        else:
+            self.network.eval()
+            mcts = NetworkMCTS(
+                self.network,
+                simulations=self.simulations,
+                c_puct=self.c_puct,
+                batch_size=self.mcts_batch_size,
+                device=self.device,
+                use_amp=self.use_amp,
+            )
+            result = rust_engine.play_eval_match(
+                mcts._batch_eval_fn,
+                num_games=num_games,
+                opponent_depth=opponent_depth,
+                batch_size=mcts.batch_size,
+                random_opening=2,
+                max_moves=80,
+            )
         wins, draws, losses = result.wins, result.draws, result.losses
         elo, elo_lo, elo_hi = elo_with_ci(wins, losses, draws)
         return elo, elo_lo, elo_hi, wins, draws, losses
 
     def _save(self, path: Path):
-        """Save model checkpoint + replay buffer."""
+        """Save model checkpoint + replay buffer.
+
+        The buffer sidecar (``<path>.buffer.npz``) contains arrays:
+        ``boards``, ``policies``, ``values``, and ``search_scores``.
+        ``search_scores`` holds the per-position search evaluation (current
+        player perspective) — useful for analysing how the engine assessed
+        each position during self-play.
+        """
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
         torch.save({
             "model_state_dict": self.network.state_dict(),
             "optimizer_state_dict": self.optimizer.state_dict(),
@@ -670,7 +1181,50 @@ class AlphaZeroTrainer:
             boards = np.array([ex[0] for ex in self.replay_buffer])
             policies = np.array([ex[1] for ex in self.replay_buffer])
             values = np.array([ex[2] for ex in self.replay_buffer], dtype=np.float32)
-            np.savez_compressed(buf_path, boards=boards, policies=policies, values=values)
+            search_scores = np.array([ex[3] if len(ex) > 3 else 0.0 for ex in self.replay_buffer], dtype=np.float32)
+            np.savez_compressed(buf_path, boards=boards, policies=policies, values=values, search_scores=search_scores)
+
+    def export_onnx(self, path: str):
+        """Export current network to ONNX format for Rust-side inference.
+
+        The exported model takes input shape [batch, 5, 6, 6] and produces:
+          - output 0: policy logits [batch, 1332]
+          - output 1: value [batch]
+        """
+        import logging
+        import warnings
+        import os
+        self.network.eval()
+        dummy = torch.randn(1, BOARD_PLANES, BOARD_SIZE, BOARD_SIZE, device=self.device)
+        # Suppress verbose ONNX export warnings and torch.onnx logs
+        prev_levels = {}
+        for name in ["", "torch.onnx", "torch.onnx._internal"]:
+            logger = logging.getLogger(name)
+            prev_levels[name] = logger.level
+            logger.setLevel(logging.CRITICAL)
+        old_env = os.environ.get("ONNX_LOG_LEVEL")
+        os.environ["ONNX_LOG_LEVEL"] = "ERROR"
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            torch.onnx.export(
+                self.network,
+                dummy,
+                path,
+                input_names=["planes"],
+                output_names=["policy", "value"],
+                dynamic_axes={
+                    "planes": {0: "batch"},
+                    "policy": {0: "batch"},
+                    "value": {0: "batch"},
+                },
+                opset_version=18,
+            )
+        for name, level in prev_levels.items():
+            logging.getLogger(name).setLevel(level)
+        if old_env is None:
+            os.environ.pop("ONNX_LOG_LEVEL", None)
+        else:
+            os.environ["ONNX_LOG_LEVEL"] = old_env
 
     def load(self, path: str, load_buffer: bool = True):
         """Load model checkpoint + optionally replay buffer."""
@@ -693,8 +1247,9 @@ class AlphaZeroTrainer:
             boards = data["boards"]
             policies = data["policies"]
             values = data["values"]
+            search_scores = data["search_scores"] if "search_scores" in data else np.zeros_like(values)
             self.replay_buffer = [
-                (boards[i], policies[i], float(values[i]))
+                (boards[i], policies[i], float(values[i]), float(search_scores[i]))
                 for i in range(len(values))
             ]
             print(f"Loaded model from {path} (buffer: {len(self.replay_buffer):,} examples)")
@@ -744,8 +1299,14 @@ Examples:
                         help="Residual blocks for resnet (default: 5)")
     parser.add_argument("--policy-weight", type=float, default=1.0,
                         help="Policy loss weight (default: 1.0)")
+    parser.add_argument("--mcts-batch-size", type=int, default=8,
+                        help="MCTS evaluation batch size (default: 8)")
+    parser.add_argument("--amp", action="store_true",
+                        help="Enable mixed precision (FP16) inference and training")
     parser.add_argument("--device", type=str, default="auto",
                         help="Device: auto, cpu, cuda, mps (default: auto)")
+    parser.add_argument("--workers", type=int, default=1,
+                        help="Parallel self-play workers (default: 1)")
 
     # Evaluation
     parser.add_argument("--eval-every", type=int, default=5,
@@ -778,6 +1339,9 @@ Examples:
             network_type=args.network,
             num_blocks=args.num_blocks,
             device=args.device,
+            mcts_batch_size=args.mcts_batch_size,
+            use_amp=args.amp,
+            num_workers=args.workers,
         )
         trainer.load(args.evaluate)
         elo, elo_lo, elo_hi, w, d, l = trainer._evaluate(
@@ -802,6 +1366,9 @@ Examples:
             num_blocks=args.num_blocks,
             policy_weight=args.policy_weight,
             device=args.device,
+            mcts_batch_size=args.mcts_batch_size,
+            use_amp=args.amp,
+            num_workers=args.workers,
         )
 
         print("=" * 60)
@@ -811,6 +1378,7 @@ Examples:
         print(f"  Iterations: {args.iterations}")
         print(f"  Games/iter: {args.games_per_iter}")
         print(f"  Simulations: {args.simulations}")
+        print(f"  Workers: {args.workers}")
         print(f"  LR: {args.lr} (cosine annealing)")
         print(f"  Policy weight: {args.policy_weight}")
         print(f"  Device: {trainer.device}")

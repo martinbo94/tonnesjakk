@@ -211,6 +211,7 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<mcts::TrainingExample>()?;
     m.add_class::<mcts::SelfPlayResult>()?;
     m.add_class::<mcts::EvalMatchResult>()?;
+    m.add_class::<mcts::OnnxSession>()?;
     Ok(())
 }
 
@@ -262,6 +263,10 @@ mod tests {
 
     /// Konverter Move til en sammenlignbar nøkkel
     fn move_key(mv: &Move) -> String {
+        if mv.is_pail_only {
+            let pail = mv.place_pail.unwrap();
+            return format!("pail_only({},{})", pail.row, pail.col);
+        }
         let pail = match mv.place_pail {
             Some(p) => format!("pail({},{})", p.row, p.col),
             None => "no_pail".to_string(),
@@ -306,10 +311,60 @@ mod tests {
         println!("✓ Both generated {} unique moves", board_keys.len());
     }
 
-    /// Test at make_move/unmake_move fungerer korrekt
+    /// Hjelpefunksjon: sett opp et brett med pails allerede plassert
+    fn setup_test_board_with_pails() -> Board {
+        let mut board = Board::new();
+        board.cells[5][2] = Cell::WhiteBarrel;
+        board.cells[5][3] = Cell::WhiteBarrel;
+        board.cells[0][2] = Cell::BlackBarrel;
+        board.cells[0][3] = Cell::BlackBarrel;
+        board.white_barrels_off_board = 2;
+        board.black_barrels_off_board = 2;
+        board.cells[3][3] = Cell::WhitePail;
+        board.white_pail_placed = true;
+        board.cells[2][2] = Cell::BlackPail;
+        board.black_pail_placed = true;
+        board
+    }
+
+    /// Test at make_move/unmake_move fungerer korrekt for pail sub-moves
+    #[test]
+    fn test_make_unmake_pail_submove() {
+        let board = setup_test_board(); // no pails placed
+        let bb_original = BitBoard::from_board(&board);
+        let mut bb = bb_original;
+
+        let moves = bb.generate_moves();
+        assert!(!moves.is_empty(), "No moves generated");
+        assert!(moves[0].is_pail_placement(), "First moves should be pail placements");
+
+        for mv in moves.iter().take(10) {
+            let undo = bb.make_move(mv);
+
+            // Pail sub-move: player stays the same, awaiting_barrel is set
+            assert_eq!(bb.current_player, bb_original.current_player);
+            assert!(bb.awaiting_barrel);
+
+            // Angre trekket
+            bb.unmake_move(&undo);
+
+            // Sjekk at vi er tilbake til original
+            assert_eq!(bb.white_barrels, bb_original.white_barrels);
+            assert_eq!(bb.black_barrels, bb_original.black_barrels);
+            assert_eq!(bb.white_pail, bb_original.white_pail);
+            assert_eq!(bb.black_pail, bb_original.black_pail);
+            assert_eq!(bb.occupied, bb_original.occupied);
+            assert_eq!(bb.current_player, bb_original.current_player);
+            assert_eq!(bb.awaiting_barrel, bb_original.awaiting_barrel);
+        }
+
+        println!("✓ make_move/unmake_move works for pail sub-moves");
+    }
+
+    /// Test at make_move/unmake_move fungerer korrekt for barrel moves
     #[test]
     fn test_make_unmake_move() {
-        let board = setup_test_board();
+        let board = setup_test_board_with_pails();
         let bb_original = BitBoard::from_board(&board);
         let mut bb = bb_original;
 
@@ -319,7 +374,7 @@ mod tests {
         for mv in moves.iter().take(10) {
             let undo = bb.make_move(mv);
 
-            // Sjekk at noe har endret seg
+            // Barrel move: player should switch
             assert_ne!(bb.current_player, bb_original.current_player);
 
             // Angre trekket
@@ -332,9 +387,10 @@ mod tests {
             assert_eq!(bb.black_pail, bb_original.black_pail);
             assert_eq!(bb.occupied, bb_original.occupied);
             assert_eq!(bb.current_player, bb_original.current_player);
+            assert_eq!(bb.awaiting_barrel, bb_original.awaiting_barrel);
         }
 
-        println!("✓ make_move/unmake_move works correctly");
+        println!("✓ make_move/unmake_move works correctly for barrel moves");
     }
 
     /// Test at prekalkulerte tabeller er korrekte
