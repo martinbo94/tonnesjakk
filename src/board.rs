@@ -237,6 +237,7 @@ pub struct BitBoard {
     pub black_barrels_off_board: u8,
     pub white_scored: u8,
     pub black_scored: u8,
+    pub awaiting_barrel: bool,  // True after pail sub-move, before barrel sub-move
 }
 
 /// Informasjon for å angre et trekk
@@ -254,17 +255,21 @@ pub struct UndoInfo {
     pub black_barrels_off_board: u8,
     pub white_scored: u8,
     pub black_scored: u8,
+    pub awaiting_barrel: bool,
+    pub current_player: Player,
+    pub move_count: u32,
 }
 
 /// Kompakt representasjon av et trekk for bitboard (32 bits)
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct BitMove {
     /// Packed data:
-    /// bits 0-5: barrel_to (0-35)
+    /// bits 0-5: barrel_to (0-35), or pail_sq for pail-only moves
     /// bits 6-11: barrel_from (0-35, eller 63 for plassering)
     /// bits 12-17: pail_pos (0-35, eller 63 for ingen)
     /// bit 18: is_placement
     /// bits 19-23: path_len (0-31)
+    /// bit 24: is_pail_placement (pail-only sub-move)
     pub packed: u32,
     /// Hopp-sti (opptil 8 hopp)
     pub path: [u8; 8],
@@ -272,6 +277,28 @@ pub struct BitMove {
 
 impl BitMove {
     const NO_POS: u8 = 63;
+
+    /// Create a pail-only sub-move (place pail, no barrel action).
+    /// Stores pail target in barrel_to bits; sets bit 18 (is_placement) for policy_index reuse
+    /// and bit 24 (is_pail_placement) to distinguish from barrel placements.
+    #[inline]
+    pub fn new_pail_placement(pail_sq: u8) -> Self {
+        let packed = (pail_sq as u32)
+            | ((Self::NO_POS as u32) << 6)
+            | ((Self::NO_POS as u32) << 12)
+            | (1 << 18)  // is_placement = true (for policy index: from=36)
+            | (1 << 24); // is_pail_placement = true
+        BitMove {
+            packed,
+            path: [0; 8],
+        }
+    }
+
+    /// Check if this is a pail-only sub-move (bit 24).
+    #[inline]
+    pub fn is_pail_placement(&self) -> bool {
+        (self.packed >> 24) & 1 == 1
+    }
 
     #[inline]
     pub fn new_placement(barrel_to: u8, pail_pos: Option<u8>) -> Self {
@@ -337,6 +364,14 @@ impl BitMove {
 
     /// Konverter til Move (for Python-kompatibilitet)
     pub fn to_move(&self) -> Move {
+        // Pail-only sub-move
+        if self.is_pail_placement() {
+            let pail_sq = self.barrel_to();
+            let (r, c) = sq_to_coords(pail_sq as usize);
+            let pos = Position::new(r as i8, c as i8);
+            return Move::pail_only(pos);
+        }
+
         let barrel_to = self.barrel_to();
         let (to_row, to_col) = sq_to_coords(barrel_to as usize);
         let to_pos = Position::new(to_row as i8, to_col as i8);
@@ -393,6 +428,7 @@ impl BitBoard {
             black_barrels_off_board: BARRELS_PER_PLAYER as u8,
             white_scored: 0,
             black_scored: 0,
+            awaiting_barrel: false,
         }
     }
 
@@ -413,6 +449,7 @@ impl BitBoard {
             black_barrels_off_board: board.black_barrels_off_board,
             white_scored: board.white_scored,
             black_scored: board.black_scored,
+            awaiting_barrel: board.awaiting_barrel,
         };
 
         for row in 0..BOARD_SIZE {
@@ -444,6 +481,7 @@ impl BitBoard {
         board.black_barrels_off_board = self.black_barrels_off_board;
         board.white_scored = self.white_scored;
         board.black_scored = self.black_scored;
+        board.awaiting_barrel = self.awaiting_barrel;
 
         // Sett celler fra bitboards
         let mut bb = self.white_barrels;
@@ -522,7 +560,7 @@ impl BitBoard {
         }
     }
 
-    /// Lagre state for undo
+    /// Lagre state for undo (full snapshot for sub-move support)
     #[inline]
     pub fn save_undo(&self) -> UndoInfo {
         UndoInfo {
@@ -538,10 +576,13 @@ impl BitBoard {
             black_barrels_off_board: self.black_barrels_off_board,
             white_scored: self.white_scored,
             black_scored: self.black_scored,
+            awaiting_barrel: self.awaiting_barrel,
+            current_player: self.current_player,
+            move_count: self.move_count,
         }
     }
 
-    /// Gjenopprett state fra undo
+    /// Gjenopprett state fra undo (full snapshot restore, no hardcoded player flip)
     #[inline]
     pub fn restore_undo(&mut self, undo: &UndoInfo) {
         self.white_barrels = undo.white_barrels;
@@ -556,25 +597,40 @@ impl BitBoard {
         self.black_barrels_off_board = undo.black_barrels_off_board;
         self.white_scored = undo.white_scored;
         self.black_scored = undo.black_scored;
-
-        // Bytt tilbake spiller
-        self.current_player = self.current_player.opponent();
-        self.move_count -= 1;
+        self.awaiting_barrel = undo.awaiting_barrel;
+        self.current_player = undo.current_player;
+        self.move_count = undo.move_count;
     }
 
     /// Generer alle lovlige trekk (bitboard-versjon)
     ///
-    /// New rules: Pail must be moved every turn!
-    /// - First turn: Place pail somewhere (required) + place/move barrel
-    /// - Subsequent turns: Move pail to new location (required) + move barrel
+    /// Three-phase sub-move system:
+    /// Phase 1: !pail_placed && !awaiting_barrel → pail-only moves (any empty square)
+    /// Phase 2: awaiting_barrel → barrel placement/move only (no pail in move)
+    /// Phase 3: pail already placed → existing barrel logic
     pub fn generate_moves(&self) -> Vec<BitMove> {
-        let mut moves = Vec::with_capacity(64);
         let player = self.current_player;
 
         let pail_placed = match player {
             Player::White => self.white_pail_placed,
             Player::Black => self.black_pail_placed,
         };
+
+        // Phase 1: Pail-only sub-move
+        if !pail_placed && !self.awaiting_barrel {
+            let mut moves = Vec::with_capacity(36);
+            let empty = self.empty();
+            let mut e = empty;
+            while e != 0 {
+                let sq = e.trailing_zeros() as u8;
+                moves.push(BitMove::new_pail_placement(sq));
+                e &= e - 1;
+            }
+            return moves;
+        }
+
+        // Phase 2 (awaiting_barrel) / Phase 3 (normal): barrel moves only, no pail component
+        let mut moves = Vec::with_capacity(64);
         let barrels_off = match player {
             Player::White => self.white_barrels_off_board,
             Player::Black => self.black_barrels_off_board,
@@ -585,72 +641,42 @@ impl BitBoard {
         };
 
         let start_row_mask = self.starting_row_mask(player);
-
-        // Empty squares for moves
         let empty = self.empty();
 
-        // Pail placement: only on first turn when pail not yet placed
-        // Generate pail destinations (empty if already placed)
-        let pail_destinations: Vec<Option<u8>> = if !pail_placed {
-            // First placement: any empty square
-            let mut dests = Vec::with_capacity(32);
-            let mut e = empty;
-            while e != 0 {
-                let sq = e.trailing_zeros() as u8;
-                dests.push(Some(sq));
-                e &= e - 1;
+        // A: Plasser ny tønne fra utenfor brettet
+        if barrels_off > 0 {
+            let placements = start_row_mask & empty;
+            let mut p = placements;
+            while p != 0 {
+                let to_sq = p.trailing_zeros() as u8;
+                moves.push(BitMove::new_placement(to_sq, None));
+                p &= p - 1;
             }
-            dests
-        } else {
-            // Pail already placed - no pail move needed
-            vec![None]
-        };
+        }
 
-        // For each pail destination (or None if already placed), generate barrel moves
-        for pail_opt in &pail_destinations {
-            // Calculate occupied squares with pail in new position (if placing)
-            let temp_occupied = if let Some(pail_sq) = pail_opt {
-                self.occupied | bit(*pail_sq as usize)
-            } else {
-                self.occupied
-            };
-            let temp_empty = !temp_occupied & ((1u64 << NUM_SQUARES) - 1);
+        // B: Flytt eksisterende tønne
+        let mut barrels = my_barrels;
+        while barrels != 0 {
+            let from_sq = barrels.trailing_zeros() as u8;
 
-            // A: Plasser ny tønne fra utenfor brettet
-            if barrels_off > 0 {
-                let placements = start_row_mask & temp_empty;
-                let mut p = placements;
-                while p != 0 {
-                    let to_sq = p.trailing_zeros() as u8;
-                    moves.push(BitMove::new_placement(to_sq, *pail_opt));
-                    p &= p - 1;
-                }
+            // Enkle trekk (ett felt) - 8 directions
+            let adjacent = ADJACENT[from_sq as usize] & empty;
+            let mut adj = adjacent;
+            while adj != 0 {
+                let to_sq = adj.trailing_zeros() as u8;
+                moves.push(BitMove::new_move(from_sq, to_sq, &[to_sq], None));
+                adj &= adj - 1;
             }
 
-            // B: Flytt eksisterende tønne
-            let mut barrels = my_barrels;
-            while barrels != 0 {
-                let from_sq = barrels.trailing_zeros() as u8;
+            // Hopp-sekvenser (iterativ DFS)
+            self.find_jumps_iterative(
+                from_sq,
+                self.occupied,
+                None,
+                &mut moves,
+            );
 
-                // Enkle trekk (ett felt) - now 8 directions
-                let adjacent = ADJACENT[from_sq as usize] & temp_empty;
-                let mut adj = adjacent;
-                while adj != 0 {
-                    let to_sq = adj.trailing_zeros() as u8;
-                    moves.push(BitMove::new_move(from_sq, to_sq, &[to_sq], *pail_opt));
-                    adj &= adj - 1;
-                }
-
-                // Hopp-sekvenser (iterativ DFS)
-                self.find_jumps_iterative(
-                    from_sq,
-                    temp_occupied,
-                    *pail_opt,
-                    &mut moves,
-                );
-
-                barrels &= barrels - 1;
-            }
+            barrels &= barrels - 1;
         }
 
         moves
@@ -757,10 +783,10 @@ impl BitBoard {
     pub fn make_move(&mut self, mv: &BitMove) -> UndoInfo {
         let undo = self.save_undo();
         let player = self.current_player;
-        let goal_row = self.goal_row(player);
 
-        // 1. Place pail (one-time placement, only when not yet placed)
-        if let Some(pail_sq) = mv.pail_pos() {
+        // Handle pail-only sub-move
+        if mv.is_pail_placement() {
+            let pail_sq = mv.barrel_to(); // pail target stored in barrel_to bits
             let pail_bit = bit(pail_sq as usize);
             let (pail_row, pail_col) = sq_to_coords(pail_sq as usize);
 
@@ -781,9 +807,21 @@ impl BitBoard {
                 }
             }
             self.occupied |= pail_bit;
+            self.awaiting_barrel = true;
+            self.hash ^= ZOBRIST.awaiting_barrel;
+            // Do NOT switch player or increment move_count
+            return undo;
         }
 
-        // 2. Håndter tønne
+        // Clear awaiting_barrel if set (barrel sub-move completes the turn)
+        if self.awaiting_barrel {
+            self.awaiting_barrel = false;
+            self.hash ^= ZOBRIST.awaiting_barrel;
+        }
+
+        let goal_row = self.goal_row(player);
+
+        // Handle barrel
         let to_sq = mv.barrel_to();
         let to_bit = bit(to_sq as usize);
         let (to_row, to_col) = sq_to_coords(to_sq as usize);
@@ -847,7 +885,7 @@ impl BitBoard {
             }
         }
 
-        // 3. Bytt spiller
+        // Switch player and increment move_count
         self.hash ^= ZOBRIST.player_to_move;
         self.current_player = player.opponent();
         self.move_count += 1;
@@ -913,6 +951,7 @@ impl Default for BitBoard {
 struct ZobristKeys {
     pieces: [[[u64; 5]; BOARD_SIZE]; BOARD_SIZE], // [row][col][piece_type]
     player_to_move: u64,
+    awaiting_barrel: u64,  // Toggled when awaiting_barrel changes
 }
 
 impl ZobristKeys {
@@ -938,6 +977,7 @@ impl ZobristKeys {
         ZobristKeys {
             pieces,
             player_to_move: next_random(),
+            awaiting_barrel: next_random(),
         }
     }
 
@@ -1050,6 +1090,7 @@ impl Position {
 /// Består av:
 /// - Valgfritt: plasser melkespann (kun hvis ikke allerede plassert)
 /// - Påkrevd: ENTEN plasser ny tønne på startrad ELLER flytt eksisterende tønne
+/// - Pail-only sub-move: only places pail, no barrel action
 #[pyclass]
 #[derive(Clone, Debug)]
 pub struct Move {
@@ -1063,17 +1104,21 @@ pub struct Move {
     pub barrel_to: Position,             // Hvor tønnen ender opp
     #[pyo3(get)]
     pub barrel_path: Vec<Position>,      // Hopp-sti (for flytt med flere hopp)
+    #[pyo3(get)]
+    pub is_pail_only: bool,              // Pail-only sub-move (no barrel action)
 }
 
 #[pymethods]
 impl Move {
     #[new]
+    #[pyo3(signature = (place_pail, is_barrel_placement, barrel_from, barrel_to, barrel_path, is_pail_only=false))]
     fn new(
         place_pail: Option<Position>,
         is_barrel_placement: bool,
         barrel_from: Option<Position>,
         barrel_to: Position,
         barrel_path: Vec<Position>,
+        is_pail_only: bool,
     ) -> Self {
         Move {
             place_pail,
@@ -1081,6 +1126,7 @@ impl Move {
             barrel_from,
             barrel_to,
             barrel_path,
+            is_pail_only,
         }
     }
 
@@ -1093,6 +1139,7 @@ impl Move {
             barrel_from: None,
             barrel_to: to,
             barrel_path: vec![to],
+            is_pail_only: false,
         }
     }
 
@@ -1106,10 +1153,28 @@ impl Move {
             barrel_from: Some(from),
             barrel_to: to,
             barrel_path: path,
+            is_pail_only: false,
+        }
+    }
+
+    /// Hjelpefunksjon for pail-only sub-move
+    #[staticmethod]
+    fn pail_only(pail_pos: Position) -> Self {
+        Move {
+            place_pail: Some(pail_pos),
+            is_barrel_placement: false,
+            barrel_from: None,
+            barrel_to: pail_pos, // dummy, same as pail target
+            barrel_path: vec![],
+            is_pail_only: true,
         }
     }
 
     fn __repr__(&self) -> String {
+        if self.is_pail_only {
+            let p = self.place_pail.unwrap();
+            return format!("Move(pail_only({},{}))", p.row, p.col);
+        }
         let pail_str = match &self.place_pail {
             Some(p) => format!("+pail({},{})", p.row, p.col),
             None => String::new(),
@@ -1125,6 +1190,10 @@ impl Move {
 
     /// Policy index for AlphaZero training: encodes from/to as index in [0, 1331].
     fn policy_index(&self) -> u16 {
+        if self.is_pail_only {
+            let pail = self.place_pail.unwrap();
+            return 36 * 36 + (pail.row * 6 + pail.col) as u16;
+        }
         let to_idx = (self.barrel_to.row * 6 + self.barrel_to.col) as u16;
         let from_idx = if self.is_barrel_placement {
             36u16
@@ -1159,6 +1228,8 @@ pub struct Board {
     pub(crate) white_scored: u8,  // Antall hvite tønner som har nådd mål (fjernet fra brettet)
     #[pyo3(get)]
     pub(crate) black_scored: u8,  // Antall svarte tønner som har nådd mål (fjernet fra brettet)
+    #[pyo3(get)]
+    pub(crate) awaiting_barrel: bool,  // True after pail sub-move, before barrel sub-move
 }
 
 #[pymethods]
@@ -1191,6 +1262,7 @@ impl Board {
             black_barrels_off_board: BARRELS_PER_PLAYER as u8,
             white_scored: 0,
             black_scored: 0,
+            awaiting_barrel: false,
         }
     }
 
@@ -1292,19 +1364,34 @@ impl Board {
     }
 
     /// Generer alle lovlige trekk for nåværende spiller
-    /// Rules:
-    /// 1. (Påkrevd FØRSTE TUR) Plasser melkespann på ledig felt
-    /// 2. (Påkrevd) ENTEN:
-    ///    a) Plasser ny tønne fra utenfor brettet på ledig felt på startrad
-    ///    b) Flytt eksisterende tønne på brettet (8 directions + jumps)
+    /// Three-phase sub-move system:
+    /// Phase 1: !pail_placed && !awaiting_barrel → pail-only moves
+    /// Phase 2: awaiting_barrel → barrel moves only
+    /// Phase 3: pail already placed → barrel moves only
     pub(crate) fn generate_moves(&self) -> Vec<Move> {
-        let mut moves = Vec::new();
         let player = self.current_player;
 
         let pail_placed = match player {
             Player::White => self.white_pail_placed,
             Player::Black => self.black_pail_placed,
         };
+
+        // Phase 1: Pail-only sub-move
+        if !pail_placed && !self.awaiting_barrel {
+            let mut moves = Vec::new();
+            for row in 0..BOARD_SIZE {
+                for col in 0..BOARD_SIZE {
+                    if self.cells[row][col] == Cell::Empty {
+                        let pos = Position::new(row as i8, col as i8);
+                        moves.push(Move::pail_only(pos));
+                    }
+                }
+            }
+            return moves;
+        }
+
+        // Phase 2 (awaiting_barrel) / Phase 3 (normal): barrel moves only
+        let mut moves = Vec::new();
         let barrels_off = match player {
             Player::White => self.white_barrels_off_board,
             Player::Black => self.black_barrels_off_board,
@@ -1313,53 +1400,21 @@ impl Board {
         let barrels_on_board = self.find_barrels(player);
         let start_row = self.starting_row(player);
 
-        // Generate pail destinations (only when not yet placed - one-time!)
-        let pail_destinations: Vec<Option<Position>> = if !pail_placed {
-            // First placement: any empty square
-            let mut dests = Vec::new();
-            for row in 0..BOARD_SIZE {
-                for col in 0..BOARD_SIZE {
-                    if self.cells[row][col] == Cell::Empty {
-                        dests.push(Some(Position::new(row as i8, col as i8)));
-                    }
+        // A: Plasser ny tønne fra utenfor brettet
+        if barrels_off > 0 {
+            for col in 0..BOARD_SIZE {
+                if self.cells[start_row][col] == Cell::Empty {
+                    let to_pos = Position::new(start_row as i8, col as i8);
+                    moves.push(Move::place_barrel(None, to_pos));
                 }
             }
-            dests
-        } else {
-            // Pail already placed - no pail move needed
-            vec![None]
-        };
+        }
 
-        for pail_opt in &pail_destinations {
-            // Create temp board with pail placed (if this is first pail placement)
-            let temp_board = if let Some(pail_dest) = pail_opt {
-                let mut temp = self.clone();
-                let pail_cell = match player {
-                    Player::White => Cell::WhitePail,
-                    Player::Black => Cell::BlackPail,
-                };
-                temp.cells[pail_dest.row as usize][pail_dest.col as usize] = pail_cell;
-                temp
-            } else {
-                self.clone()
-            };
-
-            // Alternativ A: Plasser ny tønne fra utenfor brettet
-            if barrels_off > 0 {
-                for col in 0..BOARD_SIZE {
-                    if temp_board.cells[start_row][col] == Cell::Empty {
-                        let to_pos = Position::new(start_row as i8, col as i8);
-                        moves.push(Move::place_barrel(*pail_opt, to_pos));
-                    }
-                }
-            }
-
-            // Alternativ B: Flytt eksisterende tønne på brettet
-            for &barrel_pos in &barrels_on_board {
-                let barrel_moves = temp_board.get_barrel_moves(barrel_pos, player);
-                for path in barrel_moves {
-                    moves.push(Move::move_barrel(*pail_opt, barrel_pos, path));
-                }
+        // B: Flytt eksisterende tønne på brettet
+        for &barrel_pos in &barrels_on_board {
+            let barrel_moves = self.get_barrel_moves(barrel_pos, player);
+            for path in barrel_moves {
+                moves.push(Move::move_barrel(None, barrel_pos, path));
             }
         }
 
@@ -1369,28 +1424,15 @@ impl Board {
     /// Utfør et trekk på brettet
     fn make_move(&mut self, mv: &Move) -> bool {
         let player = self.current_player;
-        let barrel_cell = match player {
-            Player::White => Cell::WhiteBarrel,
-            Player::Black => Cell::BlackBarrel,
-        };
 
-        // 1. Place pail (one-time placement, only when not yet placed)
-        if let Some(pail_pos) = mv.place_pail {
+        // Handle pail-only sub-move
+        if mv.is_pail_only {
+            let pail_pos = mv.place_pail.unwrap();
             let pail_cell = match player {
                 Player::White => Cell::WhitePail,
                 Player::Black => Cell::BlackPail,
             };
 
-            // Debug assert: pail should not already be placed
-            debug_assert!(
-                match player {
-                    Player::White => !self.white_pail_placed,
-                    Player::Black => !self.black_pail_placed,
-                },
-                "Pail already placed!"
-            );
-
-            // Place pail at position
             let pos = (pail_pos.row as usize, pail_pos.col as usize);
             self.hash ^= ZOBRIST.pieces[pos.0][pos.1][ZobristKeys::piece_index(Cell::Empty)];
             self.hash ^= ZOBRIST.pieces[pos.0][pos.1][ZobristKeys::piece_index(pail_cell)];
@@ -1400,30 +1442,40 @@ impl Board {
                 Player::White => self.white_pail_placed = true,
                 Player::Black => self.black_pail_placed = true,
             }
+            self.awaiting_barrel = true;
+            self.hash ^= ZOBRIST.awaiting_barrel;
+            // Do NOT switch player or increment move_count
+            return true;
         }
 
-        // 2. Håndter tønne: enten plassering eller flytting
+        // Clear awaiting_barrel if set (barrel sub-move completes the turn)
+        if self.awaiting_barrel {
+            self.awaiting_barrel = false;
+            self.hash ^= ZOBRIST.awaiting_barrel;
+        }
+
+        let barrel_cell = match player {
+            Player::White => Cell::WhiteBarrel,
+            Player::Black => Cell::BlackBarrel,
+        };
+
+        // Handle barrel: placement or move
         let barrel_to = (mv.barrel_to.row as usize, mv.barrel_to.col as usize);
         let goal_row = self.goal_row(player);
 
         if mv.is_barrel_placement {
             // Plasser ny tønne fra utenfor brettet
-            // Reduser antall tønner utenfor brettet
             match player {
                 Player::White => self.white_barrels_off_board -= 1,
                 Player::Black => self.black_barrels_off_board -= 1,
             }
 
-            // Sjekk om tønnen når mål med en gang (usannsynlig, men håndter det)
             if barrel_to.0 == goal_row {
-                // Tønnen scorer! Ikke plasser den på brettet, bare tell poeng
                 match player {
                     Player::White => self.white_scored += 1,
                     Player::Black => self.black_scored += 1,
                 }
-                // Oppdater hash for tom rute (den forblir tom)
             } else {
-                // Plasser tønnen på brettet
                 self.hash ^= ZOBRIST.pieces[barrel_to.0][barrel_to.1][ZobristKeys::piece_index(Cell::Empty)];
                 self.hash ^= ZOBRIST.pieces[barrel_to.0][barrel_to.1][ZobristKeys::piece_index(barrel_cell)];
                 self.cells[barrel_to.0][barrel_to.1] = barrel_cell;
@@ -1433,28 +1485,23 @@ impl Board {
             let barrel_from = mv.barrel_from.unwrap();
             let from = (barrel_from.row as usize, barrel_from.col as usize);
 
-            // Fjern tønnen fra gammel posisjon
             self.hash ^= ZOBRIST.pieces[from.0][from.1][ZobristKeys::piece_index(barrel_cell)];
             self.hash ^= ZOBRIST.pieces[from.0][from.1][ZobristKeys::piece_index(Cell::Empty)];
             self.cells[from.0][from.1] = Cell::Empty;
 
-            // Sjekk om tønnen når mål
             if barrel_to.0 == goal_row {
-                // Tønnen scorer! Fjernes fra spillet
                 match player {
                     Player::White => self.white_scored += 1,
                     Player::Black => self.black_scored += 1,
                 }
-                // Ikke plasser tønnen på brettet
             } else {
-                // Plasser tønnen på ny posisjon
                 self.hash ^= ZOBRIST.pieces[barrel_to.0][barrel_to.1][ZobristKeys::piece_index(Cell::Empty)];
                 self.hash ^= ZOBRIST.pieces[barrel_to.0][barrel_to.1][ZobristKeys::piece_index(barrel_cell)];
                 self.cells[barrel_to.0][barrel_to.1] = barrel_cell;
             }
         }
 
-        // 3. Bytt spiller og oppdater hash
+        // Switch player
         self.hash ^= ZOBRIST.player_to_move;
         self.current_player = player.opponent();
         self.move_count += 1;

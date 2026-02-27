@@ -1,0 +1,12 @@
+[
+  {
+    "timestamp": "2026-02-26 15:23:16",
+    "branch": "master",
+    "depth": 7,
+    "positions": 10,
+    "total_nodes": 38688,
+    "total_time_s": 0.746,
+    "nps": 51874,
+    "avg_nodes_per_pos": 3868
+  }
+]

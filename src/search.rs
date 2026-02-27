@@ -1214,7 +1214,8 @@ impl BitBoardEngine {
                     }
                 }
 
-                let score = self.quiesce(&new_bb, alpha, beta, false, qsdepth + 1);
+                let qs_child_maximizing = new_bb.current_player == Player::White;
+                let score = self.quiesce(&new_bb, alpha, beta, qs_child_maximizing, qsdepth + 1);
 
                 if self.halfpail_nnue.is_some() {
                     self.dual_acc_stack.pop();
@@ -1248,7 +1249,8 @@ impl BitBoardEngine {
                     }
                 }
 
-                let score = self.quiesce(&new_bb, alpha, beta, true, qsdepth + 1);
+                let qs_child_maximizing = new_bb.current_player == Player::White;
+                let score = self.quiesce(&new_bb, alpha, beta, qs_child_maximizing, qsdepth + 1);
 
                 if self.halfpail_nnue.is_some() {
                     self.dual_acc_stack.pop();
@@ -1334,6 +1336,13 @@ impl BitBoardEngine {
         let total_remaining = (4u8.saturating_sub(bb.white_scored)) + (4u8.saturating_sub(bb.black_scored));
         let is_endgame = total_remaining <= 3;
 
+        // Pail sub-move detection: disable NMP/razoring/futility at pail positions
+        let pail_placed = match bb.current_player {
+            Player::White => bb.white_pail_placed,
+            Player::Black => bb.black_pail_placed,
+        };
+        let is_pail_position = (!pail_placed && !bb.awaiting_barrel) || bb.awaiting_barrel;
+
         // Terminal node
         if bb.check_winner().is_some() {
             return (self.evaluate(bb), None);
@@ -1362,7 +1371,7 @@ impl BitBoardEngine {
         // When static eval is far below alpha (or above beta for minimizer),
         // drop to quiescence search. If even qsearch can't save the
         // position, prune the entire subtree.
-        if depth <= 3 && !is_endgame {
+        if depth <= 3 && !is_endgame && !is_pail_position {
             let razor_margin = 200 + 150 * depth as i32;
             if maximizing && corrected_eval + razor_margin < alpha {
                 let qscore = self.quiesce(bb, alpha, beta, maximizing, 0);
@@ -1387,6 +1396,7 @@ impl BitBoardEngine {
         let nmp_margin = 50; // Only try NMP if we're at least this much better
         let nmp_allowed = depth >= 4
             && !is_endgame
+            && !is_pail_position
             && corrected_eval.abs() < 90_000
             && !bb.has_barrel_near_goal()
             && beta.abs() < 90_000
@@ -1417,12 +1427,13 @@ impl BitBoardEngine {
             new_bb.make_null_move();
 
             // Search with null window around beta
+            let null_child_maximizing = new_bb.current_player == Player::White;
             let (null_score, _) = if maximizing {
                 // White is maximizing - after null move, black searches to minimize
-                self.minimax(&new_bb, null_depth, beta - 1, beta, false)
+                self.minimax(&new_bb, null_depth, beta - 1, beta, null_child_maximizing)
             } else {
                 // Black is minimizing - after null move, white searches to maximize
-                self.minimax(&new_bb, null_depth, alpha, alpha + 1, true)
+                self.minimax(&new_bb, null_depth, alpha, alpha + 1, null_child_maximizing)
             };
 
             // Check for cutoff
@@ -1444,6 +1455,7 @@ impl BitBoardEngine {
         // Use half the futility margin in endgame (prune less aggressively)
         let margin = if is_endgame { FUTILITY_MARGINS[depth.min(8) as usize] / 2 } else { FUTILITY_MARGINS[depth.min(8) as usize] };
         let futility_pruning = depth <= 8
+            && !is_pail_position
             && corrected_eval.abs() < 90_000 // Not near mate
             && if maximizing {
                 corrected_eval + margin < alpha
@@ -1570,11 +1582,14 @@ impl BitBoardEngine {
             // Set prev_move for continuation history in child nodes
             self.prev_move = Some(mv);
 
+            // Derive child_maximizing from board state (handles pail sub-moves correctly)
+            let child_maximizing = new_bb.current_player == Player::White;
+
             if moves_searched == 0 {
                 // ═══════════════════════════════════════════════════════════════
                 // PVS: Første trekk - fullt vindu (Principal Variation)
                 // ═══════════════════════════════════════════════════════════════
-                let (s, _) = self.minimax(&new_bb, depth - 1, alpha, beta, !maximizing);
+                let (s, _) = self.minimax(&new_bb, depth - 1, alpha, beta, child_maximizing);
                 score = s;
             } else {
                 // ═══════════════════════════════════════════════════════════════
@@ -1606,9 +1621,9 @@ impl BitBoardEngine {
                 let search_depth = depth.saturating_sub(1 + reduction);
 
                 let (null_score, _) = if maximizing {
-                    self.minimax(&new_bb, search_depth, alpha, alpha + 1, false)
+                    self.minimax(&new_bb, search_depth, alpha, alpha + 1, child_maximizing)
                 } else {
-                    self.minimax(&new_bb, search_depth, beta - 1, beta, true)
+                    self.minimax(&new_bb, search_depth, beta - 1, beta, child_maximizing)
                 };
 
                 // Sjekk om vi trenger re-search
@@ -1620,7 +1635,7 @@ impl BitBoardEngine {
 
                 if needs_research {
                     // Re-search med fullt vindu og full dybde
-                    let (full_score, _) = self.minimax(&new_bb, depth - 1, alpha, beta, !maximizing);
+                    let (full_score, _) = self.minimax(&new_bb, depth - 1, alpha, beta, child_maximizing);
                     score = full_score;
                 } else {
                     score = null_score;
@@ -1642,15 +1657,18 @@ impl BitBoardEngine {
                 alpha = alpha.max(score);
                 if beta <= alpha {
                     // Beta cutoff - update killer moves, history, and cont_history
-                    self.store_killer(&mv, depth as usize);
-                    self.update_history(&mv, depth);
-                    if let Some(pm) = prev_mv {
-                        let prev_to = pm.barrel_to() as usize;
-                        let curr_to = mv.barrel_to() as usize;
-                        let bonus = (depth as i32) * (depth as i32);
-                        self.cont_history[prev_to][curr_to] += bonus;
-                        self.cont_history[prev_to][curr_to] =
-                            self.cont_history[prev_to][curr_to].clamp(-32000, 32000);
+                    // (only for barrel moves, not pail-only sub-moves)
+                    if !mv.is_pail_placement() {
+                        self.store_killer(&mv, depth as usize);
+                        self.update_history(&mv, depth);
+                        if let Some(pm) = prev_mv {
+                            let prev_to = pm.barrel_to() as usize;
+                            let curr_to = mv.barrel_to() as usize;
+                            let bonus = (depth as i32) * (depth as i32);
+                            self.cont_history[prev_to][curr_to] += bonus;
+                            self.cont_history[prev_to][curr_to] =
+                                self.cont_history[prev_to][curr_to].clamp(-32000, 32000);
+                        }
                     }
                     self.cutoffs += 1;
                     break;
@@ -1663,15 +1681,17 @@ impl BitBoardEngine {
                 beta = beta.min(score);
                 if beta <= alpha {
                     // Beta cutoff - update killer moves, history, and cont_history
-                    self.store_killer(&mv, depth as usize);
-                    self.update_history(&mv, depth);
-                    if let Some(pm) = prev_mv {
-                        let prev_to = pm.barrel_to() as usize;
-                        let curr_to = mv.barrel_to() as usize;
-                        let bonus = (depth as i32) * (depth as i32);
-                        self.cont_history[prev_to][curr_to] += bonus;
-                        self.cont_history[prev_to][curr_to] =
-                            self.cont_history[prev_to][curr_to].clamp(-32000, 32000);
+                    if !mv.is_pail_placement() {
+                        self.store_killer(&mv, depth as usize);
+                        self.update_history(&mv, depth);
+                        if let Some(pm) = prev_mv {
+                            let prev_to = pm.barrel_to() as usize;
+                            let curr_to = mv.barrel_to() as usize;
+                            let bonus = (depth as i32) * (depth as i32);
+                            self.cont_history[prev_to][curr_to] += bonus;
+                            self.cont_history[prev_to][curr_to] =
+                                self.cont_history[prev_to][curr_to].clamp(-32000, 32000);
+                        }
                     }
                     self.cutoffs += 1;
                     break;
@@ -1707,6 +1727,12 @@ impl BitBoardEngine {
 
     /// Konverter Move til BitMove (statisk versjon)
     fn move_to_bitmove_static(mv: &Move) -> BitMove {
+        if mv.is_pail_only {
+            let pail = mv.place_pail.unwrap();
+            let pail_sq = sq(pail.row as usize, pail.col as usize) as u8;
+            return BitMove::new_pail_placement(pail_sq);
+        }
+
         let barrel_to = sq(mv.barrel_to.row as usize, mv.barrel_to.col as usize) as u8;
         let pail_pos = mv.place_pail.map(|p| sq(p.row as usize, p.col as usize) as u8);
 
