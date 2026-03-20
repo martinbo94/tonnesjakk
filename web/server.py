@@ -29,7 +29,9 @@ def _load_alphazero_eval(model_path: str):
     from tonnesjakk.alphazero import make_network
     import torch
     checkpoint = torch.load(model_path, map_location="cpu", weights_only=True)
-    net = make_network(checkpoint.get("network_type", "resnet"))
+    # Infer hidden channels from first conv layer weights
+    hidden = checkpoint["model_state_dict"]["conv_init.weight"].shape[0]
+    net = make_network(checkpoint.get("network_type", "resnet"), hidden=hidden)
     net.load_state_dict(checkpoint["model_state_dict"])
     net.eval()
 
@@ -44,12 +46,14 @@ def _load_alphazero_eval(model_path: str):
 
 class MoveRequest(BaseModel):
     game_id: str
-    # Pail placement (optional)
+    # Pail-only sub-move (place pail, then barrel moves follow)
+    is_pail_only: bool = False
+    # Pail placement (optional, or the pail position for pail-only moves)
     place_pail: Optional[tuple[int, int]] = None
-    # Barrel action
-    is_barrel_placement: bool  # True = place new from off-board
+    # Barrel action (ignored for pail-only moves)
+    is_barrel_placement: bool = False  # True = place new from off-board
     barrel_from: Optional[tuple[int, int]] = None  # None if placement
-    barrel_to: tuple[int, int]
+    barrel_to: Optional[tuple[int, int]] = None
 
 
 class NewGameRequest(BaseModel):
@@ -57,7 +61,7 @@ class NewGameRequest(BaseModel):
     ai_depth: int = 6
     engine_type: str = "heuristic"   # "heuristic" | "alphazero"
     model_path: Optional[str] = None  # for AlphaZero
-    mcts_simulations: int = 400       # for AlphaZero only
+    mcts_simulations: int = 300       # for AlphaZero only
 
 
 def board_to_dict(board: Board) -> dict:
@@ -96,16 +100,18 @@ def board_to_dict(board: Board) -> dict:
 def get_valid_moves(board: Board) -> list[dict]:
     """Hent alle gyldige trekk som JSON."""
     moves = board.generate_moves()
-    return [
-        {
+    result = []
+    for m in moves:
+        d = {
+            "is_pail_only": m.is_pail_only,
             "place_pail": (m.place_pail.row, m.place_pail.col) if m.place_pail else None,
             "is_barrel_placement": m.is_barrel_placement,
             "barrel_from": (m.barrel_from.row, m.barrel_from.col) if m.barrel_from else None,
             "barrel_to": (m.barrel_to.row, m.barrel_to.col),
             "barrel_path": [(p.row, p.col) for p in m.barrel_path],
         }
-        for m in moves
-    ]
+        result.append(d)
+    return result
 
 
 @app.post("/api/new-game")
@@ -131,7 +137,7 @@ def new_game(req: NewGameRequest):
         model_path = req.model_path
         if not model_path:
             # Default model path
-            model_path = str(Path(__file__).resolve().parent.parent / "nnue_halfpail" / "nnue_model.pt")
+            model_path = str(Path(__file__).resolve().parent.parent / "alphazero_v19" / "best_model.pt")
         try:
             eval_fn = _load_alphazero_eval(model_path)
             mcts_engine = MCTSEngine(req.mcts_simulations, 1.4)
@@ -209,50 +215,62 @@ def make_move(req: MoveRequest):
     moves = board.generate_moves()
     matching_move = None
 
-    for m in moves:
-        # Sjekk place_pail
-        if req.place_pail is None:
-            if m.place_pail is not None:
+    if req.is_pail_only:
+        # Pail-only sub-move: match by pail position
+        for m in moves:
+            if not m.is_pail_only:
                 continue
-        else:
-            if m.place_pail is None:
-                continue
-            if m.place_pail.row != req.place_pail[0] or m.place_pail.col != req.place_pail[1]:
-                continue
-
-        # Sjekk is_barrel_placement
-        if m.is_barrel_placement != req.is_barrel_placement:
-            continue
-
-        # Sjekk barrel_from (for flytting)
-        if req.is_barrel_placement:
-            # Plassering - barrel_from skal vaere None
-            if req.barrel_from is not None:
-                continue
-        else:
-            # Flytting - sjekk barrel_from
-            if req.barrel_from is None or m.barrel_from is None:
-                continue
-            if m.barrel_from.row != req.barrel_from[0] or m.barrel_from.col != req.barrel_from[1]:
+            if m.place_pail.row == req.place_pail[0] and m.place_pail.col == req.place_pail[1]:
+                matching_move = m
+                break
+    else:
+        for m in moves:
+            if m.is_pail_only:
                 continue
 
-        # Sjekk barrel_to
-        if m.barrel_to.row != req.barrel_to[0] or m.barrel_to.col != req.barrel_to[1]:
-            continue
+            # Sjekk place_pail
+            if req.place_pail is None:
+                if m.place_pail is not None:
+                    continue
+            else:
+                if m.place_pail is None:
+                    continue
+                if m.place_pail.row != req.place_pail[0] or m.place_pail.col != req.place_pail[1]:
+                    continue
 
-        matching_move = m
-        break
+            # Sjekk is_barrel_placement
+            if m.is_barrel_placement != req.is_barrel_placement:
+                continue
+
+            # Sjekk barrel_from (for flytting)
+            if req.is_barrel_placement:
+                if req.barrel_from is not None:
+                    continue
+            else:
+                if req.barrel_from is None or m.barrel_from is None:
+                    continue
+                if m.barrel_from.row != req.barrel_from[0] or m.barrel_from.col != req.barrel_from[1]:
+                    continue
+
+            # Sjekk barrel_to
+            if m.barrel_to.row != req.barrel_to[0] or m.barrel_to.col != req.barrel_to[1]:
+                continue
+
+            matching_move = m
+            break
 
     if not matching_move:
         raise HTTPException(status_code=400, detail="Ugyldig trekk")
 
     # Utfor spillerens trekk
     move = matching_move
-    if move.is_barrel_placement:
+    if move.is_pail_only:
+        move_str = f"pail_only({move.place_pail.row},{move.place_pail.col})"
+    elif move.is_barrel_placement:
         move_str = f"place ({move.barrel_to.row},{move.barrel_to.col})"
     else:
         move_str = f"({move.barrel_from.row},{move.barrel_from.col})->({move.barrel_to.row},{move.barrel_to.col})"
-    if move.place_pail:
+    if move.place_pail and not move.is_pail_only:
         move_str = f"pail@({move.place_pail.row},{move.place_pail.col}) " + move_str
 
     print(f"\n>>> Spiller: {move_str}")
@@ -271,8 +289,30 @@ def make_move(req: MoveRequest):
 def _do_ai_move(game: dict) -> Optional[dict]:
     """Execute AI move for the given game. Returns move info dict or None."""
     import time
+    import random
     board = game["board"]
     engine_type = game.get("engine_type", "heuristic")
+
+    if board.check_winner() is not None:
+        return None
+
+    # Handle pail-only phase: pick a center-biased random pail placement
+    moves = board.generate_moves()
+    if moves and moves[0].is_pail_only:
+        weights = []
+        for m in moves:
+            pos = m.place_pail
+            dist = abs(pos.row - 2.5) + abs(pos.col - 2.5)
+            w = max(6.0 - dist, 0.5)
+            weights.append(w * w)
+        total = sum(weights)
+        weights = [w / total for w in weights]
+        chosen = random.choices(moves, weights=weights, k=1)[0]
+        pail_str = f"pail_only({chosen.place_pail.row},{chosen.place_pail.col})"
+        print(f"\n>>> AI: {pail_str}")
+        board.make_move(chosen)
+        if "board_history" in game:
+            game["board_history"].append(board.copy())
 
     if board.check_winner() is not None:
         return None
@@ -280,11 +320,18 @@ def _do_ai_move(game: dict) -> Optional[dict]:
     start_time = time.time()
 
     if engine_type == "alphazero" and "eval_fn" in game:
-        # AlphaZero: use MCTS with neural network
-        mcts_engine = game["mcts_engine"]
+        # AlphaZero: use MCTS with neural network — fresh engine each move to avoid stale tree
+        mcts_engine = MCTSEngine(game.get("mcts_simulations", 300), 1.4)
         eval_fn = game["eval_fn"]
-        mcts_result = mcts_engine.search_network_batched(board, eval_fn, 8)
+        print(f"  [alphazero] searching... board.current_player={board.current_player}, awaiting_barrel={board.awaiting_barrel}")
+        try:
+            mcts_result = mcts_engine.search_network_batched(board, eval_fn, 8)
+        except Exception as e:
+            print(f"  [alphazero] ERROR in search: {e}")
+            import traceback; traceback.print_exc()
+            return None
         elapsed = time.time() - start_time
+        print(f"  [alphazero] search done in {int(elapsed*1000)}ms, best_move={mcts_result.best_move}")
 
         if mcts_result.best_move:
             move = mcts_result.best_move

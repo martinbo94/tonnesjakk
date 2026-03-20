@@ -454,6 +454,16 @@ impl Engine {
         self.inner.weight_eg_threat = value;
     }
 
+    #[getter]
+    fn weight_jump(&self) -> i32 {
+        self.inner.weight_jump
+    }
+
+    #[setter]
+    fn set_weight_jump(&mut self, value: i32) {
+        self.inner.weight_jump = value;
+    }
+
     /// Load NNUE weights from JSON file
     /// After loading, the engine will use NNUE for evaluation instead of heuristics
     fn load_nnue(&mut self, path: &str) -> PyResult<()> {
@@ -583,6 +593,7 @@ pub struct BitBoardEngine {
     pub weight_trapped: i32,       // Penalty per barrel with zero empty adjacent squares
     pub weight_score_accel: i32,   // Non-linear scoring: extra reward for 2+ scored barrels
     pub weight_eg_threat: i32,     // Endgame threat amplification (scaled by game phase)
+    pub weight_jump: i32,          // Bonus per barrel with forward jump available
 }
 
 impl Default for BitBoardEngine {
@@ -635,6 +646,7 @@ impl BitBoardEngine {
             weight_trapped: 0,
             weight_score_accel: 0,
             weight_eg_threat: 0,
+            weight_jump: 60,
         }
     }
 
@@ -743,6 +755,7 @@ impl BitBoardEngine {
         let mut white_mobility = 0i32; // Forward empty squares
         let mut white_passed = 0i32;  // Barrels with clear column path to goal
         let mut white_trapped = 0i32; // Barrels with zero empty adjacent squares
+        let mut white_jumps = 0i32;  // Forward jumps available
         let occupied = bb.occupied;
         // Obstacles for passed barrel detection: enemy barrels + enemy pail
         let white_obstacles = bb.black_barrels | bb.black_pail;
@@ -784,6 +797,27 @@ impl BitBoardEngine {
                     adj_bits &= adj_bits - 1;
                 }
             }
+            // Jump: count forward jumps over any piece (except enemy pail) to empty landing
+            if self.weight_jump != 0 {
+                let jumpable = bb.white_barrels | bb.black_barrels | bb.white_pail;
+                for dir in 0..NUM_JUMP_DIRS {
+                    let over = JUMP_OVER[sq][dir];
+                    let landing = JUMP_LANDING[sq][dir];
+                    if over >= 0 && landing >= 0 {
+                        let over_bit = 1u64 << over;
+                        let landing_bit = 1u64 << landing;
+                        if (jumpable & over_bit) != 0
+                            && (bb.black_pail & over_bit) == 0
+                            && (occupied & landing_bit) == 0
+                        {
+                            let (land_row, _) = sq_to_coords(landing as usize);
+                            if land_row < row {
+                                white_jumps += 1;
+                            }
+                        }
+                    }
+                }
+            }
             bb_white &= bb_white - 1;
         }
 
@@ -793,6 +827,7 @@ impl BitBoardEngine {
         let mut black_mobility = 0i32;
         let mut black_passed = 0i32;
         let mut black_trapped = 0i32;
+        let mut black_jumps = 0i32;
         let mut bb_black = bb.black_barrels;
         while bb_black != 0 {
             let sq = bb_black.trailing_zeros() as usize;
@@ -828,6 +863,27 @@ impl BitBoardEngine {
                     adj_bits &= adj_bits - 1;
                 }
             }
+            // Jump: count forward jumps over any piece (except enemy pail) to empty landing
+            if self.weight_jump != 0 {
+                let jumpable = bb.white_barrels | bb.black_barrels | bb.black_pail;
+                for dir in 0..NUM_JUMP_DIRS {
+                    let over = JUMP_OVER[sq][dir];
+                    let landing = JUMP_LANDING[sq][dir];
+                    if over >= 0 && landing >= 0 {
+                        let over_bit = 1u64 << over;
+                        let landing_bit = 1u64 << landing;
+                        if (jumpable & over_bit) != 0
+                            && (bb.white_pail & over_bit) == 0
+                            && (occupied & landing_bit) == 0
+                        {
+                            let (land_row, _) = sq_to_coords(landing as usize);
+                            if land_row > row {
+                                black_jumps += 1;
+                            }
+                        }
+                    }
+                }
+            }
             bb_black &= bb_black - 1;
         }
 
@@ -837,6 +893,7 @@ impl BitBoardEngine {
         score += (white_mobility - black_mobility) * self.weight_mobility;
         score += (white_passed - black_passed) * self.weight_passed;
         score -= (white_trapped - black_trapped) * self.weight_trapped; // Penalty: more trapped = worse
+        score += (white_jumps - black_jumps) * self.weight_jump;
 
         // Endgame threat amplification: threats become more valuable as game progresses.
         // Phase = total scored barrels (0..8). At phase 0, no extra bonus.

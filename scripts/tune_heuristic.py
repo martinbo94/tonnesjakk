@@ -19,6 +19,7 @@ import math
 import random
 import sys
 import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -75,6 +76,7 @@ def make_engine_with_weights(weights: Dict[str, int]) -> Engine:
     engine.weight_trapped = weights.get("trapped", 0)
     engine.weight_score_accel = weights.get("score_accel", 0)
     engine.weight_eg_threat = weights.get("eg_threat", 0)
+    engine.weight_jump = weights.get("jump", 0)
     return engine
 
 
@@ -277,7 +279,7 @@ def print_tournament_results(
         f"  {'Rank':>4s}  {'Config':14s}  {'ELO':>6s}  {'W':>4s}  {'L':>4s}  {'D':>4s}  "
         f"{'Score%':>6s}  {'Prog':>4s}  {'Cntr':>4s}  {'Blck':>4s}  {'Scrd':>4s}  {'Thrt':>4s}  "
         f"{'Tht2':>4s}  {'ABlk':>4s}  {'Mob':>4s}  "
-        f"{'Pass':>4s}  {'Trap':>4s}  {'SAcl':>4s}  {'EgTh':>4s}"
+        f"{'Pass':>4s}  {'Trap':>4s}  {'SAcl':>4s}  {'EgTh':>4s}  {'Jump':>4s}"
     )
     print(header)
     print("  " + "-" * (len(header) - 2))
@@ -309,7 +311,7 @@ def print_tournament_results(
             f"{score_pct:5.1f}%  {cfg['progress']:4d}  {cfg['center_pail']:4d}  {cfg['blocking']:4d}  "
             f"{cfg['scored']:4d}  {cfg['threat']:4d}  "
             f"{cfg.get('threat2', 0):4d}  {cfg.get('adj_blocking', 0):4d}  {cfg.get('mobility', 0):4d}  "
-            f"{cfg.get('passed', 0):4d}  {cfg.get('trapped', 0):4d}  {cfg.get('score_accel', 0):4d}  {cfg.get('eg_threat', 0):4d}"
+            f"{cfg.get('passed', 0):4d}  {cfg.get('trapped', 0):4d}  {cfg.get('score_accel', 0):4d}  {cfg.get('eg_threat', 0):4d}  {cfg.get('jump', 0):4d}"
         )
 
     print()
@@ -419,6 +421,10 @@ Examples:
                         help="Output path for results JSON (default: scripts/tuning_results.json)")
     parser.add_argument("--seed", type=int, default=None,
                         help="Random seed for reproducibility")
+    parser.add_argument("--baseline", type=str, default=None,
+                        help="Only test each config against this baseline (skip round-robin)")
+    parser.add_argument("--workers", type=int, default=1,
+                        help="Number of parallel matchup workers (default: 1)")
     parser.add_argument("--quiet", action="store_true",
                         help="Suppress per-game output")
 
@@ -444,7 +450,23 @@ Examples:
 
     names = list(configs.keys())
     n = len(names)
-    total_matchups = n * (n - 1) // 2
+
+    # Build matchup pairs
+    if args.baseline:
+        if args.baseline not in configs:
+            print(f"Error: baseline '{args.baseline}' not found in configs", file=sys.stderr)
+            sys.exit(1)
+        matchup_pairs = [
+            (args.baseline, name)
+            for name in names if name != args.baseline
+        ]
+    else:
+        matchup_pairs = [
+            (names[i], names[j])
+            for i in range(n) for j in range(i + 1, n)
+        ]
+
+    total_matchups = len(matchup_pairs)
 
     # Determine search mode
     use_time = args.time_ms is not None
@@ -455,6 +477,8 @@ Examples:
     print("  TONNESJAKK HEURISTIC TUNING TOURNAMENT")
     print("=" * 70)
     print(f"  Configs:  {n}")
+    if args.baseline:
+        print(f"  Mode:     baseline ({args.baseline}) vs each challenger")
     print(f"  Matchups: {total_matchups}")
     print(f"  Games per matchup: {args.games}")
     print(f"  Search: {search_desc}")
@@ -465,16 +489,47 @@ Examples:
     if args.seed is not None:
         random.seed(args.seed)
 
-    # Run round-robin
+    # Run matchups
     results: Dict[Tuple[str, str], Tuple[int, int, int]] = {}
     tournament_start = time.time()
-    matchup_num = 0
 
-    for i in range(n):
-        for j in range(i + 1, n):
+    if args.workers > 1:
+        # Parallel execution
+        print(f"  Running {total_matchups} matchups with {args.workers} workers...\n")
+        futures = {}
+        with ProcessPoolExecutor(max_workers=args.workers) as executor:
+            for name_a, name_b in matchup_pairs:
+                future = executor.submit(
+                    run_matchup,
+                    name_a=name_a,
+                    weights_a=configs[name_a],
+                    name_b=name_b,
+                    weights_b=configs[name_b],
+                    num_games=args.games,
+                    depth=args.depth if not use_time else None,
+                    time_ms=args.time_ms if use_time else None,
+                    max_moves=args.max_moves,
+                    verbose=False,
+                )
+                futures[future] = (name_a, name_b)
+
+            done_count = 0
+            for future in as_completed(futures):
+                name_a, name_b = futures[future]
+                wins_a, wins_b, draws = future.result()
+                results[(name_a, name_b)] = (wins_a, wins_b, draws)
+                done_count += 1
+                total = wins_a + wins_b + draws
+                print(
+                    f"  [{done_count}/{total_matchups}] {name_a} vs {name_b}: "
+                    f"+{wins_a} ={draws} -{wins_b}  "
+                    f"({(wins_a + 0.5 * draws) / max(total, 1):.1%})"
+                )
+    else:
+        # Sequential execution
+        matchup_num = 0
+        for name_a, name_b in matchup_pairs:
             matchup_num += 1
-            name_a = names[i]
-            name_b = names[j]
             print(f"  Matchup {matchup_num}/{total_matchups}: {name_a} vs {name_b}")
 
             wins_a, wins_b, draws = run_matchup(

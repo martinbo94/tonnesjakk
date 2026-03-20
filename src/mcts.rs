@@ -10,7 +10,7 @@
 
 use pyo3::prelude::*;
 
-use crate::{BitBoard, BitBoardEngine, BitMove, Board, Move, Player, NUM_SQUARES};
+use crate::{BitBoard, BitBoardEngine, BitMove, Board, Move, Player, NUM_SQUARES, sq_to_coords};
 
 // ---------------------------------------------------------------------------
 // ONNX Runtime session wrapper (pure Rust inference, no Python needed)
@@ -403,6 +403,12 @@ impl Rng {
         }
         samples.into_iter().map(|s| s as f32).collect()
     }
+
+    /// Gumbel(0,1) variate: -ln(-ln(U)) where U ~ Uniform(0,1).
+    fn gumbel(&mut self) -> f64 {
+        let u = self.f64().max(1e-30).min(1.0 - 1e-10);
+        -((-u.ln()).ln())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -421,13 +427,45 @@ pub struct MCTSEngine {
     rng: Rng,
     heuristic_cache: std::collections::HashMap<u64, f32>,
     network_cache: std::collections::HashMap<u64, (Vec<f32>, f32)>,
+    /// Lambda for blending value targets: value = lambda * game_outcome + (1-lambda) * search_score.
+    /// 1.0 = pure game outcome (original AlphaZero), 0.0 = pure search score.
+    /// Default 0.5 to give dense per-position signal from heuristic eval.
+    value_blend_lambda: f32,
+    /// Adjudicate games as decisive when |heuristic_eval| exceeds this threshold
+    /// (in tanh-scaled units, i.e. 0.0-1.0) after adjudication_move has been reached.
+    /// 0.0 = disabled. Default 0.6 (~360cp in raw heuristic score).
+    adjudication_threshold: f32,
+    /// Minimum move count before adjudication can trigger. Default 30.
+    adjudication_min_moves: u32,
+    /// Use Gumbel AlphaZero search at root (Sequential Halving + completed-Q policy targets).
+    /// Only active during self-play. Eval games use standard PUCT.
+    use_gumbel: bool,
+    /// Forward-only mode: filter out backward barrel moves during self-play.
+    /// White can only move to same or lower row (toward goal row 0),
+    /// Black can only move to same or higher row (toward goal row 5).
+    /// Reduces branching factor and forces decisive games.
+    forward_only: bool,
+    /// Penalty applied to MCTS leaf value when the position's hash appears in
+    /// the game-level position history.  Discourages the search from choosing
+    /// moves that revisit earlier positions (shuffle-loops).
+    /// The penalty is subtracted from the absolute value, pushing it toward 0
+    /// (draw-like) for each repetition.  0.0 = disabled.  Default 0.2.
+    repetition_penalty: f32,
+    /// Game-level position history (hashes).  Set by game loops before each
+    /// search call so the tree can penalise revisiting earlier positions.
+    game_position_history: Vec<u64>,
 }
 
 #[pymethods]
 impl MCTSEngine {
     #[new]
-    #[pyo3(signature = (simulations=200, c_puct=1.0, fpu_reduction=0.3, dirichlet_alpha=0.5, dirichlet_epsilon=0.25))]
-    fn new(simulations: u32, c_puct: f32, fpu_reduction: f32, dirichlet_alpha: f32, dirichlet_epsilon: f32) -> Self {
+    #[pyo3(signature = (simulations=200, c_puct=1.0, fpu_reduction=0.3, dirichlet_alpha=0.5, dirichlet_epsilon=0.25, value_blend_lambda=0.5, adjudication_threshold=0.6, adjudication_min_moves=30, use_gumbel=false, forward_only=false, repetition_penalty=0.0))]
+    fn new(
+        simulations: u32, c_puct: f32, fpu_reduction: f32,
+        dirichlet_alpha: f32, dirichlet_epsilon: f32,
+        value_blend_lambda: f32, adjudication_threshold: f32, adjudication_min_moves: u32,
+        use_gumbel: bool, forward_only: bool, repetition_penalty: f32,
+    ) -> Self {
         MCTSEngine {
             simulations,
             c_puct,
@@ -439,6 +477,13 @@ impl MCTSEngine {
             rng: Rng::new(),
             heuristic_cache: std::collections::HashMap::new(),
             network_cache: std::collections::HashMap::new(),
+            value_blend_lambda,
+            adjudication_threshold,
+            adjudication_min_moves,
+            use_gumbel,
+            forward_only,
+            repetition_penalty,
+            game_position_history: Vec::new(),
         }
     }
 
@@ -669,6 +714,27 @@ impl MCTSEngine {
         Ok(results)
     }
 
+    /// Play one training game: network MCTS vs alpha-beta heuristic.
+    /// Collects training examples from the network's turns only.
+    /// The network alternates between white and black across calls.
+    #[pyo3(signature = (onnx_session, opponent_depth=5, batch_size=8, random_opening=2, max_moves=80, temp_moves=3, temperature=0.8, mcts_is_white=true))]
+    fn play_mixed_game_onnx(
+        &mut self,
+        onnx_session: &mut OnnxSession,
+        opponent_depth: u8,
+        batch_size: u32,
+        random_opening: usize,
+        max_moves: usize,
+        temp_moves: usize,
+        temperature: f32,
+        mcts_is_white: bool,
+    ) -> PyResult<SelfPlayResult> {
+        self.play_mixed_game_onnx_impl(
+            onnx_session, opponent_depth, batch_size, random_opening, max_moves,
+            temp_moves, temperature, mcts_is_white,
+        ).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))
+    }
+
     /// Play N evaluation games using ONNX inference: MCTS vs alpha-beta engine.
     #[pyo3(signature = (onnx_session, num_games=20, opponent_depth=5, batch_size=8, random_opening=2, max_moves=80))]
     fn play_eval_match_onnx(
@@ -691,6 +757,40 @@ impl MCTSEngine {
 // ---------------------------------------------------------------------------
 
 impl MCTSEngine {
+    /// Generate moves, optionally filtering backward barrel moves in forward-only mode.
+    /// Placements, pail moves, sideways moves, and jumps toward/across the goal are kept.
+    /// Only simple one-step backward barrel moves are removed.
+    fn gen_moves(&self, bb: &BitBoard) -> Vec<BitMove> {
+        let mut moves = bb.generate_moves();
+        if self.forward_only {
+            let player = bb.current_player;
+            moves.retain(|m| {
+                // Pail-only sub-moves always allowed
+                if m.is_pail_placement() {
+                    return true;
+                }
+                // Placements from off-board always allowed (on starting row)
+                if m.is_placement() {
+                    return true;
+                }
+                // Barrel moves: check direction
+                if let Some(from_sq) = m.barrel_from() {
+                    let (from_row, _) = sq_to_coords(from_sq as usize);
+                    let (to_row, _) = sq_to_coords(m.barrel_to() as usize);
+                    match player {
+                        // White moves toward row 0 (forward = to_row <= from_row)
+                        Player::White => to_row <= from_row,
+                        // Black moves toward row 5 (forward = to_row >= from_row)
+                        Player::Black => to_row >= from_row,
+                    }
+                } else {
+                    true // no from_sq means placement, keep it
+                }
+            });
+        }
+        moves
+    }
+
     fn search_impl(
         &mut self,
         bb: &BitBoard,
@@ -814,7 +914,7 @@ impl MCTSEngine {
             return v;
         }
 
-        let moves = bb.generate_moves();
+        let moves = self.gen_moves(&bb);
         if moves.is_empty() {
             self.nodes[node_idx].is_terminal = true;
             self.nodes[node_idx].terminal_value = 0.0;
@@ -882,7 +982,8 @@ impl MCTSEngine {
         self.nodes[node_idx].children_start = children_start;
         self.nodes[node_idx].children_count = children_count;
 
-        value
+        // Penalise revisiting positions from earlier in the game
+        self.apply_repetition_penalty(value, bb.hash)
     }
 
     /// Call Python network for evaluation.
@@ -1012,7 +1113,7 @@ impl MCTSEngine {
 
             // Expand root with single eval
             let root_planes = bb_to_planes(bb);
-            let root_moves = bb.generate_moves();
+            let root_moves = self.gen_moves(&bb);
             if root_moves.is_empty() {
                 return MCTSSearchResult::empty();
             }
@@ -1102,7 +1203,7 @@ impl MCTSEngine {
                     continue;
                 }
 
-                let moves = sim_bb.generate_moves();
+                let moves = self.gen_moves(&sim_bb);
                 if moves.is_empty() {
                     self.nodes[node_idx].is_terminal = true;
                     self.nodes[node_idx].terminal_value = 0.0;
@@ -1120,7 +1221,8 @@ impl MCTSEngine {
                         sim_bb.current_player != Player::White
                     };
                     self.expand_node(node_idx, &moves, &priors, child_is_white);
-                    self.backpropagate(node_idx, cached_value);
+                    let penalized_cv = self.apply_repetition_penalty(cached_value, hash);
+                    self.backpropagate(node_idx, penalized_cv);
                     continue;
                 }
 
@@ -1202,6 +1304,9 @@ impl MCTSEngine {
                         leaf.bb.current_player != Player::White
                     };
                     self.expand_node(leaf.node_idx, &leaf.moves, &priors, child_is_white);
+
+                    // Penalise revisiting positions from earlier in the game
+                    let value = self.apply_repetition_penalty(value, leaf.bb.hash);
 
                     // Backpropagate
                     self.backpropagate(leaf.node_idx, value);
@@ -1305,6 +1410,36 @@ impl MCTSEngine {
             }
         }
         priors
+    }
+
+    /// Compute log-softmax (log-priors) for legal moves from full policy logits.
+    /// Returns log(softmax(logit_i)) for each legal move.
+    fn masked_log_softmax(policy_logits: &[f32], moves: &[BitMove]) -> Vec<f32> {
+        let mut max_logit = f32::NEG_INFINITY;
+        for bm in moves {
+            let idx = policy_index(bm) as usize;
+            if idx < policy_logits.len() && policy_logits[idx] > max_logit {
+                max_logit = policy_logits[idx];
+            }
+        }
+
+        let mut shifted: Vec<f32> = moves
+            .iter()
+            .map(|bm| {
+                let idx = policy_index(bm) as usize;
+                if idx < policy_logits.len() {
+                    policy_logits[idx] - max_logit
+                } else {
+                    -30.0
+                }
+            })
+            .collect();
+
+        let log_sum_exp = shifted.iter().map(|s| s.exp()).sum::<f32>().ln();
+        for s in &mut shifted {
+            *s -= log_sum_exp;
+        }
+        shifted
     }
 
     /// Call Python network for a single position (used for root expansion).
@@ -1430,6 +1565,7 @@ impl MCTSEngine {
         let mut bb = BitBoard::new();
         let mut examples: Vec<(Vec<f32>, Vec<f32>, bool, f32)> = Vec::new();
         let original_sims = self.simulations;
+        let mut position_history: Vec<u64> = Vec::new();
 
         // Random opening moves (count only full turns, not pail sub-moves)
         let mut random_turns = 0;
@@ -1437,7 +1573,7 @@ impl MCTSEngine {
             if bb.check_winner().is_some() {
                 break;
             }
-            let moves = bb.generate_moves();
+            let moves = self.gen_moves(&bb);
             if moves.is_empty() {
                 break;
             }
@@ -1453,6 +1589,24 @@ impl MCTSEngine {
         loop {
             if bb.check_winner().is_some() || (move_count as usize) >= max_moves {
                 break;
+            }
+
+            // Adjudicate decisive positions early
+            if self.should_adjudicate(&bb, move_count) {
+                break;
+            }
+
+            // 3-fold repetition detection
+            if move_count >= 15 && Self::is_threefold(&position_history, bb.hash) {
+                break;
+            }
+            position_history.push(bb.hash);
+            self.game_position_history.clone_from(&position_history);
+
+            // Pail placement: skip MCTS, use center-biased random selection
+            if let Some(pail_move) = self.random_center_pail(&bb) {
+                bb.make_move(&pail_move);
+                continue;
             }
 
             // Playout cap randomization: full search or cheap search
@@ -1476,7 +1630,7 @@ impl MCTSEngine {
 
             // Temperature-based selection for first moves
             let chosen_bitmove = if (move_count as usize) < temp_moves {
-                let moves = bb.generate_moves();
+                let moves = self.gen_moves(&bb);
                 self.select_move_by_policy(&moves, &result.policy_target, 1.0)
             } else {
                 // Find the BitMove for the best move
@@ -1511,11 +1665,12 @@ impl MCTSEngine {
         // Determine outcome (White perspective: +1 White win, -1 Black win)
         let (outcome_white, winner_str) = self.determine_outcome(&bb);
 
-        // Fill in outcomes: value_target is from current player's perspective
+        // Fill in outcomes: blend game outcome with per-position search score
         let training_examples: Vec<TrainingExample> = examples
             .into_iter()
             .map(|(planes, policy, is_white, search_score)| {
-                let value_target = if is_white { outcome_white } else { -outcome_white };
+                let game_outcome = if is_white { outcome_white } else { -outcome_white };
+                let value_target = self.blend_value_target(game_outcome, search_score);
                 // For Black positions, flip policy target to relative coords (matching network output)
                 let policy_target = if is_white { policy } else { Self::vflip_policy(&policy) };
                 TrainingExample {
@@ -1546,6 +1701,7 @@ impl MCTSEngine {
     ) -> SelfPlayResult {
         let mut bb = BitBoard::new();
         let mut examples: Vec<(Vec<f32>, Vec<f32>, bool, f32)> = Vec::new();
+        let mut position_history: Vec<u64> = Vec::new();
 
         // Random opening moves (count only full turns)
         let mut random_turns = 0;
@@ -1553,7 +1709,7 @@ impl MCTSEngine {
             if bb.check_winner().is_some() {
                 break;
             }
-            let moves = bb.generate_moves();
+            let moves = self.gen_moves(&bb);
             if moves.is_empty() {
                 break;
             }
@@ -1571,7 +1727,25 @@ impl MCTSEngine {
                 break;
             }
 
-            let moves = bb.generate_moves();
+            // Adjudicate decisive positions early
+            if self.should_adjudicate(&bb, move_count) {
+                break;
+            }
+
+            // 3-fold repetition detection
+            if move_count >= 15 && Self::is_threefold(&position_history, bb.hash) {
+                break;
+            }
+            position_history.push(bb.hash);
+            self.game_position_history.clone_from(&position_history);
+
+            // Pail placement: skip alpha-beta, use center-biased random selection
+            if let Some(pail_move) = self.random_center_pail(&bb) {
+                bb.make_move(&pail_move);
+                continue;
+            }
+
+            let moves = self.gen_moves(&bb);
             if moves.is_empty() {
                 break;
             }
@@ -1646,7 +1820,8 @@ impl MCTSEngine {
         let training_examples: Vec<TrainingExample> = examples
             .into_iter()
             .map(|(planes, policy, is_white, search_score)| {
-                let value_target = if is_white { outcome_white } else { -outcome_white };
+                let game_outcome = if is_white { outcome_white } else { -outcome_white };
+                let value_target = self.blend_value_target(game_outcome, search_score);
                 // For Black positions, flip policy target to relative coords (matching network output)
                 let policy_target = if is_white { policy } else { Self::vflip_policy(&policy) };
                 TrainingExample {
@@ -1685,6 +1860,7 @@ impl MCTSEngine {
         let mut bb = BitBoard::new();
         let mut examples: Vec<(Vec<f32>, Vec<f32>, bool, f32)> = Vec::new();
         let original_sims = self.simulations;
+        let mut position_history: Vec<u64> = Vec::new();
 
         // Random opening moves (count only full turns)
         let mut random_turns = 0;
@@ -1692,7 +1868,7 @@ impl MCTSEngine {
             if bb.check_winner().is_some() {
                 break;
             }
-            let moves = bb.generate_moves();
+            let moves = self.gen_moves(&bb);
             if moves.is_empty() {
                 break;
             }
@@ -1710,12 +1886,35 @@ impl MCTSEngine {
                 break;
             }
 
+            // Adjudicate decisive positions early
+            if self.should_adjudicate(&bb, move_count) {
+                break;
+            }
+
+            // 3-fold repetition detection
+            if move_count >= 15 && Self::is_threefold(&position_history, bb.hash) {
+                break;
+            }
+            position_history.push(bb.hash);
+            self.game_position_history.clone_from(&position_history);
+
+            // Pail placement: skip MCTS, use center-biased random selection
+            if let Some(pail_move) = self.random_center_pail(&bb) {
+                bb.make_move(&pail_move);
+                // No training data for forced-random pail moves
+                continue;
+            }
+
             // Playout cap randomization: full search or cheap search
             let is_full_search = full_search_fraction >= 1.0
                 || self.rng.f64() < full_search_fraction as f64;
             self.simulations = if is_full_search { original_sims } else { cheap_sims };
 
-            let result = self.search_batched_impl(&bb, py, eval_fn, batch_size, true); // add_noise=true
+            let result = if self.use_gumbel {
+                self.search_gumbel_batched_py_impl(&bb, py, eval_fn, batch_size)
+            } else {
+                self.search_batched_impl(&bb, py, eval_fn, batch_size, true) // add_noise=true
+            };
             if result.best_move.is_none() {
                 break;
             }
@@ -1729,18 +1928,38 @@ impl MCTSEngine {
                 examples.push((planes, result.policy_target.clone(), is_white, search_score));
             }
 
-            // Temperature-based selection for first moves, then deterministic
-            let chosen_bitmove = if (move_count as usize) < temp_moves && temperature > 0.0 {
-                // Sample from visit distribution via the tree
+            // Move selection
+            let chosen_bitmove = if self.use_gumbel {
+                if (move_count as usize) < temp_moves && temperature > 0.0 {
+                    // Temperature sampling from visit counts (not improved policy)
+                    self.sample_bitmove_by_temp(0, temperature)
+                        .unwrap_or_else(|| self.most_visited_bitmove())
+                } else {
+                    // Argmax from Gumbel search result
+                    let best_move = result.best_move.as_ref().unwrap();
+                    let best_pi = Self::move_policy_index(best_move);
+                    let root = &self.nodes[0];
+                    let s = root.children_start as usize;
+                    let mut bm = self.nodes[s].bitmove;
+                    for i in 0..root.children_count as usize {
+                        if policy_index(&self.nodes[s + i].bitmove) == best_pi {
+                            bm = self.nodes[s + i].bitmove;
+                            break;
+                        }
+                    }
+                    bm
+                }
+            } else if (move_count as usize) < temp_moves && temperature > 0.0 {
                 self.sample_bitmove_by_temp(0, temperature)
                     .unwrap_or_else(|| self.most_visited_bitmove())
             } else {
                 self.most_visited_bitmove()
             };
 
-            // Retain subtree for chosen move before making it
             let is_barrel_move = !chosen_bitmove.is_pail_placement();
-            self.retain_subtree(&chosen_bitmove);
+            if !self.use_gumbel {
+                self.retain_subtree(&chosen_bitmove);
+            }
             bb.make_move(&chosen_bitmove);
             if is_barrel_move {
                 move_count += 1;
@@ -1756,11 +1975,12 @@ impl MCTSEngine {
         // Determine outcome (White perspective: +1 White win, -1 Black win)
         let (outcome_white, winner_str) = self.determine_outcome(&bb);
 
-        // Fill in outcomes: value_target is from current player's perspective
+        // Fill in outcomes: blend game outcome with per-position search score
         let training_examples: Vec<TrainingExample> = examples
             .into_iter()
             .map(|(planes, policy, is_white, search_score)| {
-                let value_target = if is_white { outcome_white } else { -outcome_white };
+                let game_outcome = if is_white { outcome_white } else { -outcome_white };
+                let value_target = self.blend_value_target(game_outcome, search_score);
                 // For Black positions, flip policy target to relative coords (matching network output)
                 let policy_target = if is_white { policy } else { Self::vflip_policy(&policy) };
                 TrainingExample {
@@ -1810,7 +2030,7 @@ impl MCTSEngine {
                 if bb.check_winner().is_some() {
                     break;
                 }
-                let moves = bb.generate_moves();
+                let moves = self.gen_moves(&bb);
                 if moves.is_empty() {
                     break;
                 }
@@ -1823,20 +2043,54 @@ impl MCTSEngine {
             }
 
             let mut move_count = 0u32; // counts full turns only
+            let mut position_history: Vec<u64> = Vec::new();
             loop {
                 if bb.check_winner().is_some() || (move_count as usize) >= max_moves {
                     break;
+                }
+
+                // 3-fold repetition detection
+                if move_count >= 15 && Self::is_threefold(&position_history, bb.hash) {
+                    break;
+                }
+                position_history.push(bb.hash);
+                self.game_position_history.clone_from(&position_history);
+
+                // Pail placement: center-biased random for both sides
+                if let Some(pail_move) = self.random_center_pail(&bb) {
+                    bb.make_move(&pail_move);
+                    continue;
                 }
 
                 let is_white_turn = bb.current_player == Player::White;
                 let is_mcts_turn = is_white_turn == mcts_is_white;
 
                 let chosen_bitmove = if is_mcts_turn {
-                    // MCTS move (network) -- no noise for eval
-                    let result = self.search_batched_impl(&bb, py, eval_fn, batch_size, false);
-                    match result.best_move {
-                        Some(_) => self.most_visited_bitmove(),
-                        None => break,
+                    // MCTS move (network) -- use Gumbel if enabled, standard otherwise
+                    if self.use_gumbel {
+                        let result = self.search_gumbel_batched_py_impl(&bb, py, eval_fn, batch_size);
+                        match result.best_move {
+                            Some(mv) => {
+                                let best_pi = Self::move_policy_index(&mv);
+                                let root = &self.nodes[0];
+                                let s = root.children_start as usize;
+                                let mut bm = self.nodes[s].bitmove;
+                                for i in 0..root.children_count as usize {
+                                    if policy_index(&self.nodes[s + i].bitmove) == best_pi {
+                                        bm = self.nodes[s + i].bitmove;
+                                        break;
+                                    }
+                                }
+                                bm
+                            }
+                            None => break,
+                        }
+                    } else {
+                        let result = self.search_batched_impl(&bb, py, eval_fn, batch_size, false);
+                        match result.best_move {
+                            Some(_) => self.most_visited_bitmove(),
+                            None => break,
+                        }
                     }
                 } else {
                     // Alpha-beta opponent
@@ -1967,10 +2221,70 @@ impl MCTSEngine {
         true
     }
 
+    /// Pick a center-biased random pail placement from the legal moves.
+    /// Returns None if current position is not a pail placement.
+    /// Weight = (6 - manhattan_dist_from_center)^2, so center squares are ~9x more likely than corners.
+    fn random_center_pail(&mut self, bb: &BitBoard) -> Option<BitMove> {
+        let moves = self.gen_moves(&bb);
+        if moves.is_empty() || !moves[0].is_pail_placement() {
+            return None;
+        }
+
+        // Compute center-biased weights
+        let mut weights: Vec<f32> = Vec::with_capacity(moves.len());
+        for m in &moves {
+            let pail_sq = m.barrel_to() as usize; // pail_sq stored in barrel_to for pail-only moves
+            if m.is_pail_placement() {
+                let (row, col) = sq_to_coords(pail_sq);
+                let dist = (row as f32 - 2.5).abs() + (col as f32 - 2.5).abs();
+                let w = (6.0 - dist).max(0.5);
+                weights.push(w * w);
+            }
+        }
+
+        // Weighted random selection
+        let total: f32 = weights.iter().sum();
+        let mut r = self.rng.f64() as f32 * total;
+        for (i, &w) in weights.iter().enumerate() {
+            r -= w;
+            if r <= 0.0 {
+                return Some(moves[i]);
+            }
+        }
+        Some(*moves.last().unwrap())
+    }
+
+    /// Check if a position hash has occurred 3 times (3-fold repetition).
+    #[inline]
+    fn is_threefold(history: &[u64], hash: u64) -> bool {
+        history.iter().filter(|&&h| h == hash).count() >= 2
+        // 2 previous occurrences + current = 3-fold
+    }
+
     /// Clear evaluation caches (call between games, not between moves).
     fn clear_caches(&mut self) {
         self.heuristic_cache.clear();
         self.network_cache.clear();
+    }
+
+    /// Apply repetition penalty to a leaf value.
+    /// If the position hash appears in the game-level history, shift the value
+    /// toward 0.0 (draw-like) by `repetition_penalty` per occurrence.
+    /// This makes the search avoid revisiting positions from earlier in the game.
+    #[inline]
+    fn apply_repetition_penalty(&self, value: f32, hash: u64) -> f32 {
+        if self.repetition_penalty <= 0.0 || self.game_position_history.is_empty() {
+            return value;
+        }
+        let count = self.game_position_history.iter().filter(|&&h| h == hash).count() as f32;
+        if count == 0.0 {
+            return value;
+        }
+        // Shrink value toward 0 by penalty * count
+        // e.g. value=0.5, penalty=0.2, count=1 → 0.5 * (1 - 0.2) = 0.4
+        // e.g. value=0.5, penalty=0.2, count=2 → 0.5 * (1 - 0.4) = 0.3
+        let shrink = (1.0 - self.repetition_penalty * count).max(0.0);
+        value * shrink
     }
 
     /// Apply Dirichlet noise to root node's children priors.
@@ -2011,12 +2325,179 @@ impl MCTSEngine {
             Some(Player::White) => (1.0, "white".to_string()),
             Some(Player::Black) => (-1.0, "black".to_string()),
             None => {
-                // Draw: use heuristic score as value target
+                // Draw/adjudicated: use heuristic score as value target
                 let score = self.engine.evaluate_heuristic(bb);
                 let outcome = (score as f32 / SCORE_SCALING).tanh();
                 (outcome, "draw".to_string())
             }
         }
+    }
+
+    /// Check if the current position should be adjudicated based on heuristic eval.
+    /// Returns true if the heuristic score exceeds the threshold and we're past min moves.
+    fn should_adjudicate(&self, bb: &BitBoard, move_count: u32) -> bool {
+        if self.adjudication_threshold <= 0.0 || move_count < self.adjudication_min_moves {
+            return false;
+        }
+        let score = self.engine.evaluate_heuristic(bb);
+        let scaled = (score as f32 / SCORE_SCALING).tanh().abs();
+        scaled >= self.adjudication_threshold
+    }
+
+    /// Compute v_mix for a root node (paper equation 6).
+    /// v_mix = value_score * (1 - sum_visited_priors) + sum(prior_i * Q_i) for visited children.
+    fn compute_v_mix(&self, root_idx: usize) -> f32 {
+        let root = &self.nodes[root_idx];
+        let n_children = root.children_count as usize;
+        let start = root.children_start as usize;
+
+        // Root value from root-player perspective
+        let value_score = if root.player_is_white {
+            root.q_value()
+        } else {
+            -root.q_value()
+        };
+
+        let mut sum_visited_priors = 0.0f32;
+        let mut sum_prior_q = 0.0f32;
+        for i in 0..n_children {
+            let child = &self.nodes[start + i];
+            if child.visit_count > 0 {
+                sum_visited_priors += child.prior;
+                let q_white = child.q_value();
+                let q = if root.player_is_white { q_white } else { -q_white };
+                sum_prior_q += child.prior * q;
+            }
+        }
+
+        value_score * (1.0 - sum_visited_priors) + sum_prior_q
+    }
+
+    /// Completed Q-value for a root child, in root-player perspective.
+    /// If the child has been visited, returns its Q-value.
+    /// If unvisited, returns v_mix (paper §3.1).
+    fn completed_q(&self, root_idx: usize, child_idx: usize) -> f32 {
+        let root = &self.nodes[root_idx];
+        let child = &self.nodes[child_idx];
+        if child.visit_count == 0 {
+            return self.compute_v_mix(root_idx);
+        }
+        let q_white = child.q_value();
+        if root.player_is_white { q_white } else { -q_white }
+    }
+
+    /// Compute adaptive sigma for Gumbel search (paper §3.1).
+    /// sigma = (c_visit + max_visit_count) * c_scale
+    fn compute_gumbel_sigma(&self, root_idx: usize) -> f32 {
+        let root = &self.nodes[root_idx];
+        let n_children = root.children_count as usize;
+        let start = root.children_start as usize;
+        let max_visits = (0..n_children)
+            .map(|i| self.nodes[start + i].visit_count)
+            .max()
+            .unwrap_or(0) as f32;
+        (Self::GUMBEL_C_VISIT + max_visits) * Self::GUMBEL_C_SCALE
+    }
+
+    /// Normalized completed Q-values for all root children, mapped to [0, 1].
+    fn normalized_completed_q_values(&self, root_idx: usize) -> Vec<f32> {
+        let root = &self.nodes[root_idx];
+        let n_children = root.children_count as usize;
+        let start = root.children_start as usize;
+
+        let raw: Vec<f32> = (0..n_children)
+            .map(|i| self.completed_q(root_idx, start + i))
+            .collect();
+
+        let min_q = raw.iter().cloned().fold(f32::INFINITY, f32::min);
+        let max_q = raw.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let range = (max_q - min_q).max(1e-8);
+
+        raw.iter().map(|&q| (q - min_q) / range).collect()
+    }
+
+    /// Build search result for Gumbel AlphaZero.
+    /// Policy target = softmax(log_prior + sigma * normalized_completed_Q) over ALL legal actions.
+    /// Best move = argmax(gumbel + log_prior + sigma * normalized_completed_Q).
+    fn build_gumbel_result(
+        &self,
+        root_idx: usize,
+        gumbels: &[f64],
+        log_priors: &[f32],
+        sigma: f32,
+    ) -> MCTSSearchResult {
+        let root = &self.nodes[root_idx];
+        let n_children = root.children_count as usize;
+        let start = root.children_start as usize;
+
+        // Use normalized Q-values in [0, 1] (paper §3.1)
+        let norm_q = self.normalized_completed_q_values(root_idx);
+
+        // Policy target: softmax(log_prior + sigma * normalized_Q) over ALL actions
+        let mut policy_target = vec![0.0f32; POLICY_SIZE];
+        let mut logits: Vec<f32> = Vec::with_capacity(n_children);
+        let mut max_logit = f32::NEG_INFINITY;
+
+        for i in 0..n_children {
+            let logit = log_priors[i] + sigma * norm_q[i];
+            logits.push(logit);
+            if logit > max_logit {
+                max_logit = logit;
+            }
+        }
+
+        let mut exp_sum = 0.0f32;
+        let mut exp_vals: Vec<f32> = logits
+            .iter()
+            .map(|&l| {
+                let e = (l - max_logit).exp();
+                exp_sum += e;
+                e
+            })
+            .collect();
+
+        if exp_sum > 0.0 {
+            for e in &mut exp_vals {
+                *e /= exp_sum;
+            }
+        }
+
+        for (i, &e) in exp_vals.iter().enumerate() {
+            let idx = policy_index(&self.nodes[start + i].bitmove) as usize;
+            if idx < POLICY_SIZE {
+                policy_target[idx] = e;
+            }
+        }
+
+        // Best move: argmax(gumbel + log_prior + sigma * normalized_Q)
+        let mut best_score = f64::NEG_INFINITY;
+        let mut best_child_idx = start;
+        for i in 0..n_children {
+            let score = gumbels[i] + (log_priors[i] + sigma * norm_q[i]) as f64;
+            if score > best_score {
+                best_score = score;
+                best_child_idx = start + i;
+            }
+        }
+
+        let total_visits: u32 = (0..n_children)
+            .map(|i| self.nodes[start + i].visit_count)
+            .sum();
+
+        MCTSSearchResult {
+            best_move: Some(self.nodes[best_child_idx].bitmove.to_move()),
+            visits: total_visits,
+            policy_target,
+            root_value: root.q_value(),
+        }
+    }
+
+    /// Compute blended value target for a training example.
+    /// Blends game outcome with per-position search score:
+    ///   value = lambda * game_outcome + (1 - lambda) * search_score
+    fn blend_value_target(&self, game_outcome: f32, search_score: f32) -> f32 {
+        let l = self.value_blend_lambda;
+        (l * game_outcome + (1.0 - l) * search_score).clamp(-1.0, 1.0)
     }
 
     // -----------------------------------------------------------------------
@@ -2044,7 +2525,7 @@ impl MCTSEngine {
 
             // Expand root with single eval
             let root_planes = bb_to_planes(bb);
-            let root_moves = bb.generate_moves();
+            let root_moves = self.gen_moves(&bb);
             if root_moves.is_empty() {
                 return MCTSSearchResult::empty();
             }
@@ -2126,7 +2607,7 @@ impl MCTSEngine {
                     continue;
                 }
 
-                let moves = sim_bb.generate_moves();
+                let moves = self.gen_moves(&sim_bb);
                 if moves.is_empty() {
                     self.nodes[node_idx].is_terminal = true;
                     self.nodes[node_idx].terminal_value = 0.0;
@@ -2144,7 +2625,8 @@ impl MCTSEngine {
                         sim_bb.current_player != Player::White
                     };
                     self.expand_node(node_idx, &moves, &priors, child_is_white);
-                    self.backpropagate(node_idx, cached_value);
+                    let penalized_cv = self.apply_repetition_penalty(cached_value, hash);
+                    self.backpropagate(node_idx, penalized_cv);
                     continue;
                 }
 
@@ -2221,6 +2703,7 @@ impl MCTSEngine {
                         leaf.bb.current_player != Player::White
                     };
                     self.expand_node(leaf.node_idx, &leaf.moves, &priors, child_is_white);
+                    let value = self.apply_repetition_penalty(value, leaf.bb.hash);
                     self.backpropagate(leaf.node_idx, value);
                 }
             }
@@ -2234,6 +2717,489 @@ impl MCTSEngine {
         }
 
         self.build_result(0)
+    }
+
+    // -----------------------------------------------------------------------
+    // Gumbel AlphaZero search (Sequential Halving at root, PUCT below)
+    // -----------------------------------------------------------------------
+
+    /// Gumbel AlphaZero adaptive sigma constants (paper §3.1, Appendix D).
+    /// sigma(root) = (c_visit + max_visit_count) * c_scale
+    /// DeepMind's reference impl (mctx) uses maxvisit_init=50, value_scale=0.1.
+    /// Paper text says c_scale=1.0 but that's before min-max Q normalization to [0,1];
+    /// the mctx code applies value_scale=0.1 AFTER normalization.
+    /// With 400 sims: sigma = (50 + 400) * 0.1 = 45 → entropy ~0.64, top-1 ~0.71.
+    const GUMBEL_C_VISIT: f32 = 50.0;
+    const GUMBEL_C_SCALE: f32 = 0.1;
+
+    /// Gumbel AlphaZero search with Python NN batched evaluation.
+    /// Uses Sequential Halving at root with Gumbel noise instead of PUCT + Dirichlet.
+    /// Policy targets are softmax(log_prior + sigma * completed_Q) instead of visit counts.
+    fn search_gumbel_batched_py_impl(
+        &mut self,
+        bb: &BitBoard,
+        py: Python<'_>,
+        eval_fn: &PyObject,
+        batch_size: u32,
+    ) -> MCTSSearchResult {
+        let is_white = bb.current_player == Player::White;
+
+        // Always fresh tree for Gumbel search (no reuse)
+        self.nodes.clear();
+        self.nodes.push(MCTSNode::root(is_white));
+
+        // Expand root
+        let root_planes = bb_to_planes(bb);
+        let root_moves = self.gen_moves(&bb);
+        if root_moves.is_empty() {
+            return MCTSSearchResult::empty();
+        }
+
+        let root_child_is_white = if !root_moves.is_empty() && root_moves[0].is_pail_placement() {
+            bb.current_player == Player::White
+        } else {
+            bb.current_player != Player::White
+        };
+
+        // Evaluate root via network
+        let log_priors = match self.call_network_single(py, eval_fn, &root_planes) {
+            Ok((raw_logits, value)) => {
+                let policy_logits = if !is_white { Self::vflip_policy(&raw_logits) } else { raw_logits };
+                let priors = Self::masked_softmax(&policy_logits, &root_moves);
+                let log_priors = Self::masked_log_softmax(&policy_logits, &root_moves);
+                self.expand_node(0, &root_moves, &priors, root_child_is_white);
+                // No Dirichlet noise: Gumbel noise replaces it (paper §3)
+                let value_white = if is_white { value } else { -value };
+                self.nodes[0].visit_count += 1;
+                self.nodes[0].total_value += value_white;
+                log_priors
+            }
+            Err(_) => {
+                let v = (self.engine.evaluate_heuristic(bb) as f32 / SCORE_SCALING).tanh();
+                let n = root_moves.len();
+                let uniform = 1.0 / n as f32;
+                let priors = vec![uniform; n];
+                self.expand_node(0, &root_moves, &priors, root_child_is_white);
+                self.nodes[0].visit_count += 1;
+                self.nodes[0].total_value += v;
+                vec![(uniform as f64).ln() as f32; n]
+            }
+        };
+
+        let n_children = self.nodes[0].children_count as usize;
+        let start = self.nodes[0].children_start as usize;
+
+        if n_children == 0 {
+            return MCTSSearchResult::empty();
+        }
+        if n_children == 1 {
+            self.nodes[start].visit_count = 1;
+            return self.build_result(0);
+        }
+
+        // Sample Gumbel(0,1) noise for each action
+        let gumbels: Vec<f64> = (0..n_children).map(|_| self.rng.gumbel()).collect();
+
+        // Sequential Halving: select top-m, then halve in phases
+        let m = n_children; // use all actions for small branching factor
+        let mut candidates: Vec<usize> = (0..n_children).collect();
+        // Sort descending by gumbel + log_prior
+        candidates.sort_by(|&a, &b| {
+            let sa = gumbels[a] + log_priors[a] as f64;
+            let sb = gumbels[b] + log_priors[b] as f64;
+            sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        candidates.truncate(m);
+
+        let n_phases = ((candidates.len() as f64).log2().ceil() as u32).max(1);
+        let sims_per_phase = self.simulations / n_phases;
+
+        for phase in 0..n_phases {
+            let n_remaining = candidates.len();
+            if n_remaining <= 1 {
+                break;
+            }
+
+            let sims_per_action = (sims_per_phase / n_remaining as u32).max(1);
+
+            // Run sims for each candidate, forcing root action
+            for &cand_i in &candidates.clone() {
+                let forced_child = start + cand_i;
+                let mut sims_done = 0u32;
+
+                while sims_done < sims_per_action {
+                    let batch_n = std::cmp::min(batch_size, sims_per_action - sims_done) as usize;
+
+                    struct PendingLeaf {
+                        node_idx: usize,
+                        bb: BitBoard,
+                        moves: Vec<BitMove>,
+                    }
+                    let mut pending: Vec<PendingLeaf> = Vec::new();
+                    let mut terminal_backprops: Vec<(usize, f32)> = Vec::new();
+
+                    for _ in 0..batch_n {
+                        // Force root -> forced_child
+                        let mut sim_bb = *bb;
+                        sim_bb.make_move(&self.nodes[forced_child].bitmove);
+                        let mut node_idx = forced_child;
+
+                        // PUCT below forced child
+                        while self.nodes[node_idx].is_expanded() && !self.nodes[node_idx].is_terminal {
+                            node_idx = self.select_child(node_idx);
+                            sim_bb.make_move(&self.nodes[node_idx].bitmove);
+                        }
+
+                        if self.nodes[node_idx].is_terminal {
+                            terminal_backprops.push((node_idx, self.nodes[node_idx].terminal_value));
+                            continue;
+                        }
+
+                        if let Some(winner) = sim_bb.check_winner() {
+                            self.nodes[node_idx].is_terminal = true;
+                            let v = if winner == Player::White { 1.0 } else { -1.0 };
+                            self.nodes[node_idx].terminal_value = v;
+                            terminal_backprops.push((node_idx, v));
+                            continue;
+                        }
+
+                        let moves = self.gen_moves(&sim_bb);
+                        if moves.is_empty() {
+                            self.nodes[node_idx].is_terminal = true;
+                            self.nodes[node_idx].terminal_value = 0.0;
+                            terminal_backprops.push((node_idx, 0.0));
+                            continue;
+                        }
+
+                        // Check cache
+                        let hash = sim_bb.hash;
+                        if let Some((cached_logits, cached_value)) = self.network_cache.get(&hash).cloned() {
+                            let priors = Self::masked_softmax(&cached_logits, &moves);
+                            let child_is_white = if !moves.is_empty() && moves[0].is_pail_placement() {
+                                sim_bb.current_player == Player::White
+                            } else {
+                                sim_bb.current_player != Player::White
+                            };
+                            self.expand_node(node_idx, &moves, &priors, child_is_white);
+                            self.backpropagate(node_idx, cached_value);
+                            continue;
+                        }
+
+                        // Virtual loss
+                        let mut vl_idx = node_idx;
+                        loop {
+                            self.nodes[vl_idx].visit_count += Self::VIRTUAL_LOSS as u32;
+                            self.nodes[vl_idx].total_value -= Self::VIRTUAL_LOSS;
+                            if self.nodes[vl_idx].parent == u32::MAX { break; }
+                            vl_idx = self.nodes[vl_idx].parent as usize;
+                        }
+
+                        pending.push(PendingLeaf { node_idx, bb: sim_bb, moves });
+                    }
+
+                    // Batch evaluate
+                    if !pending.is_empty() {
+                        let batch_planes: Vec<Vec<f32>> = pending.iter()
+                            .map(|p| bb_to_planes(&p.bb)).collect();
+                        let batch_results = self.call_network_batch(py, eval_fn, &batch_planes);
+
+                        for (i, leaf) in pending.iter().enumerate() {
+                            // Remove virtual loss
+                            let mut vl_idx = leaf.node_idx;
+                            loop {
+                                self.nodes[vl_idx].visit_count -= Self::VIRTUAL_LOSS as u32;
+                                self.nodes[vl_idx].total_value += Self::VIRTUAL_LOSS;
+                                if self.nodes[vl_idx].parent == u32::MAX { break; }
+                                vl_idx = self.nodes[vl_idx].parent as usize;
+                            }
+
+                            let leaf_is_white = leaf.bb.current_player == Player::White;
+                            let (value, priors) = match &batch_results {
+                                Ok((policies, values)) => {
+                                    let value_white = if leaf_is_white { values[i] } else { -values[i] };
+                                    let policy_logits = if !leaf_is_white {
+                                        Self::vflip_policy(&policies[i])
+                                    } else {
+                                        policies[i].clone()
+                                    };
+                                    let hash = leaf.bb.hash;
+                                    if self.network_cache.len() < 100_000 {
+                                        self.network_cache.insert(hash, (policy_logits.clone(), value_white));
+                                    } else {
+                                        self.network_cache.clear();
+                                        self.network_cache.insert(hash, (policy_logits.clone(), value_white));
+                                    }
+                                    (value_white, Self::masked_softmax(&policy_logits, &leaf.moves))
+                                }
+                                Err(_) => {
+                                    let v = (self.engine.evaluate_heuristic(&leaf.bb) as f32 / SCORE_SCALING).tanh();
+                                    (v, vec![1.0 / leaf.moves.len() as f32; leaf.moves.len()])
+                                }
+                            };
+
+                            let child_is_white = if !leaf.moves.is_empty() && leaf.moves[0].is_pail_placement() {
+                                leaf.bb.current_player == Player::White
+                            } else {
+                                leaf.bb.current_player != Player::White
+                            };
+                            self.expand_node(leaf.node_idx, &leaf.moves, &priors, child_is_white);
+                            let value = self.apply_repetition_penalty(value, leaf.bb.hash);
+                            self.backpropagate(leaf.node_idx, value);
+                        }
+                    }
+
+                    for (node_idx, value) in &terminal_backprops {
+                        self.backpropagate(*node_idx, *value);
+                    }
+
+                    sims_done += batch_n as u32;
+                }
+            }
+
+            // Halve: keep top half by gumbel + log_prior + sigma * normalized_Q
+            if phase < n_phases - 1 && candidates.len() > 1 {
+                let sigma = self.compute_gumbel_sigma(0);
+                let norm_q = self.normalized_completed_q_values(0);
+                candidates.sort_by(|&a, &b| {
+                    let sa = gumbels[a] + (log_priors[a] + sigma * norm_q[a]) as f64;
+                    let sb = gumbels[b] + (log_priors[b] + sigma * norm_q[b]) as f64;
+                    sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+                });
+                let half = (candidates.len() + 1) / 2;
+                candidates.truncate(half);
+            }
+        }
+
+        let sigma = self.compute_gumbel_sigma(0);
+        self.build_gumbel_result(0, &gumbels, &log_priors, sigma)
+    }
+
+    /// Gumbel AlphaZero search with ONNX batched evaluation (pure Rust, no Python).
+    fn search_gumbel_batched_onnx_impl(
+        &mut self,
+        bb: &BitBoard,
+        onnx: &mut OnnxSession,
+        batch_size: u32,
+    ) -> MCTSSearchResult {
+        let is_white = bb.current_player == Player::White;
+
+        // Always fresh tree
+        self.nodes.clear();
+        self.nodes.push(MCTSNode::root(is_white));
+
+        let root_planes = bb_to_planes(bb);
+        let root_moves = self.gen_moves(&bb);
+        if root_moves.is_empty() {
+            return MCTSSearchResult::empty();
+        }
+
+        let root_child_is_white = if !root_moves.is_empty() && root_moves[0].is_pail_placement() {
+            bb.current_player == Player::White
+        } else {
+            bb.current_player != Player::White
+        };
+
+        let log_priors = match onnx.infer_batch(&[root_planes]) {
+            Ok((policies, values)) if !policies.is_empty() => {
+                let raw_logits = &policies[0];
+                let policy_logits = if !is_white { Self::vflip_policy(raw_logits) } else { raw_logits.clone() };
+                let priors = Self::masked_softmax(&policy_logits, &root_moves);
+                let log_priors = Self::masked_log_softmax(&policy_logits, &root_moves);
+                self.expand_node(0, &root_moves, &priors, root_child_is_white);
+                // No Dirichlet noise: Gumbel noise replaces it (paper §3)
+                let value_white = if is_white { values[0] } else { -values[0] };
+                self.nodes[0].visit_count += 1;
+                self.nodes[0].total_value += value_white;
+                log_priors
+            }
+            _ => {
+                let v = (self.engine.evaluate_heuristic(bb) as f32 / SCORE_SCALING).tanh();
+                let n = root_moves.len();
+                let uniform = 1.0 / n as f32;
+                let priors = vec![uniform; n];
+                self.expand_node(0, &root_moves, &priors, root_child_is_white);
+                self.nodes[0].visit_count += 1;
+                self.nodes[0].total_value += v;
+                vec![(uniform as f64).ln() as f32; n]
+            }
+        };
+
+        let n_children = self.nodes[0].children_count as usize;
+        let start = self.nodes[0].children_start as usize;
+
+        if n_children == 0 {
+            return MCTSSearchResult::empty();
+        }
+        if n_children == 1 {
+            self.nodes[start].visit_count = 1;
+            return self.build_result(0);
+        }
+
+        let gumbels: Vec<f64> = (0..n_children).map(|_| self.rng.gumbel()).collect();
+
+        let m = n_children;
+        let mut candidates: Vec<usize> = (0..n_children).collect();
+        candidates.sort_by(|&a, &b| {
+            let sa = gumbels[a] + log_priors[a] as f64;
+            let sb = gumbels[b] + log_priors[b] as f64;
+            sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        candidates.truncate(m);
+
+        let n_phases = ((candidates.len() as f64).log2().ceil() as u32).max(1);
+        let sims_per_phase = self.simulations / n_phases;
+
+        for phase in 0..n_phases {
+            let n_remaining = candidates.len();
+            if n_remaining <= 1 {
+                break;
+            }
+
+            let sims_per_action = (sims_per_phase / n_remaining as u32).max(1);
+
+            for &cand_i in &candidates.clone() {
+                let forced_child = start + cand_i;
+                let mut sims_done = 0u32;
+
+                while sims_done < sims_per_action {
+                    let batch_n = std::cmp::min(batch_size, sims_per_action - sims_done) as usize;
+
+                    struct PendingLeaf {
+                        node_idx: usize,
+                        bb: BitBoard,
+                        moves: Vec<BitMove>,
+                    }
+                    let mut pending: Vec<PendingLeaf> = Vec::new();
+                    let mut terminal_backprops: Vec<(usize, f32)> = Vec::new();
+
+                    for _ in 0..batch_n {
+                        let mut sim_bb = *bb;
+                        sim_bb.make_move(&self.nodes[forced_child].bitmove);
+                        let mut node_idx = forced_child;
+
+                        while self.nodes[node_idx].is_expanded() && !self.nodes[node_idx].is_terminal {
+                            node_idx = self.select_child(node_idx);
+                            sim_bb.make_move(&self.nodes[node_idx].bitmove);
+                        }
+
+                        if self.nodes[node_idx].is_terminal {
+                            terminal_backprops.push((node_idx, self.nodes[node_idx].terminal_value));
+                            continue;
+                        }
+
+                        if let Some(winner) = sim_bb.check_winner() {
+                            self.nodes[node_idx].is_terminal = true;
+                            let v = if winner == Player::White { 1.0 } else { -1.0 };
+                            self.nodes[node_idx].terminal_value = v;
+                            terminal_backprops.push((node_idx, v));
+                            continue;
+                        }
+
+                        let moves = self.gen_moves(&sim_bb);
+                        if moves.is_empty() {
+                            self.nodes[node_idx].is_terminal = true;
+                            self.nodes[node_idx].terminal_value = 0.0;
+                            terminal_backprops.push((node_idx, 0.0));
+                            continue;
+                        }
+
+                        let hash = sim_bb.hash;
+                        if let Some((cached_logits, cached_value)) = self.network_cache.get(&hash).cloned() {
+                            let priors = Self::masked_softmax(&cached_logits, &moves);
+                            let child_is_white = if !moves.is_empty() && moves[0].is_pail_placement() {
+                                sim_bb.current_player == Player::White
+                            } else {
+                                sim_bb.current_player != Player::White
+                            };
+                            self.expand_node(node_idx, &moves, &priors, child_is_white);
+                            self.backpropagate(node_idx, cached_value);
+                            continue;
+                        }
+
+                        let mut vl_idx = node_idx;
+                        loop {
+                            self.nodes[vl_idx].visit_count += Self::VIRTUAL_LOSS as u32;
+                            self.nodes[vl_idx].total_value -= Self::VIRTUAL_LOSS;
+                            if self.nodes[vl_idx].parent == u32::MAX { break; }
+                            vl_idx = self.nodes[vl_idx].parent as usize;
+                        }
+
+                        pending.push(PendingLeaf { node_idx, bb: sim_bb, moves });
+                    }
+
+                    if !pending.is_empty() {
+                        let batch_planes: Vec<Vec<f32>> = pending.iter()
+                            .map(|p| bb_to_planes(&p.bb)).collect();
+                        let batch_results = onnx.infer_batch(&batch_planes);
+
+                        for (i, leaf) in pending.iter().enumerate() {
+                            let mut vl_idx = leaf.node_idx;
+                            loop {
+                                self.nodes[vl_idx].visit_count -= Self::VIRTUAL_LOSS as u32;
+                                self.nodes[vl_idx].total_value += Self::VIRTUAL_LOSS;
+                                if self.nodes[vl_idx].parent == u32::MAX { break; }
+                                vl_idx = self.nodes[vl_idx].parent as usize;
+                            }
+
+                            let leaf_is_white = leaf.bb.current_player == Player::White;
+                            let (value, priors) = match &batch_results {
+                                Ok((policies, values)) => {
+                                    let value_white = if leaf_is_white { values[i] } else { -values[i] };
+                                    let policy_logits = if !leaf_is_white {
+                                        Self::vflip_policy(&policies[i])
+                                    } else {
+                                        policies[i].clone()
+                                    };
+                                    let hash = leaf.bb.hash;
+                                    if self.network_cache.len() < 100_000 {
+                                        self.network_cache.insert(hash, (policy_logits.clone(), value_white));
+                                    } else {
+                                        self.network_cache.clear();
+                                        self.network_cache.insert(hash, (policy_logits.clone(), value_white));
+                                    }
+                                    (value_white, Self::masked_softmax(&policy_logits, &leaf.moves))
+                                }
+                                Err(_) => {
+                                    let v = (self.engine.evaluate_heuristic(&leaf.bb) as f32 / SCORE_SCALING).tanh();
+                                    (v, vec![1.0 / leaf.moves.len() as f32; leaf.moves.len()])
+                                }
+                            };
+
+                            let child_is_white = if !leaf.moves.is_empty() && leaf.moves[0].is_pail_placement() {
+                                leaf.bb.current_player == Player::White
+                            } else {
+                                leaf.bb.current_player != Player::White
+                            };
+                            self.expand_node(leaf.node_idx, &leaf.moves, &priors, child_is_white);
+                            let value = self.apply_repetition_penalty(value, leaf.bb.hash);
+                            self.backpropagate(leaf.node_idx, value);
+                        }
+                    }
+
+                    for (node_idx, value) in terminal_backprops {
+                        self.backpropagate(node_idx, value);
+                    }
+
+                    sims_done += batch_n as u32;
+                }
+            }
+
+            // Halve
+            if phase < n_phases - 1 && candidates.len() > 1 {
+                let sigma = self.compute_gumbel_sigma(0);
+                let norm_q = self.normalized_completed_q_values(0);
+                candidates.sort_by(|&a, &b| {
+                    let sa = gumbels[a] + (log_priors[a] + sigma * norm_q[a]) as f64;
+                    let sb = gumbels[b] + (log_priors[b] + sigma * norm_q[b]) as f64;
+                    sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+                });
+                let half = (candidates.len() + 1) / 2;
+                candidates.truncate(half);
+            }
+        }
+
+        let sigma = self.compute_gumbel_sigma(0);
+        self.build_gumbel_result(0, &gumbels, &log_priors, sigma)
     }
 
     /// Play one self-play game using ONNX inference (pure Rust).
@@ -2252,12 +3218,13 @@ impl MCTSEngine {
         let mut bb = BitBoard::new();
         let mut examples: Vec<(Vec<f32>, Vec<f32>, bool, f32)> = Vec::new();
         let original_sims = self.simulations;
+        let mut position_history: Vec<u64> = Vec::new();
 
         // Random opening moves
         let mut random_turns = 0;
         while random_turns < random_opening {
             if bb.check_winner().is_some() { break; }
-            let moves = bb.generate_moves();
+            let moves = self.gen_moves(&bb);
             if moves.is_empty() { break; }
             let idx = self.rng.usize(moves.len());
             let is_barrel_move = !moves[idx].is_pail_placement();
@@ -2271,12 +3238,34 @@ impl MCTSEngine {
                 break;
             }
 
+            // Adjudicate decisive positions early
+            if self.should_adjudicate(&bb, move_count) {
+                break;
+            }
+
+            // 3-fold repetition detection
+            if move_count >= 15 && Self::is_threefold(&position_history, bb.hash) {
+                break;
+            }
+            position_history.push(bb.hash);
+            self.game_position_history.clone_from(&position_history);
+
+            // Pail placement: skip MCTS, use center-biased random selection
+            if let Some(pail_move) = self.random_center_pail(&bb) {
+                bb.make_move(&pail_move);
+                continue;
+            }
+
             // Playout cap randomization
             let is_full_search = full_search_fraction >= 1.0
                 || self.rng.f64() < full_search_fraction as f64;
             self.simulations = if is_full_search { original_sims } else { cheap_sims };
 
-            let result = self.search_batched_onnx_impl(&bb, onnx, batch_size, true);
+            let result = if self.use_gumbel {
+                self.search_gumbel_batched_onnx_impl(&bb, onnx, batch_size)
+            } else {
+                self.search_batched_onnx_impl(&bb, onnx, batch_size, true)
+            };
             if result.best_move.is_none() { break; }
 
             // Only collect training data from full-search moves
@@ -2287,8 +3276,27 @@ impl MCTSEngine {
                 examples.push((planes, result.policy_target.clone(), is_white, search_score));
             }
 
-            // Temperature-based selection
-            let chosen_bitmove = if (move_count as usize) < temp_moves && temperature > 0.0 {
+            // Move selection
+            let chosen_bitmove = if self.use_gumbel {
+                if (move_count as usize) < temp_moves && temperature > 0.0 {
+                    // Temperature sampling from visit counts (not improved policy)
+                    self.sample_bitmove_by_temp(0, temperature)
+                        .unwrap_or_else(|| self.most_visited_bitmove())
+                } else {
+                    let best_move = result.best_move.as_ref().unwrap();
+                    let best_pi = Self::move_policy_index(best_move);
+                    let root = &self.nodes[0];
+                    let s = root.children_start as usize;
+                    let mut bm = self.nodes[s].bitmove;
+                    for i in 0..root.children_count as usize {
+                        if policy_index(&self.nodes[s + i].bitmove) == best_pi {
+                            bm = self.nodes[s + i].bitmove;
+                            break;
+                        }
+                    }
+                    bm
+                }
+            } else if (move_count as usize) < temp_moves && temperature > 0.0 {
                 self.sample_bitmove_by_temp(0, temperature)
                     .unwrap_or_else(|| self.most_visited_bitmove())
             } else {
@@ -2296,7 +3304,9 @@ impl MCTSEngine {
             };
 
             let is_barrel_move = !chosen_bitmove.is_pail_placement();
-            self.retain_subtree(&chosen_bitmove);
+            if !self.use_gumbel {
+                self.retain_subtree(&chosen_bitmove);
+            }
             bb.make_move(&chosen_bitmove);
             if is_barrel_move { move_count += 1; }
         }
@@ -2309,7 +3319,8 @@ impl MCTSEngine {
         let training_examples: Vec<TrainingExample> = examples
             .into_iter()
             .map(|(planes, policy, is_white, search_score)| {
-                let value_target = if is_white { outcome_white } else { -outcome_white };
+                let game_outcome = if is_white { outcome_white } else { -outcome_white };
+                let value_target = self.blend_value_target(game_outcome, search_score);
                 let policy_target = if is_white { policy } else { Self::vflip_policy(&policy) };
                 TrainingExample {
                     planes,
@@ -2328,6 +3339,145 @@ impl MCTSEngine {
     }
 
     /// Play N evaluation games using ONNX: MCTS vs alpha-beta.
+    fn play_mixed_game_onnx_impl(
+        &mut self,
+        onnx: &mut OnnxSession,
+        opponent_depth: u8,
+        batch_size: u32,
+        random_opening: usize,
+        max_moves: usize,
+        temp_moves: usize,
+        temperature: f32,
+        mcts_is_white: bool,
+    ) -> Result<SelfPlayResult, String> {
+        self.clear_caches();
+        let mut bb = BitBoard::new();
+        let mut examples: Vec<(Vec<f32>, Vec<f32>, bool, f32)> = Vec::new();
+        let mut position_history: Vec<u64> = Vec::new();
+
+        // Random opening moves
+        let mut random_turns = 0;
+        while random_turns < random_opening {
+            if bb.check_winner().is_some() { break; }
+            let moves = self.gen_moves(&bb);
+            if moves.is_empty() { break; }
+            let idx = self.rng.usize(moves.len());
+            let is_barrel_move = !moves[idx].is_pail_placement();
+            bb.make_move(&moves[idx]);
+            if is_barrel_move { random_turns += 1; }
+        }
+
+        let mut move_count = 0u32;
+        loop {
+            if bb.check_winner().is_some() || (move_count as usize) >= max_moves {
+                break;
+            }
+
+            // Adjudicate decisive positions early
+            if self.should_adjudicate(&bb, move_count) {
+                break;
+            }
+
+            // 3-fold repetition detection
+            if move_count >= 15 && Self::is_threefold(&position_history, bb.hash) {
+                break;
+            }
+            position_history.push(bb.hash);
+            self.game_position_history.clone_from(&position_history);
+
+            // Pail placement: center-biased random for both sides
+            if let Some(pail_move) = self.random_center_pail(&bb) {
+                bb.make_move(&pail_move);
+                continue;
+            }
+
+            let is_white_turn = bb.current_player == Player::White;
+            let is_mcts_turn = is_white_turn == mcts_is_white;
+
+            let chosen_bitmove = if is_mcts_turn {
+                // Network MCTS turn — collect training data
+                let result = if self.use_gumbel {
+                    self.search_gumbel_batched_onnx_impl(&bb, onnx, batch_size)
+                } else {
+                    self.search_batched_onnx_impl(&bb, onnx, batch_size, true)
+                };
+                if result.best_move.is_none() { break; }
+
+                // Collect training example
+                let is_white = bb.current_player == Player::White;
+                let planes = bb_to_planes(&bb);
+                let search_score = if is_white { result.root_value } else { -result.root_value };
+                examples.push((planes, result.policy_target.clone(), is_white, search_score));
+
+                // Move selection
+                if self.use_gumbel {
+                    if (move_count as usize) < temp_moves && temperature > 0.0 {
+                        self.sample_bitmove_by_temp(0, temperature)
+                            .unwrap_or_else(|| self.most_visited_bitmove())
+                    } else {
+                        let best_move = result.best_move.as_ref().unwrap();
+                        let best_pi = Self::move_policy_index(best_move);
+                        let root = &self.nodes[0];
+                        let s = root.children_start as usize;
+                        let mut bm = self.nodes[s].bitmove;
+                        for i in 0..root.children_count as usize {
+                            if policy_index(&self.nodes[s + i].bitmove) == best_pi {
+                                bm = self.nodes[s + i].bitmove;
+                                break;
+                            }
+                        }
+                        bm
+                    }
+                } else if (move_count as usize) < temp_moves && temperature > 0.0 {
+                    self.sample_bitmove_by_temp(0, temperature)
+                        .unwrap_or_else(|| self.most_visited_bitmove())
+                } else {
+                    self.most_visited_bitmove()
+                }
+            } else {
+                // Heuristic turn
+                self.engine.full_reset();
+                let (_, bm_opt) = self.engine.search(&bb, opponent_depth);
+                match bm_opt {
+                    Some(bm) => bm,
+                    None => break,
+                }
+            };
+
+            let is_barrel_move = !chosen_bitmove.is_pail_placement();
+            if is_mcts_turn && !self.use_gumbel {
+                self.retain_subtree(&chosen_bitmove);
+            }
+            bb.make_move(&chosen_bitmove);
+            if is_barrel_move { move_count += 1; }
+        }
+
+        self.nodes.clear();
+
+        let (outcome_white, winner_str) = self.determine_outcome(&bb);
+
+        let training_examples: Vec<TrainingExample> = examples
+            .into_iter()
+            .map(|(planes, policy, is_white, search_score)| {
+                let game_outcome = if is_white { outcome_white } else { -outcome_white };
+                let value_target = self.blend_value_target(game_outcome, search_score);
+                let policy_target = if is_white { policy } else { Self::vflip_policy(&policy) };
+                TrainingExample {
+                    planes,
+                    policy_target,
+                    value_target,
+                    search_score,
+                }
+            })
+            .collect();
+
+        Ok(SelfPlayResult {
+            examples: training_examples,
+            winner: winner_str,
+            move_count,
+        })
+    }
+
     fn play_eval_match_onnx_impl(
         &mut self,
         onnx: &mut OnnxSession,
@@ -2352,7 +3502,7 @@ impl MCTSEngine {
             let mut random_turns = 0;
             while random_turns < random_opening {
                 if bb.check_winner().is_some() { break; }
-                let moves = bb.generate_moves();
+                let moves = self.gen_moves(&bb);
                 if moves.is_empty() { break; }
                 let idx = self.rng.usize(moves.len());
                 let is_barrel_move = !moves[idx].is_pail_placement();
@@ -2361,19 +3511,53 @@ impl MCTSEngine {
             }
 
             let mut move_count = 0u32;
+            let mut position_history: Vec<u64> = Vec::new();
             loop {
                 if bb.check_winner().is_some() || (move_count as usize) >= max_moves {
                     break;
+                }
+
+                // 3-fold repetition detection
+                if move_count >= 15 && Self::is_threefold(&position_history, bb.hash) {
+                    break;
+                }
+                position_history.push(bb.hash);
+                self.game_position_history.clone_from(&position_history);
+
+                // Pail placement: center-biased random for both sides
+                if let Some(pail_move) = self.random_center_pail(&bb) {
+                    bb.make_move(&pail_move);
+                    continue;
                 }
 
                 let is_white_turn = bb.current_player == Player::White;
                 let is_mcts_turn = is_white_turn == mcts_is_white;
 
                 let chosen_bitmove = if is_mcts_turn {
-                    let result = self.search_batched_onnx_impl(&bb, onnx, batch_size, false);
-                    match result.best_move {
-                        Some(_) => self.most_visited_bitmove(),
-                        None => break,
+                    if self.use_gumbel {
+                        let result = self.search_gumbel_batched_onnx_impl(&bb, onnx, batch_size);
+                        match result.best_move {
+                            Some(mv) => {
+                                let best_pi = Self::move_policy_index(&mv);
+                                let root = &self.nodes[0];
+                                let s = root.children_start as usize;
+                                let mut bm = self.nodes[s].bitmove;
+                                for i in 0..root.children_count as usize {
+                                    if policy_index(&self.nodes[s + i].bitmove) == best_pi {
+                                        bm = self.nodes[s + i].bitmove;
+                                        break;
+                                    }
+                                }
+                                bm
+                            }
+                            None => break,
+                        }
+                    } else {
+                        let result = self.search_batched_onnx_impl(&bb, onnx, batch_size, false);
+                        match result.best_move {
+                            Some(_) => self.most_visited_bitmove(),
+                            None => break,
+                        }
                     }
                 } else {
                     self.engine.full_reset();

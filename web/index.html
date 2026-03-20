@@ -564,8 +564,8 @@
             <select id="simulations-select">
                 <option value="100">100 (rask)</option>
                 <option value="200">200</option>
-                <option value="400" selected>400 (standard)</option>
-                <option value="800">800 (sterk)</option>
+                <option value="300" selected>300 (standard)</option>
+                <option value="400">400 (sterk)</option>
             </select>
         </div>
 
@@ -1377,9 +1377,23 @@
 
                 if (isValid) {
                     selectedPailDest = [row, col];
-                    phase = 'select-barrel';
-                    renderBoard();
-                    updateStatus();
+                    // Send pail-only sub-move to server immediately
+                    (async () => {
+                        try {
+                            const data = await api('/api/move', 'POST', {
+                                game_id: gameId,
+                                is_pail_only: true,
+                                place_pail: [row, col],
+                            });
+                            gameState = data.state;
+                            validMoves = data.valid_moves;
+                            phase = 'select-barrel';
+                            renderBoard();
+                            updateStatus();
+                        } catch (e) {
+                            alert('Feil: ' + e.message);
+                        }
+                    })();
                 }
             }
             else if (phase === 'select-barrel') {

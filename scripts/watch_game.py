@@ -20,6 +20,29 @@ from tonnesjakk.alphazero import (
 )
 
 
+def _handle_pail_submove(board):
+    """If the board is in pail-placement phase, pick a random center-biased pail move.
+
+    This matches the Rust game loop which handles pail sub-moves separately from
+    barrel moves.  Without this, MCTS tree reuse causes stale pail-phase trees
+    to be reused during the barrel-phase search.
+    """
+    moves = board.generate_moves()
+    if not moves or not moves[0].is_pail_only:
+        return None
+    weights = []
+    for m in moves:
+        to = m.barrel_to
+        dist = abs(to.row - 2.5) + abs(to.col - 2.5)
+        w = max(6.0 - dist, 0.5)
+        weights.append(w * w)
+    weights = np.array(weights)
+    weights /= weights.sum()
+    idx = np.random.choice(len(moves), p=weights)
+    board.make_move(moves[idx])
+    return moves[idx]
+
+
 def _fmt_move(m):
     """Format a move for display."""
     if m.is_barrel_placement:
@@ -57,7 +80,6 @@ def play_self_game(trainer, simulations, max_moves=80):
         device=trainer.device,
         use_amp=trainer.use_amp,
     )
-    engine = _RustMCTSEngine(simulations, 1.4)
 
     board = Board()
     print(board.display())
@@ -68,9 +90,15 @@ def play_self_game(trainer, simulations, max_moves=80):
         if winner is not None:
             break
 
+        # Handle pail sub-move first (avoids MCTS tree reuse bug)
+        _handle_pail_submove(board)
+
         moves = board.generate_moves()
         if not moves:
             break
+
+        # Fresh engine to avoid stale tree reuse across sub-moves
+        engine = _RustMCTSEngine(simulations, 1.4)
 
         # Raw network eval
         net_probs, raw_value = _net_eval(trainer.network, board, engine, trainer.device)
@@ -120,7 +148,6 @@ def play_vs_heuristic(trainer, simulations, depth, max_moves=80):
         device=trainer.device,
         use_amp=trainer.use_amp,
     )
-    engine = _RustMCTSEngine(simulations, 1.4)
 
     board = Board()
     print(f"Network (White, {simulations} sims) vs Heuristic (Black, depth {depth})")
@@ -132,6 +159,9 @@ def play_vs_heuristic(trainer, simulations, depth, max_moves=80):
         if winner is not None:
             break
 
+        # Handle pail sub-move first (avoids MCTS tree reuse bug)
+        _handle_pail_submove(board)
+
         moves = board.generate_moves()
         if not moves:
             break
@@ -139,7 +169,8 @@ def play_vs_heuristic(trainer, simulations, depth, max_moves=80):
         is_white = str(board.current_player) == "Player.White"
 
         if is_white:
-            # Network + MCTS
+            # Network + MCTS — fresh engine to avoid stale tree reuse
+            engine = _RustMCTSEngine(simulations, 1.4)
             net_probs, raw_value = _net_eval(trainer.network, board, engine, trainer.device)
             mcts_policy, mcts_value, best_move = _mcts_search(
                 engine, board, mcts._batch_eval_fn, mcts.batch_size
@@ -147,7 +178,8 @@ def play_vs_heuristic(trainer, simulations, depth, max_moves=80):
             print(f"Move {move_num+1} (Network/White): {_fmt_move(best_move)}  "
                   f"net_val={raw_value:+.4f}  mcts_val={mcts_value:+.4f}")
         else:
-            # Heuristic alpha-beta
+            # Heuristic alpha-beta — fresh engine
+            engine = _RustMCTSEngine(simulations, 1.4)
             result = engine.search_heuristic(board)
             best_move = result.best_move
             print(f"Move {move_num+1} (Heuristic/Black): {_fmt_move(best_move)}  "

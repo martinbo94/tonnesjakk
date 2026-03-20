@@ -26,7 +26,7 @@ import json
 import multiprocessing
 import time
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -396,12 +396,16 @@ class TrainingLogger:
                       lr: float, selfplay_time: float, train_time: float,
                       search_score_mean: float = 0.0, search_score_std: float = 0.0,
                       search_score_mae: float = 0.0, n_heuristic: int = 0,
-                      n_network: int = 0):
+                      n_network: int = 0, draws_dropped: int = 0):
         self._write({
             "type": "iteration",
             "timestamp": time.time(),
             "iteration": iteration,
             "game_results": game_results,
+            "white_wins": game_results.get("white", 0),
+            "black_wins": game_results.get("black", 0),
+            "draws": game_results.get("draw", 0),
+            "draws_dropped": draws_dropped,
             "buffer_size": buffer_size,
             "policy_loss": round(policy_loss, 6),
             "value_loss": round(value_loss, 6),
@@ -435,38 +439,96 @@ class TrainingLogger:
 
 
 # ---------------------------------------------------------------------------
+# Game result helpers
+# ---------------------------------------------------------------------------
+
+# Per-game result: (outcome, examples) where outcome is "white"/"black"/"draw"
+# and examples is a list of (planes, policy, value_target, search_score) tuples.
+GameResult = Tuple[str, List[Tuple[np.ndarray, np.ndarray, float, float]]]
+
+
+def _filter_draws(games: List[GameResult], max_draw_fraction: float,
+                  rng: Optional[np.random.Generator] = None,
+                  ) -> Tuple[List[Tuple[np.ndarray, np.ndarray, float, float]],
+                             Dict[str, int], int]:
+    """Filter per-game results to cap the fraction of draw games.
+
+    Returns (examples, results_dict, draws_dropped).
+    """
+    if max_draw_fraction >= 1.0:
+        # No filtering — flatten and return
+        examples = []
+        results: Dict[str, int] = {"white": 0, "black": 0, "draw": 0}
+        for outcome, exs in games:
+            examples.extend(exs)
+            results[outcome] += 1
+        return examples, results, 0
+
+    decisive = [(o, exs) for o, exs in games if o != "draw"]
+    draws = [(o, exs) for o, exs in games if o == "draw"]
+
+    n_decisive = len(decisive)
+    if n_decisive == 0:
+        # All draws — keep max_draw_fraction of them
+        keep = max(1, int(len(draws) * max_draw_fraction))
+        if rng is None:
+            rng = np.random.default_rng()
+        rng.shuffle(draws)
+        kept_draws = draws[:keep]
+        dropped = len(draws) - keep
+    else:
+        # Allow up to max_draw_fraction of total
+        # n_draws / (n_decisive + n_draws) <= max_draw_fraction
+        # n_draws <= max_draw_fraction * n_decisive / (1 - max_draw_fraction)
+        max_draws = int(max_draw_fraction * n_decisive / (1.0 - max_draw_fraction))
+        max_draws = max(max_draws, 0)
+        if len(draws) <= max_draws:
+            kept_draws = draws
+            dropped = 0
+        else:
+            if rng is None:
+                rng = np.random.default_rng()
+            rng.shuffle(draws)
+            kept_draws = draws[:max_draws]
+            dropped = len(draws) - max_draws
+
+    examples = []
+    results = {"white": 0, "black": 0, "draw": 0}
+    for outcome, exs in decisive + kept_draws:
+        examples.extend(exs)
+        results[outcome] += 1
+    return examples, results, dropped
+
+
+# ---------------------------------------------------------------------------
 # Multiprocessing workers (top-level for pickling)
 # ---------------------------------------------------------------------------
 
 def _play_alphabeta_games_worker(args):
     """Worker for parallel alpha-beta game generation. Pure Rust, no model needed."""
-    num_games, depth, random_opening, max_moves, simulations, c_puct = args
+    num_games, depth, random_opening, max_moves, simulations, c_puct, value_blend_lambda, adjudication_threshold, adjudication_min_moves = args
 
-    engine = _RustMCTSEngine(simulations, c_puct)
+    engine = _RustMCTSEngine(simulations, c_puct,
+                             value_blend_lambda=value_blend_lambda,
+                             adjudication_threshold=adjudication_threshold,
+                             adjudication_min_moves=adjudication_min_moves)
     results = engine.play_alphabeta_games(num_games, depth=depth,
                                           random_opening=random_opening,
                                           max_moves=max_moves)
 
-    all_planes = []
-    all_policies = []
-    all_values = []
-    all_search_scores = []
-    game_results = {"white": 0, "black": 0, "draw": 0}
-
+    games = []  # list of (outcome, examples) per game
     for r in results:
+        examples = []
         for ex in r.examples:
-            all_planes.append(np.array(ex.planes, dtype=np.float32).reshape(BOARD_PLANES, BOARD_SIZE, BOARD_SIZE))
-            all_policies.append(np.array(ex.policy_target, dtype=np.float32))
-            all_values.append(ex.value_target)
-            all_search_scores.append(ex.search_score)
-        game_results[r.winner] += 1
+            examples.append((
+                np.array(ex.planes, dtype=np.float32).reshape(BOARD_PLANES, BOARD_SIZE, BOARD_SIZE),
+                np.array(ex.policy_target, dtype=np.float32),
+                ex.value_target,
+                ex.search_score,
+            ))
+        games.append((r.winner, examples))
 
-    planes_np = np.array(all_planes) if all_planes else np.empty((0, 6, 6, 6), dtype=np.float32)
-    policies_np = np.array(all_policies) if all_policies else np.empty((0, POLICY_SIZE), dtype=np.float32)
-    values_np = np.array(all_values, dtype=np.float32) if all_values else np.empty(0, dtype=np.float32)
-    search_scores_np = np.array(all_search_scores, dtype=np.float32) if all_search_scores else np.empty(0, dtype=np.float32)
-
-    return planes_np, policies_np, values_np, search_scores_np, game_results
+    return games
 
 
 def _play_network_games_worker(args):
@@ -474,13 +536,15 @@ def _play_network_games_worker(args):
 
     Must be top-level (not a method) so it's picklable with spawn start method.
     Each worker creates its own model (CPU) + MCTSEngine, plays games sequentially,
-    and returns numpy arrays.
+    and returns per-game grouped results for draw filtering.
     """
     (
         num_games, model_state_dict, network_type, hidden, num_blocks,
         simulations, c_puct, mcts_batch_size, temperature,
         random_opening, max_moves, temp_moves,
         full_search_fraction, cheap_sims,
+        value_blend_lambda, adjudication_threshold, adjudication_min_moves,
+        use_gumbel, forward_only, repetition_penalty,
     ) = args
 
     # Create fresh model on CPU
@@ -504,14 +568,15 @@ def _play_network_games_worker(args):
             policy_logits, values = net(buf)
         return policy_logits.numpy().tolist(), values.numpy().tolist()
 
-    engine = _RustMCTSEngine(simulations, c_puct)
+    engine = _RustMCTSEngine(simulations, c_puct,
+                             value_blend_lambda=value_blend_lambda,
+                             adjudication_threshold=adjudication_threshold,
+                             adjudication_min_moves=adjudication_min_moves,
+                             use_gumbel=use_gumbel,
+                             forward_only=forward_only,
+                             repetition_penalty=repetition_penalty)
 
-    all_planes = []
-    all_policies = []
-    all_values = []
-    all_search_scores = []
-    results = {"white": 0, "black": 0, "draw": 0}
-
+    games = []  # list of (outcome, examples) per game
     for _ in range(num_games):
         nr = engine.play_network_game(
             batch_eval_fn, batch_size=mcts_batch_size,
@@ -520,19 +585,17 @@ def _play_network_games_worker(args):
             full_search_fraction=full_search_fraction,
             cheap_sims=cheap_sims,
         )
+        examples = []
         for ex in nr.examples:
-            all_planes.append(np.array(ex.planes, dtype=np.float32).reshape(BOARD_PLANES, BOARD_SIZE, BOARD_SIZE))
-            all_policies.append(np.array(ex.policy_target, dtype=np.float32))
-            all_values.append(ex.value_target)
-            all_search_scores.append(ex.search_score)
-        results[nr.winner] += 1
+            examples.append((
+                np.array(ex.planes, dtype=np.float32).reshape(BOARD_PLANES, BOARD_SIZE, BOARD_SIZE),
+                np.array(ex.policy_target, dtype=np.float32),
+                ex.value_target,
+                ex.search_score,
+            ))
+        games.append((nr.winner, examples))
 
-    planes_np = np.array(all_planes) if all_planes else np.empty((0, 6, 6, 6), dtype=np.float32)
-    policies_np = np.array(all_policies) if all_policies else np.empty((0, POLICY_SIZE), dtype=np.float32)
-    values_np = np.array(all_values, dtype=np.float32) if all_values else np.empty(0, dtype=np.float32)
-    search_scores_np = np.array(all_search_scores, dtype=np.float32) if all_search_scores else np.empty(0, dtype=np.float32)
-
-    return planes_np, policies_np, values_np, search_scores_np, results
+    return games
 
 
 def _play_onnx_games_worker(args):
@@ -548,17 +611,20 @@ def _play_onnx_games_worker(args):
         simulations, c_puct, mcts_batch_size, temperature,
         random_opening, max_moves, temp_moves,
         full_search_fraction, cheap_sims,
+        value_blend_lambda, adjudication_threshold, adjudication_min_moves,
+        use_gumbel, forward_only, repetition_penalty,
     ) = args
 
     onnx_session = _OnnxSession(onnx_path, use_coreml=use_coreml)
-    engine = _RustMCTSEngine(simulations, c_puct)
+    engine = _RustMCTSEngine(simulations, c_puct,
+                             value_blend_lambda=value_blend_lambda,
+                             adjudication_threshold=adjudication_threshold,
+                             adjudication_min_moves=adjudication_min_moves,
+                             use_gumbel=use_gumbel,
+                             forward_only=forward_only,
+                             repetition_penalty=repetition_penalty)
 
-    all_planes = []
-    all_policies = []
-    all_values = []
-    all_search_scores = []
-    results = {"white": 0, "black": 0, "draw": 0}
-
+    games = []  # list of (outcome, examples) per game
     for _ in range(num_games):
         nr = engine.play_network_game_onnx(
             onnx_session, batch_size=mcts_batch_size,
@@ -567,19 +633,69 @@ def _play_onnx_games_worker(args):
             full_search_fraction=full_search_fraction,
             cheap_sims=cheap_sims,
         )
+        examples = []
         for ex in nr.examples:
-            all_planes.append(np.array(ex.planes, dtype=np.float32).reshape(BOARD_PLANES, BOARD_SIZE, BOARD_SIZE))
-            all_policies.append(np.array(ex.policy_target, dtype=np.float32))
-            all_values.append(ex.value_target)
-            all_search_scores.append(ex.search_score)
-        results[nr.winner] += 1
+            examples.append((
+                np.array(ex.planes, dtype=np.float32).reshape(BOARD_PLANES, BOARD_SIZE, BOARD_SIZE),
+                np.array(ex.policy_target, dtype=np.float32),
+                ex.value_target,
+                ex.search_score,
+            ))
+        games.append((nr.winner, examples))
 
-    planes_np = np.array(all_planes) if all_planes else np.empty((0, 6, 6, 6), dtype=np.float32)
-    policies_np = np.array(all_policies) if all_policies else np.empty((0, POLICY_SIZE), dtype=np.float32)
-    values_np = np.array(all_values, dtype=np.float32) if all_values else np.empty(0, dtype=np.float32)
-    search_scores_np = np.array(all_search_scores, dtype=np.float32) if all_search_scores else np.empty(0, dtype=np.float32)
+    return games
 
-    return planes_np, policies_np, values_np, search_scores_np, results
+
+def _play_mixed_games_worker(args):
+    """Worker for parallel network-vs-heuristic training games.
+
+    Each game alternates which side the network plays. Collects training
+    examples only from the network's turns.
+    """
+    from tonnesjakk._core import OnnxSession as _OnnxSession
+
+    (
+        num_games, onnx_path, use_coreml,
+        simulations, c_puct, mcts_batch_size, temperature,
+        random_opening, max_moves, temp_moves,
+        opponent_depth,
+        value_blend_lambda, adjudication_threshold, adjudication_min_moves,
+        use_gumbel, forward_only, repetition_penalty,
+    ) = args
+
+    onnx_session = _OnnxSession(onnx_path, use_coreml=use_coreml)
+    engine = _RustMCTSEngine(simulations, c_puct,
+                             value_blend_lambda=value_blend_lambda,
+                             adjudication_threshold=adjudication_threshold,
+                             adjudication_min_moves=adjudication_min_moves,
+                             use_gumbel=use_gumbel,
+                             forward_only=forward_only,
+                             repetition_penalty=repetition_penalty)
+
+    games = []
+    for game_idx in range(num_games):
+        mcts_is_white = (game_idx % 2 == 0)
+        nr = engine.play_mixed_game_onnx(
+            onnx_session,
+            opponent_depth=opponent_depth,
+            batch_size=mcts_batch_size,
+            random_opening=random_opening,
+            max_moves=max_moves,
+            temp_moves=temp_moves,
+            temperature=temperature,
+            mcts_is_white=mcts_is_white,
+        )
+        examples = []
+        for ex in nr.examples:
+            examples.append((
+                np.array(ex.planes, dtype=np.float32).reshape(BOARD_PLANES, BOARD_SIZE, BOARD_SIZE),
+                np.array(ex.policy_target, dtype=np.float32),
+                ex.value_target,
+                ex.search_score,
+            ))
+        games.append((nr.winner, examples))
+
+    return games
 
 
 # ---------------------------------------------------------------------------
@@ -607,7 +723,7 @@ class AlphaZeroTrainer:
 
     def __init__(
         self,
-        hidden: int = 128,
+        hidden: int = 64,
         simulations: int = 200,       # 200 sufficient for branching factor ~16 (Wang et al. 2020)
         c_puct: float = 1.0,
         lr: float = 0.001,
@@ -628,6 +744,18 @@ class AlphaZeroTrainer:
         full_search_fraction: float = 1.0,
         cheap_sims: int = 50,
         gate_threshold: float = 0.0,
+        temp_moves: int = 3,
+        value_blend_lambda: float = 0.5,
+        adjudication_threshold: float = 0.6,
+        adjudication_min_moves: int = 30,
+        max_moves: int = 80,
+        use_gumbel: bool = False,
+        forward_only: bool = False,
+        repetition_penalty: float = 0.0,
+        max_draw_fraction: float = 1.0,
+        eval_simulations: Optional[int] = None,
+        mixed_opponent_depth: int = 0,
+        mixed_fraction: float = 0.0,
     ):
         self.network_type = network_type
         self.hidden = hidden
@@ -652,6 +780,18 @@ class AlphaZeroTrainer:
         self.full_search_fraction = full_search_fraction
         self.cheap_sims = cheap_sims
         self.gate_threshold = gate_threshold
+        self.temp_moves = temp_moves
+        self.value_blend_lambda = value_blend_lambda
+        self.adjudication_threshold = adjudication_threshold
+        self.adjudication_min_moves = adjudication_min_moves
+        self.max_moves = max_moves
+        self.use_gumbel = use_gumbel
+        self.forward_only = forward_only
+        self.repetition_penalty = repetition_penalty
+        self.max_draw_fraction = max_draw_fraction
+        self.eval_simulations = eval_simulations  # None = use self.simulations
+        self.mixed_opponent_depth = mixed_opponent_depth  # 0 = disabled
+        self.mixed_fraction = mixed_fraction  # fraction of games that are network-vs-heuristic
 
         self._current_iteration = 0
         self._total_iterations = 0
@@ -665,6 +805,18 @@ class AlphaZeroTrainer:
         amp_str = "FP16" if self.use_amp else "FP32"
         workers_str = f", workers={self.num_workers}" if self.num_workers > 1 else ""
         print(f"AlphaZero network: {self.network.num_parameters:,} parameters ({self.device}, {amp_str}, mcts_batch={self.mcts_batch_size}{workers_str})")
+
+    def _make_rust_engine(self) -> '_RustMCTSEngine':
+        """Create a Rust MCTSEngine with current training parameters."""
+        return _RustMCTSEngine(
+            self.simulations, self.c_puct,
+            value_blend_lambda=self.value_blend_lambda,
+            adjudication_threshold=self.adjudication_threshold,
+            adjudication_min_moves=self.adjudication_min_moves,
+            use_gumbel=self.use_gumbel,
+            forward_only=self.forward_only,
+            repetition_penalty=self.repetition_penalty,
+        )
 
     def set_lr_schedule(self, total_steps: int):
         """Update LR schedule T_max for known total iteration count."""
@@ -700,8 +852,10 @@ class AlphaZeroTrainer:
             (
                 count, model_state_dict, self.network_type, self.hidden, self.num_blocks,
                 self.simulations, self.c_puct, self.mcts_batch_size, self.temperature,
-                4, 80, 15,  # random_opening, max_moves, temp_moves
+                4, self.max_moves, self.temp_moves,  # random_opening, max_moves, temp_moves
                 self.full_search_fraction, self.cheap_sims,
+                self.value_blend_lambda, self.adjudication_threshold, self.adjudication_min_moves,
+                self.use_gumbel, self.forward_only, self.repetition_penalty,
             )
             for count in game_counts
         ]
@@ -709,16 +863,12 @@ class AlphaZeroTrainer:
         with multiprocessing.Pool(processes=len(game_counts)) as pool:
             results_list = pool.map(_play_network_games_worker, worker_args)
 
-        # Merge results
-        new_examples = []
-        results = {"white": 0, "black": 0, "draw": 0}
-        for planes_np, policies_np, values_np, search_scores_np, worker_results in results_list:
-            for i in range(len(values_np)):
-                new_examples.append((planes_np[i], policies_np[i], float(values_np[i]), float(search_scores_np[i])))
-            for k in results:
-                results[k] += worker_results[k]
+        # Merge per-game results from all workers
+        all_games = []
+        for worker_games in results_list:
+            all_games.extend(worker_games)
 
-        return new_examples, results
+        return all_games
 
     def _play_onnx_games_parallel(self, n_network: int, onnx_path: str):
         """Play network self-play games in parallel using ONNX (pure Rust).
@@ -735,8 +885,10 @@ class AlphaZeroTrainer:
             (
                 count, onnx_path, False,  # use_coreml=False (CPU for workers)
                 self.simulations, self.c_puct, self.mcts_batch_size, self.temperature,
-                4, 80, 15,  # random_opening, max_moves, temp_moves
+                4, self.max_moves, self.temp_moves,  # random_opening, max_moves, temp_moves
                 self.full_search_fraction, self.cheap_sims,
+                self.value_blend_lambda, self.adjudication_threshold, self.adjudication_min_moves,
+                self.use_gumbel, self.forward_only, self.repetition_penalty,
             )
             for count in game_counts
         ]
@@ -744,44 +896,99 @@ class AlphaZeroTrainer:
         with multiprocessing.Pool(processes=len(game_counts)) as pool:
             results_list = pool.map(_play_onnx_games_worker, worker_args)
 
-        # Merge results
-        new_examples = []
-        results = {"white": 0, "black": 0, "draw": 0}
-        for planes_np, policies_np, values_np, search_scores_np, worker_results in results_list:
-            for i in range(len(values_np)):
-                new_examples.append((planes_np[i], policies_np[i], float(values_np[i]), float(search_scores_np[i])))
-            for k in results:
-                results[k] += worker_results[k]
+        # Merge per-game results from all workers
+        all_games = []
+        for worker_games in results_list:
+            all_games.extend(worker_games)
 
-        return new_examples, results
+        return all_games
+
+    def _play_mixed_games_parallel(self, n_games: int, onnx_path: str):
+        """Play network-vs-heuristic training games in parallel using ONNX."""
+        per_worker = n_games // self.num_workers
+        remainder = n_games % self.num_workers
+        game_counts = [per_worker + (1 if i < remainder else 0) for i in range(self.num_workers)]
+        game_counts = [c for c in game_counts if c > 0]
+
+        worker_args = [
+            (
+                count, onnx_path, False,
+                self.simulations, self.c_puct, self.mcts_batch_size, self.temperature,
+                4, self.max_moves, self.temp_moves,
+                self.mixed_opponent_depth,
+                self.value_blend_lambda, self.adjudication_threshold, self.adjudication_min_moves,
+                self.use_gumbel, self.forward_only, self.repetition_penalty,
+            )
+            for count in game_counts
+        ]
+
+        with multiprocessing.Pool(processes=len(game_counts)) as pool:
+            results_list = pool.map(_play_mixed_games_worker, worker_args)
+
+        all_games = []
+        for worker_games in results_list:
+            all_games.extend(worker_games)
+        return all_games
+
+    def _play_mixed_games_sequential(self, n_games: int, onnx_path: str):
+        """Play network-vs-heuristic training games sequentially using ONNX."""
+        from tonnesjakk._core import OnnxSession as _OnnxSession
+
+        onnx_session = _OnnxSession(onnx_path, use_coreml=False)
+        engine = self._make_rust_engine()
+
+        games = []
+        for game_idx in range(n_games):
+            mcts_is_white = (game_idx % 2 == 0)
+            nr = engine.play_mixed_game_onnx(
+                onnx_session,
+                opponent_depth=self.mixed_opponent_depth,
+                batch_size=self.mcts_batch_size,
+                random_opening=4,
+                max_moves=self.max_moves,
+                temp_moves=self.temp_moves,
+                temperature=self.temperature,
+                mcts_is_white=mcts_is_white,
+            )
+            examples = []
+            for ex in nr.examples:
+                examples.append((
+                    np.array(ex.planes, dtype=np.float32).reshape(BOARD_PLANES, BOARD_SIZE, BOARD_SIZE),
+                    np.array(ex.policy_target, dtype=np.float32),
+                    ex.value_target,
+                    ex.search_score,
+                ))
+            games.append((nr.winner, examples))
+
+        return games
 
     def _play_onnx_games_sequential(self, n_network: int, onnx_path: str):
         """Play network self-play games sequentially using ONNX (pure Rust)."""
         from tonnesjakk._core import OnnxSession as _OnnxSession
 
         onnx_session = _OnnxSession(onnx_path, use_coreml=False)
-        engine = _RustMCTSEngine(self.simulations, self.c_puct)
+        engine = self._make_rust_engine()
 
-        new_examples = []
-        results = {"white": 0, "black": 0, "draw": 0}
+        games = []
         for _ in range(n_network):
             nr = engine.play_network_game_onnx(
                 onnx_session, batch_size=self.mcts_batch_size,
-                random_opening=4, max_moves=80,
-                temp_moves=15, temperature=self.temperature,
+                random_opening=4, max_moves=self.max_moves,
+                temp_moves=self.temp_moves, temperature=self.temperature,
                 full_search_fraction=self.full_search_fraction,
                 cheap_sims=self.cheap_sims,
             )
+            examples = []
             for ex in nr.examples:
-                new_examples.append((
+                examples.append((
                     np.array(ex.planes, dtype=np.float32).reshape(BOARD_PLANES, BOARD_SIZE, BOARD_SIZE),
                     np.array(ex.policy_target, dtype=np.float32),
                     ex.value_target,
                     ex.search_score,
                 ))
-            results[nr.winner] += 1
+            games.append((nr.winner, examples))
 
-        return new_examples, results
+        return games
 
     def generate_bootstrap_games(self, num_games: int, depth: int = 7,
                                   random_opening: int = 4, max_moves: int = 80):
@@ -796,6 +1003,7 @@ class AlphaZeroTrainer:
         batch_size = workers * 50  # ~50 games per worker per batch
         games_done = 0
         total_examples = 0
+        draws_dropped = 0
         game_results = {"white": 0, "black": 0, "draw": 0}
 
         t0 = time.time()
@@ -809,7 +1017,8 @@ class AlphaZeroTrainer:
             game_counts = [c for c in game_counts if c > 0]
 
             worker_args = [
-                (count, depth, random_opening, max_moves, self.simulations, self.c_puct)
+                (count, depth, random_opening, max_moves, self.simulations, self.c_puct,
+                 self.value_blend_lambda, self.adjudication_threshold, self.adjudication_min_moves)
                 for count in game_counts
             ]
 
@@ -819,13 +1028,19 @@ class AlphaZeroTrainer:
                 with multiprocessing.Pool(processes=len(game_counts)) as pool:
                     results_list = pool.map(_play_alphabeta_games_worker, worker_args)
 
-            # Merge into replay buffer
-            for planes_np, policies_np, values_np, search_scores_np, worker_results in results_list:
-                for i in range(len(values_np)):
-                    self.replay_buffer.append((planes_np[i], policies_np[i], float(values_np[i]), float(search_scores_np[i])))
-                    total_examples += 1
-                for k in game_results:
-                    game_results[k] += worker_results[k]
+            # Merge per-game results from all workers
+            batch_games = []
+            for worker_games in results_list:
+                batch_games.extend(worker_games)
+
+            # Filter draws
+            examples, batch_results, dropped = _filter_draws(
+                batch_games, self.max_draw_fraction)
+            self.replay_buffer.extend(examples)
+            total_examples += len(examples)
+            draws_dropped += dropped
+            for k in game_results:
+                game_results[k] += batch_results[k]
 
             games_done += batch
             elapsed = time.time() - t0
@@ -841,8 +1056,9 @@ class AlphaZeroTrainer:
             self.replay_buffer = self.replay_buffer[-effective_max:]
 
         elapsed = time.time() - t0
+        drop_str = f" (dropped {draws_dropped} draw games)" if draws_dropped > 0 else ""
         print(f"Bootstrap complete: {num_games} games in {elapsed/60:.1f}m | "
-              f"buffer: {len(self.replay_buffer):,} examples")
+              f"buffer: {len(self.replay_buffer):,} examples{drop_str}")
 
     def run(
         self,
@@ -872,7 +1088,8 @@ class AlphaZeroTrainer:
         save_path = Path(save_dir)
         save_path.mkdir(parents=True, exist_ok=True)
 
-        best_elo = -400.0
+        if not hasattr(self, '_best_elo'):
+            self._best_elo = -400.0
         total_games = 0
 
         for iteration in range(1, iterations + 1):
@@ -886,42 +1103,52 @@ class AlphaZeroTrainer:
             onnx_path = str(save_path / "_current.onnx")
             self.export_onnx(onnx_path)
 
-            new_examples = []
-            results = {"white": 0, "black": 0, "draw": 0}
+            all_games: List[GameResult] = []
             n_heuristic = int(self.games_per_iter * heuristic_ratio)
-            n_network = self.games_per_iter - n_heuristic
+            n_remaining = self.games_per_iter - n_heuristic
+            # Split remaining games between self-play and mixed (network vs heuristic)
+            n_mixed = int(n_remaining * self.mixed_fraction) if self.mixed_opponent_depth > 0 else 0
+            n_network = n_remaining - n_mixed
 
             # Alpha-beta self-play games (fully in Rust, strong + balanced)
             if n_heuristic > 0:
-                rust_engine = _RustMCTSEngine(self.simulations, self.c_puct)
+                rust_engine = self._make_rust_engine()
                 ab_results = rust_engine.play_alphabeta_games(
-                    n_heuristic, depth=7, random_opening=4, max_moves=80,
+                    n_heuristic, depth=7, random_opening=4, max_moves=self.max_moves,
                 )
                 for ar in ab_results:
+                    examples = []
                     for ex in ar.examples:
-                        new_examples.append((
+                        examples.append((
                             np.array(ex.planes, dtype=np.float32).reshape(BOARD_PLANES, BOARD_SIZE, BOARD_SIZE),
                             np.array(ex.policy_target, dtype=np.float32),
                             ex.value_target,
                             ex.search_score,
                         ))
-                    results[ar.winner] += 1
-                    total_games += 1
+                    all_games.append((ar.winner, examples))
 
-            heuristic_time = time.time() - iter_start
+            # Network-vs-heuristic training games (network learns from playing a stronger opponent)
+            if n_mixed > 0:
+                if self.num_workers > 1:
+                    mixed_games = self._play_mixed_games_parallel(n_mixed, onnx_path)
+                else:
+                    mixed_games = self._play_mixed_games_sequential(n_mixed, onnx_path)
+                all_games.extend(mixed_games)
 
             # Network self-play games via ONNX (pure Rust, no Python/GIL)
             if n_network > 0:
                 if self.num_workers > 1:
-                    par_examples, par_results = self._play_onnx_games_parallel(n_network, onnx_path)
+                    net_games = self._play_onnx_games_parallel(n_network, onnx_path)
                 else:
-                    par_examples, par_results = self._play_onnx_games_sequential(n_network, onnx_path)
-                new_examples.extend(par_examples)
-                for k in results:
-                    results[k] += par_results[k]
-                total_games += n_network
+                    net_games = self._play_onnx_games_sequential(n_network, onnx_path)
+                all_games.extend(net_games)
 
             selfplay_time = time.time() - iter_start
+
+            # Filter draws and flatten to examples
+            total_games += len(all_games)
+            new_examples, results, draws_dropped = _filter_draws(
+                all_games, self.max_draw_fraction)
 
             # Add to replay buffer (growing buffer: starts small, grows to buffer_max)
             self.replay_buffer.extend(new_examples)
@@ -938,12 +1165,19 @@ class AlphaZeroTrainer:
 
             current_lr = self.optimizer.param_groups[0]["lr"]
             if verbose:
-                h_str = f" ({n_heuristic}h+{n_network}n)" if n_heuristic > 0 else ""
+                parts = []
+                if n_heuristic > 0:
+                    parts.append(f"{n_heuristic}h")
+                if n_mixed > 0:
+                    parts.append(f"{n_mixed}mx")
+                parts.append(f"{n_network}n")
+                h_str = f" ({'+'.join(parts)})" if (n_heuristic > 0 or n_mixed > 0) else ""
                 pw_str = f" pw={self.policy_weight:.1f}" if self.policy_weight != 1.0 else ""
+                drop_str = f" -{draws_dropped}D" if draws_dropped > 0 else ""
                 print(
                     f"Iter {iteration:3d}/{iterations} | "
                     f"games: {self.games_per_iter}{h_str} "
-                    f"(W:{results['white']} B:{results['black']} D:{results['draw']}) | "
+                    f"(W:{results['white']} B:{results['black']} D:{results['draw']}{drop_str}) | "
                     f"buf: {len(self.replay_buffer):,} (train {min(len(self.replay_buffer), self.train_window):,}) | "
                     f"loss: p={policy_loss:.4f} v={value_loss:.4f}{pw_str} | "
                     f"lr={current_lr:.6f} | "
@@ -970,6 +1204,7 @@ class AlphaZeroTrainer:
                     search_score_mean=ss_mean, search_score_std=ss_std,
                     search_score_mae=ss_mae,
                     n_heuristic=n_heuristic, n_network=n_network,
+                    draws_dropped=draws_dropped,
                 )
 
             # --- Evaluation ---
@@ -978,8 +1213,9 @@ class AlphaZeroTrainer:
                     eval_games, eval_depth, onnx_path=onnx_path,
                 )
                 if verbose:
+                    eval_sims = self.eval_simulations or self.simulations
                     print(
-                        f"  >> Eval vs heuristic (depth {eval_depth}): "
+                        f"  >> Eval vs heuristic (depth {eval_depth}, {eval_sims} sims): "
                         f"{w}W-{d}D-{l}L | "
                         f"ELO: {elo:+.0f} [{elo_lo:+.0f}, {elo_hi:+.0f}]",
                         flush=True,
@@ -989,8 +1225,8 @@ class AlphaZeroTrainer:
                         iteration, wins=w, draws=d, losses=l,
                         elo=elo, elo_lo=elo_lo, elo_hi=elo_hi, depth=eval_depth,
                     )
-                if elo > best_elo:
-                    best_elo = elo
+                if elo > self._best_elo:
+                    self._best_elo = elo
                     self._save(save_path / "best_model.pt")
                     if verbose:
                         print(f"  >> New best ELO: {elo:+.0f}, saved.", flush=True)
@@ -1015,7 +1251,7 @@ class AlphaZeroTrainer:
         self._save(save_path / "final_model.pt")
         if verbose:
             print(f"\nTraining complete. {total_games} total self-play games.")
-            print(f"Best ELO vs heuristic: {best_elo:+.0f}")
+            print(f"Best ELO vs heuristic: {self._best_elo:+.0f}")
             print(f"Models saved to {save_path}/")
 
     def _train_epoch(self) -> Tuple[float, float]:
@@ -1123,7 +1359,18 @@ class AlphaZeroTrainer:
         If onnx_path is provided, uses ONNX inference (pure Rust, no Python).
         Returns (elo, elo_lo, elo_hi, wins, draws, losses).
         """
-        rust_engine = _RustMCTSEngine(self.simulations, self.c_puct)
+        # Eval can use a different sim budget than training
+        eval_sims = self.eval_simulations or self.simulations
+        # Eval always uses full move set (forward_only=False)
+        rust_engine = _RustMCTSEngine(
+            eval_sims, self.c_puct,
+            value_blend_lambda=self.value_blend_lambda,
+            adjudication_threshold=self.adjudication_threshold,
+            adjudication_min_moves=self.adjudication_min_moves,
+            use_gumbel=self.use_gumbel,
+            forward_only=False,
+            repetition_penalty=self.repetition_penalty,
+        )
         if onnx_path:
             from tonnesjakk._core import OnnxSession as _OnnxSession
             onnx_session = _OnnxSession(onnx_path, use_coreml=False)
@@ -1139,7 +1386,7 @@ class AlphaZeroTrainer:
             self.network.eval()
             mcts = NetworkMCTS(
                 self.network,
-                simulations=self.simulations,
+                simulations=eval_sims,
                 c_puct=self.c_puct,
                 batch_size=self.mcts_batch_size,
                 device=self.device,
@@ -1191,40 +1438,38 @@ class AlphaZeroTrainer:
           - output 0: policy logits [batch, 1332]
           - output 1: value [batch]
         """
-        import logging
-        import warnings
+        import io
         import os
+        import sys
+        import warnings
+        import logging
         self.network.eval()
         dummy = torch.randn(1, BOARD_PLANES, BOARD_SIZE, BOARD_SIZE, device=self.device)
-        # Suppress verbose ONNX export warnings and torch.onnx logs
-        prev_levels = {}
-        for name in ["", "torch.onnx", "torch.onnx._internal"]:
-            logger = logging.getLogger(name)
-            prev_levels[name] = logger.level
-            logger.setLevel(logging.CRITICAL)
-        old_env = os.environ.get("ONNX_LOG_LEVEL")
-        os.environ["ONNX_LOG_LEVEL"] = "ERROR"
+        # Suppress all ONNX export output (stdout, stderr, warnings, logging)
+        old_stdout, old_stderr = sys.stdout, sys.stderr
+        sys.stdout = io.StringIO()
+        sys.stderr = io.StringIO()
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            torch.onnx.export(
-                self.network,
-                dummy,
-                path,
-                input_names=["planes"],
-                output_names=["policy", "value"],
-                dynamic_axes={
-                    "planes": {0: "batch"},
-                    "policy": {0: "batch"},
-                    "value": {0: "batch"},
-                },
-                opset_version=18,
-            )
-        for name, level in prev_levels.items():
-            logging.getLogger(name).setLevel(level)
-        if old_env is None:
-            os.environ.pop("ONNX_LOG_LEVEL", None)
-        else:
-            os.environ["ONNX_LOG_LEVEL"] = old_env
+            logging.disable(logging.CRITICAL)
+            try:
+                torch.onnx.export(
+                    self.network,
+                    dummy,
+                    path,
+                    input_names=["planes"],
+                    output_names=["policy", "value"],
+                    dynamic_axes={
+                        "planes": {0: "batch"},
+                        "policy": {0: "batch"},
+                        "value": {0: "batch"},
+                    },
+                    opset_version=18,
+                )
+            finally:
+                sys.stdout = old_stdout
+                sys.stderr = old_stderr
+                logging.disable(logging.NOTSET)
 
     def load(self, path: str, load_buffer: bool = True):
         """Load model checkpoint + optionally replay buffer."""

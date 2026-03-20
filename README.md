@@ -344,6 +344,33 @@ tonnesjakk/
 └── pyproject.toml                # Python/maturin build config
 ```
 
+## Heuristic Tuning: What Worked and What Didn't
+
+The heuristic evaluation weights are tuned via round-robin tournaments (`scripts/tune_heuristic.py`), where candidate configurations play hundreds of games against each other at depth 7 with randomized openings.
+
+**Current best configuration** (the "consolidator" profile):
+
+| Weight | Value | Description |
+|--------|-------|-------------|
+| progress | 80 | Per-row advancement bonus |
+| center_pail | 15 | Pail centrality bonus |
+| blocking | 20 | Pail blocking enemy barrels |
+| scored | 700 | Per barrel scored |
+| threat | 150 | Barrels at dist==1 from goal |
+| threat2 | 100 | Barrels at dist==2 from goal |
+| mobility | 12 | Forward empty squares per barrel |
+| passed | 80 | Barrels with clear column path to goal |
+| jump | 60 | Forward jumps available per barrel |
+
+**Ideas that were tested and rejected:**
+
+| Feature | What it does | Result | Why it failed |
+|---------|-------------|--------|---------------|
+| **Scoring threat extension** (`ext_threat`) | +1 ply search extension when a barrel reaches dist==1 from goal (analogous to check extension in chess) | 50.6% over 500 games vs baseline — no measurable benefit | The engine already handles threats well at depth 7. The existing threat/threat2 eval terms and good move ordering (goal-reaching moves scored high) make the extra search depth redundant. |
+| **Jump-to-score eval** (`weight_jump_score`) | Bonus per barrel that can chain-jump to the goal row in one turn, using DFS over the jump tables | Harmful at all values tested: 50% at weight=100, down to 35% at weight=120 | The DFS doesn't account for the barrel vacating its start square during the chain (reports false positives). The existing `jump` weight (single forward jump) already captures most tactical value with less noise. |
+
+These features are not included in the engine. The code was implemented, A/B tested across 1500+ games, and removed.
+
 ## Technologies
 
 - **Rust** — Engine core (speed + safety)
