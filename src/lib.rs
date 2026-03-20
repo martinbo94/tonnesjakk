@@ -17,7 +17,7 @@ pub use search::{BitBoardEngine, Engine, SearchResult, TT_SIZE};
 ///
 /// Accepts either a list of 164 floats or raw bytes (656 bytes = 164 × f32).
 ///
-/// Returns: (white_indices: list[int], black_indices: list[int], dense_6: list[float])
+/// Returns: (white_indices: list[int], black_indices: list[int], dense_20: list[float])
 #[pyfunction]
 fn decode_halfpail(data: &Bound<'_, pyo3::types::PyAny>) -> PyResult<(Vec<u16>, Vec<u16>, Vec<f32>)> {
     let row: Vec<f32> = if let Ok(bytes) = data.extract::<Vec<u8>>() {
@@ -58,12 +58,6 @@ fn decode_halfpail(data: &Bound<'_, pyo3::types::PyAny>) -> PyResult<(Vec<u16>, 
         if row[base + 3] > 0.5 { black_pail = Some(sq); }
     }
 
-    // Extract scored counts and current player from relational features
-    let rel = &row[144..];
-    let white_scored = (rel[8] * 4.0).round() as i32;
-    let black_scored = (rel[9] * 4.0).round() as i32;
-    let current_player: f32 = if rel[12] > 0.0 { 1.0 } else { -1.0 };
-
     // White perspective: bucket = white pail position
     let w_bucket = white_pail.unwrap_or(NUM_SQUARES);
     let mut white_indices: Vec<u16> = Vec::with_capacity(10);
@@ -90,17 +84,9 @@ fn decode_halfpail(data: &Bound<'_, pyo3::types::PyAny>) -> PyResult<(Vec<u16>, 
         black_indices.push(halfpail_feature_index(b_bucket, wp, 2));
     }
 
-    // Dense features (6 values)
-    let wb_on_board = white_barrels.len() as f32;
-    let bb_on_board = black_barrels.len() as f32;
-    let dense = vec![
-        white_scored as f32 / 4.0,
-        black_scored as f32 / 4.0,
-        (white_scored - black_scored) as f32 / 4.0,
-        current_player,
-        wb_on_board / 4.0,
-        bb_on_board / 4.0,
-    ];
+    // Dense features: all 20 relational features from the 164-dim row (features 144-163)
+    let rel = &row[144..];
+    let dense: Vec<f32> = rel[..HALFPAIL_DENSE].to_vec();
 
     Ok((white_indices, black_indices, dense))
 }

@@ -129,6 +129,7 @@ def decode_board_from_dense164(row: np.ndarray) -> dict:
         'current_player': current_player,
         'white_barrels_on_board': len(white_barrels),
         'black_barrels_on_board': len(black_barrels),
+        'rel': rel,  # all 20 relational features for HalfPail dense input
     }
 
 
@@ -156,7 +157,7 @@ def board_to_halfpail_indices(board_dict: dict) -> tuple:
         Type 1: opponent's barrels ("enemy")
         Type 2: opponent's pail ("enemy pail")
 
-    Also computes the 6 dense features.
+    Also returns the 20 dense relational features.
 
     Returns:
         (white_indices, black_indices, dense_6)
@@ -190,15 +191,22 @@ def board_to_halfpail_indices(board_dict: dict) -> tuple:
     if wp is not None:
         black_indices.append(halfpail_feature_index(b_bucket, wp, 2))  # enemy pail
 
-    # Dense features (6 values)
-    dense = [
-        ws / 4.0,                              # white_scored / 4
-        bs / 4.0,                              # black_scored / 4
-        (ws - bs) / 4.0,                       # score_differential / 4
-        board_dict['current_player'],           # +1 or -1
-        board_dict['white_barrels_on_board'] / 4.0,  # white barrels on board / 4
-        board_dict['black_barrels_on_board'] / 4.0,  # black barrels on board / 4
-    ]
+    # Dense features: all 20 relational features from the 164-dim row
+    if 'rel' in board_dict:
+        dense = board_dict['rel'].tolist() if hasattr(board_dict['rel'], 'tolist') else list(board_dict['rel'])
+    else:
+        # Fallback: compute the 6 basic features, pad to 20
+        dense = [0.0] * HALFPAIL_DENSE
+        dense[0] = 1.0 - min(wb[0], 5) / 5.0 if wb else 0.0  # approximate barrel distances
+        dense[4] = 1.0 - min(bb[0], 5) / 5.0 if bb else 0.0
+        dense[8] = ws / 4.0
+        dense[9] = bs / 4.0
+        dense[10] = 1.0 if wp is not None else 0.0
+        dense[11] = 1.0 if bp is not None else 0.0
+        dense[12] = board_dict['current_player']
+        dense[15] = (ws - bs) / 4.0
+        dense[16] = board_dict['white_barrels_on_board'] / 4.0
+        dense[17] = board_dict['black_barrels_on_board'] / 4.0
 
     return white_indices, black_indices, dense
 
