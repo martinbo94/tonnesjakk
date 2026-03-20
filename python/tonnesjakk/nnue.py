@@ -420,7 +420,7 @@ class HalfPailDataset(torch.utils.data.Dataset):
             self._x_path = X.filename
             self._x_shape = (len(X), X.shape[1]) if X.ndim == 2 else (len(X),)
             self._y_path = y.filename
-            self._y_shape = (len(y),)
+            self._y_shape = y.shape
             self._is_memmap = True
             self.X = None
             self.y = None
@@ -552,7 +552,7 @@ def _rust_batch_decode_chunk(X_chunk, y_chunk):
 
 def train_halfpail_model(
     X,  # np.ndarray or np.memmap, shape (N, 164)
-    y,  # np.ndarray or np.memmap, shape (N,) or (N, 1)
+    y,  # np.ndarray or np.memmap, shape (N,), (N, 1), or (N, 2) [search_score, outcome]
     hidden1: int = 128,
     hidden2: int = 32,
     epochs: int = 200,
@@ -563,11 +563,16 @@ def train_halfpail_model(
     loss_fn: str = "wdl-ce",
     num_workers: int = 0,
     resume_from: Optional[str] = None,
+    lambda_blend: Optional[float] = None,
 ) -> tuple:
     """Train a HalfPail NNUE model.
 
     Uses Rust batch decoding for fast on-the-fly feature computation.
     Falls back to Python DataLoader if Rust batch decoder is unavailable.
+
+    If y has 2 columns [search_score, outcome], lambda_blend controls the mix:
+      label = lambda * search_score + (1 - lambda) * outcome
+    Default lambda_blend=1.0 uses pure search scores (backward compatible).
 
     Returns:
         (model, history)
@@ -575,7 +580,15 @@ def train_halfpail_model(
     n = len(X)
     split = int((1 - validation_split) * n)
     train_n = split
-    y_flat = y.ravel() if y.ndim > 1 else y
+
+    # Handle 2-column labels: blend search_score and outcome at training time
+    if y.ndim == 2 and y.shape[1] == 2:
+        lb = lambda_blend if lambda_blend is not None else 1.0
+        y_flat = (lb * y[:, 0] + (1 - lb) * y[:, 1]).astype(np.float32)
+        if verbose:
+            print(f"  Label blend: {lb:.2f} * search_score + {1-lb:.2f} * outcome")
+    else:
+        y_flat = y.ravel() if y.ndim > 1 else y
 
     use_rust_batch = _rust_decode_batch is not None
 
@@ -1385,6 +1398,8 @@ class DataGenerator:
                     meta = {
                         "total_positions": stats.total_positions,
                         "input_size": INPUT_SIZE,
+                        "label_columns": 2,
+                        "label_format": ["search_score", "outcome"],
                         "white_wins": stats.white_wins,
                         "black_wins": stats.black_wins,
                         "draws": stats.draws,
@@ -1411,6 +1426,8 @@ class DataGenerator:
             meta = {
                 "total_positions": stats.total_positions,
                 "input_size": INPUT_SIZE,
+                "label_columns": 2,
+                "label_format": ["search_score", "outcome"],
                 "white_wins": stats.white_wins,
                 "black_wins": stats.black_wins,
                 "draws": stats.draws,
@@ -1475,7 +1492,11 @@ class DataGenerator:
         input_size = meta.get('input_size', INPUT_SIZE)
 
         X = np.memmap(bin_path, dtype=np.float32, mode='r', shape=(n, input_size))
-        y = np.memmap(y_path, dtype=np.float32, mode='r', shape=(n,))
+        label_columns = meta.get('label_columns', 1)
+        if label_columns == 2:
+            y = np.memmap(y_path, dtype=np.float32, mode='r', shape=(n, 2))
+        else:
+            y = np.memmap(y_path, dtype=np.float32, mode='r', shape=(n,))
 
         stats = TrainingStats()
         stats.white_wins = meta.get('white_wins', 0)
@@ -1503,7 +1524,7 @@ def _generate_games_worker(args):
     gen = DataGenerator(nnue_path=nnue_path)
 
     all_X = []
-    all_y = []
+    all_y = []  # Each entry is [search_score, outcome] — 2 floats per position
     white_wins = black_wins = draws = 0
 
     for _ in range(num_games):
@@ -1517,14 +1538,6 @@ def _generate_games_worker(args):
             draws += 1
 
         for pos_data in result.positions:
-            # Lambda blend: mix search scores with game outcomes
-            if lambda_blend is not None:
-                label = lambda_blend * pos_data.search_score + (1 - lambda_blend) * result.outcome
-            elif use_search_scores:
-                label = pos_data.search_score
-            else:
-                label = result.outcome
-
             tensor = board_to_tensor(
                 pos_data.board,
                 white_scored=pos_data.white_scored,
@@ -1532,7 +1545,7 @@ def _generate_games_worker(args):
                 current_player=pos_data.current_player
             )
             all_X.append(tensor)
-            all_y.append(label)
+            all_y.append([pos_data.search_score, result.outcome])
 
             if augment:
                 flipped_board = flip_board_horizontal(pos_data.board)
@@ -1543,14 +1556,14 @@ def _generate_games_worker(args):
                     current_player=pos_data.current_player
                 )
                 all_X.append(flipped_tensor)
-                all_y.append(label)
+                all_y.append([pos_data.search_score, result.outcome])
 
     if all_X:
         X_np = torch.stack(all_X).numpy()
-        y_np = np.array(all_y, dtype=np.float32)
+        y_np = np.array(all_y, dtype=np.float32)  # shape (N, 2)
     else:
         X_np = np.zeros((0, INPUT_SIZE), dtype=np.float32)
-        y_np = np.zeros(0, dtype=np.float32)
+        y_np = np.zeros((0, 2), dtype=np.float32)
 
     return X_np, y_np, white_wins, black_wins, draws
 
@@ -1722,6 +1735,7 @@ def train_nnue(
         loss_fn=loss_fn,
         num_workers=num_workers,
         resume_from=resume_from,
+        lambda_blend=lambda_blend,
     )
 
     # Step 3: Export
