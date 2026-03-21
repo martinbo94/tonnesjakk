@@ -591,6 +591,7 @@ def train_halfpail_model(
         y_flat = y.ravel() if y.ndim > 1 else y
 
     use_rust_batch = _rust_decode_batch is not None
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     model = HalfPailNNUE(hidden1, hidden2)
     if resume_from:
@@ -598,6 +599,7 @@ def train_halfpail_model(
         model.load_state_dict(state)
         if verbose:
             print(f"  Resumed from: {resume_from}")
+    model = model.to(device)
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
 
     # Cosine annealing: LR decays from initial to ~0 over all epochs
@@ -619,6 +621,7 @@ def train_halfpail_model(
         mode = "Rust batch decode (contiguous reads)" if use_rust_batch else "Python DataLoader"
         print(f"  Mode: HalfPail dual-perspective sparse features")
         print(f"  Decoder: {mode}")
+        print(f"  Device: {device}")
         print(f"  Loss: {loss_fn}")
         print(f"  LR: {learning_rate} (cosine annealing -> {learning_rate * 0.01:.6f})")
         print(f"  Architecture: EmbeddingBag({HALFPAIL_FEATURES}, {hidden1}) shared")
@@ -648,6 +651,9 @@ def train_halfpail_model(
                 w_idx, w_off, b_idx, b_off, dense, labels = _rust_batch_decode_chunk(
                     X[start:end], y_flat[start:end]
                 )
+                w_idx, w_off = w_idx.to(device), w_off.to(device)
+                b_idx, b_off = b_idx.to(device), b_off.to(device)
+                dense, labels = dense.to(device), labels.to(device)
 
                 optimizer.zero_grad()
                 pred = model(w_idx, w_off, b_idx, b_off, dense)
@@ -670,6 +676,9 @@ def train_halfpail_model(
                     w_idx, w_off, b_idx, b_off, dense, labels = _rust_batch_decode_chunk(
                         X[vs:ve], y_flat[vs:ve]
                     )
+                    w_idx, w_off = w_idx.to(device), w_off.to(device)
+                    b_idx, b_off = b_idx.to(device), b_off.to(device)
+                    dense, labels = dense.to(device), labels.to(device)
                     pred = model(w_idx, w_off, b_idx, b_off, dense)
                     val_loss_total += criterion(pred, labels).item() * (ve - vs)
                     val_batches += (ve - vs)
@@ -728,6 +737,9 @@ def train_halfpail_model(
             num_batches = 0
 
             for w_idx, w_off, b_idx, b_off, dense, labels in train_loader:
+                w_idx, w_off = w_idx.to(device), w_off.to(device)
+                b_idx, b_off = b_idx.to(device), b_off.to(device)
+                dense, labels = dense.to(device), labels.to(device)
                 optimizer.zero_grad()
                 pred = model(w_idx, w_off, b_idx, b_off, dense)
                 loss = criterion(pred, labels)
@@ -743,6 +755,9 @@ def train_halfpail_model(
             val_batches = 0
             with torch.no_grad():
                 for w_idx, w_off, b_idx, b_off, dense, labels in val_loader:
+                    w_idx, w_off = w_idx.to(device), w_off.to(device)
+                    b_idx, b_off = b_idx.to(device), b_off.to(device)
+                    dense, labels = dense.to(device), labels.to(device)
                     pred = model(w_idx, w_off, b_idx, b_off, dense)
                     val_loss_total += criterion(pred, labels).item()
                     val_batches += 1
