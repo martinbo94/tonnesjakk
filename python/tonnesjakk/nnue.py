@@ -629,32 +629,69 @@ def train_halfpail_model(
         print(f"  Parameters: {model.num_parameters:,}")
 
     if use_rust_batch:
-        # Fast path: contiguous chunk reads + Rust batch decode (no DataLoader needed)
+        # Pre-decode all positions once, then train purely on GPU
         n_chunks = (train_n + batch_size - 1) // batch_size
         chunk_order = np.arange(n_chunks)
-
         val_n = n - split
         val_n_chunks = (val_n + batch_size - 1) // batch_size
+
+        # Pre-decode phase: decode all batches and move to GPU
+        decode_chunk_size = 65536  # decode in large chunks for efficiency
+        if verbose:
+            print(f"  Pre-decoding {n:,} positions to GPU...", flush=True)
+
+        def _predecode_to_gpu(X_data, y_data, start_idx, count, bs, dev):
+            """Pre-decode positions and return list of GPU-resident batch tuples."""
+            batches = []
+            n_decode_chunks = (count + decode_chunk_size - 1) // decode_chunk_size
+            for di in range(n_decode_chunks):
+                ds = start_idx + di * decode_chunk_size
+                de = min(ds + decode_chunk_size, start_idx + count)
+                # Rust decode
+                w_idx, w_off, b_idx, b_off, dense, labels = _rust_batch_decode_chunk(
+                    X_data[ds:de], y_data[ds:de]
+                )
+                # Split into training batch sizes and move to GPU
+                chunk_n = de - ds
+                for bi in range(0, chunk_n, bs):
+                    be = min(bi + bs, chunk_n)
+                    # Compute index ranges for sparse indices
+                    off_start = int(w_off[bi])
+                    off_end = int(w_off[be]) if be < chunk_n else len(w_idx)
+                    b_off_start = int(b_off[bi])
+                    b_off_end = int(b_off[be]) if be < chunk_n else len(b_idx)
+                    batches.append((
+                        w_idx[off_start:off_end].to(dev),
+                        (w_off[bi:be] - w_off[bi]).to(dev),
+                        b_idx[b_off_start:b_off_end].to(dev),
+                        (b_off[bi:be] - b_off[bi]).to(dev),
+                        dense[bi:be].to(dev),
+                        labels[bi:be].to(dev),
+                    ))
+                if verbose:
+                    done = min((di + 1) * decode_chunk_size, count)
+                    print(f"    {done:,}/{count:,} decoded", flush=True)
+            return batches
+
+        t0 = time.time()
+        train_batches = _predecode_to_gpu(X, y_flat, 0, train_n, batch_size, device)
+        val_batches_list = _predecode_to_gpu(X, y_flat, split, val_n, batch_size, device)
+        decode_time = time.time() - t0
+        if verbose:
+            print(f"  Pre-decode complete: {len(train_batches)} train + {len(val_batches_list)} val batches "
+                  f"in {decode_time:.1f}s", flush=True)
 
         train_start = time.time()
         for epoch in range(epochs):
             epoch_start = time.time()
             model.train()
-            np.random.shuffle(chunk_order)  # shuffle chunk ORDER, not indices
+            # Shuffle batch order (data is already on GPU)
+            perm = np.random.permutation(len(train_batches))
             total_loss = 0.0
             num_batches = 0
 
-            for ci in chunk_order:
-                start = ci * batch_size
-                end = min(start + batch_size, train_n)
-                # Contiguous read from memmap + Rust batch decode
-                w_idx, w_off, b_idx, b_off, dense, labels = _rust_batch_decode_chunk(
-                    X[start:end], y_flat[start:end]
-                )
-                w_idx, w_off = w_idx.to(device), w_off.to(device)
-                b_idx, b_off = b_idx.to(device), b_off.to(device)
-                dense, labels = dense.to(device), labels.to(device)
-
+            for bi in perm:
+                w_idx, w_off, b_idx, b_off, dense, labels = train_batches[bi]
                 optimizer.zero_grad()
                 pred = model(w_idx, w_off, b_idx, b_off, dense)
                 loss = criterion(pred, labels)
@@ -665,24 +702,17 @@ def train_halfpail_model(
 
             train_loss = total_loss / max(num_batches, 1)
 
-            # Validation (chunked to avoid OOM)
+            # Validation
             model.eval()
             val_loss_total = 0.0
-            val_batches = 0
+            val_count = 0
             with torch.no_grad():
-                for vi in range(val_n_chunks):
-                    vs = split + vi * batch_size
-                    ve = min(vs + batch_size, n)
-                    w_idx, w_off, b_idx, b_off, dense, labels = _rust_batch_decode_chunk(
-                        X[vs:ve], y_flat[vs:ve]
-                    )
-                    w_idx, w_off = w_idx.to(device), w_off.to(device)
-                    b_idx, b_off = b_idx.to(device), b_off.to(device)
-                    dense, labels = dense.to(device), labels.to(device)
+                for w_idx, w_off, b_idx, b_off, dense, labels in val_batches_list:
                     pred = model(w_idx, w_off, b_idx, b_off, dense)
-                    val_loss_total += criterion(pred, labels).item() * (ve - vs)
-                    val_batches += (ve - vs)
-            val_loss = val_loss_total / max(val_batches, 1)
+                    batch_n = labels.shape[0]
+                    val_loss_total += criterion(pred, labels).item() * batch_n
+                    val_count += batch_n
+            val_loss = val_loss_total / max(val_count, 1)
 
             history['train_loss'].append(train_loss)
             history['val_loss'].append(val_loss)
