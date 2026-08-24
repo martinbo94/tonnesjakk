@@ -10,7 +10,8 @@ Tonnesjakk is played on a 6x6 board. Two players (white and black) each have **4
 - Barrels start off the board and are placed from your own back row
 - Barrels move one square in any direction (orthogonal or diagonal — 8 directions total)
 - Barrels can **jump over** adjacent pieces, landing on the empty square behind them (like checkers)
-- Each player gets one **pail** per game — a piece that can be placed anywhere on the board as a permanent blocker
+- Each player gets one **pail** per game — a piece that can be placed on any empty square as a permanent blocker. Placing it is an optional sub-move on any of your turns, made *before* your barrel move
+- **Draw rules**: threefold repetition of a position is a draw, as is 60 consecutive plies without progress (no barrel placement, pail placement, or scoring)
 
 The game is deceptively tactical: barrel chains create jump sequences, the pail can block key lanes, and the 6x6 board means every move matters.
 
