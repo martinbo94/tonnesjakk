@@ -231,14 +231,17 @@ choice), killer+butterfly+1-ply continuation history, LMR (ln·ln + history
 modulation), correction history (2024-era!), win-distance scoring + TT
 mate-score conversion (added today).
 
-Missing / added behind flags (SPRT-gating in progress):
-- `rfp_margin` — reverse futility (beta-side static cutoff); we only had the
-  alpha side. Standard everywhere.
-- `lmp_base` — late move pruning (movecount): skip late-ordered quiets at
-  depth ≤6 after base+depth² moves. Biggest standard feature we lacked.
-- `keep_killers` — killers persisted across ID iterations (we wiped them).
-- `asp_mode=1` — aspiration: start ±30, widen only the failed side
-  geometrically (was: fixed ±50, full-window re-search).
+Missing / added behind flags — SPRT gate results (2026-08-24):
+- `asp_mode=1` (one-sided geometric aspiration widening): **PASSED both
+  gates — +42 [+20,+64] @ 50ms, +31 [+13,+50] @ 200ms → DEFAULT.**
+- `lmp_base=6` (late move pruning): PASSED @ 50ms (+27 [+10,+45]);
+  200ms gate inconclusive at budget (+16 [−1,+33]) → extended retry
+  running. Pruning patches require the slow-TC pass.
+- `rfp_margin=120` (reverse futility): inconclusive (+2, 1000 games @
+  50ms). Retry other margins later (≤4 attempts, then archive).
+- `keep_killers=1`: null (+1 in 2000 games) — archived. Plausibly because
+  aspiration re-searches within one iteration already reuse killers where
+  it matters.
 
 Backlog (bigger builds): improving flag (needs static-eval stack),
 2-ply continuation history + history pruning, singular extensions +

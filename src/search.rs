@@ -770,6 +770,7 @@ pub struct BitBoardEngine {
     pub keep_killers: i32,
     // Aspiration mode: 0 = fixed ±50 + full-window re-search (legacy),
     // 1 = geometric one-sided widening starting at ±30.
+    // Default 1: SPRT PASS at 50ms (+42 [+20,+64]) AND 200ms (+31 [+13,+50]).
     pub asp_mode: i32,
 }
 
@@ -842,10 +843,10 @@ impl BitBoardEngine {
             weight_race: 80,
             weight_straggler: 0, // A/B: -20 Elo at 6, no value
             pail_filter: false,  // A/B: -2 Elo, no measurable speed win
-            rfp_margin: 0,
-            lmp_base: 0,
-            keep_killers: 0,
-            asp_mode: 0,
+            rfp_margin: 0,   // SPRT inconclusive at 120 (+2, 1000 games)
+            lmp_base: 0,     // STC PASS +27; LTC retry pending
+            keep_killers: 0, // SPRT null (+1 in 2000 games) — archived
+            asp_mode: 1,     // PASSED both gates (see field comment)
         }
     }
 
