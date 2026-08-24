@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """Round-robin tournament between heuristic engine at different depths.
 
-Tests whether deeper search actually produces stronger play.
-Each matchup plays N games with alternating colors and random openings.
+DEPRECATED: prefer scripts/match.py for pairwise matches — it has real draw
+rules (threefold repetition + no-progress clock), paired openings, parallel
+workers, Elo confidence intervals, and an SPRT stop rule. This script
+predates the draw rules (games are capped at 80 moves instead) and remains
+only for quick round-robin sketches.
 
 Usage:
     python scripts/depth_tournament.py [--games 50] [--depths 4 6 8 10 12]
