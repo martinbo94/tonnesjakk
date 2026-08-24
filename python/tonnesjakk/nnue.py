@@ -1096,14 +1096,27 @@ class DataGenerator:
         )
 
         for _ in range(actual_random):
-            moves = board.generate_moves()
+            # Barrel moves only: the pail is a once-per-game strategic decision
+            # left to the engine, not burned on a random opening square.
+            moves = [m for m in board.generate_moves() if not m.is_pail_only]
             if not moves or board.check_winner():
                 break
             board.make_move(random.choice(moves))
 
+        # Draw-rule tracking: `recent` = hashes since last irreversible event
+        # (passed to the engine so search sees repetitions), `counts` for 3-fold.
+        recent = [board.get_hash()]
+        counts = {board.get_hash(): 1}
+        NO_PROGRESS_LIMIT = 60
+
         # Engine plays the rest
         move_count = 0
         while board.check_winner() is None and move_count < max_moves:
+            # Real draw rules (threefold repetition / no-progress clock)
+            if board.halfmove_clock >= NO_PROGRESS_LIMIT or counts.get(board.get_hash(), 0) >= 3:
+                break
+
+            engine.set_game_history(recent)
             result = engine.search(board, depth)
             if result.best_move is None:
                 break
@@ -1140,10 +1153,17 @@ class DataGenerator:
             board.make_move(result.best_move)
             move_count += 1
 
+            h = board.get_hash()
+            if board.halfmove_clock == 0:
+                recent = [h]
+            else:
+                recent.append(h)
+            counts[h] = counts.get(h, 0) + 1
+
         # Determine outcome
         winner = board.check_winner()
         if winner is None:
-            outcome = 0.0  # Draw / max moves reached
+            outcome = 0.0  # Draw (repetition/no-progress) or max moves reached
         elif "White" in repr(winner):
             outcome = 1.0
         else:

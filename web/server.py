@@ -279,11 +279,44 @@ def make_move(req: MoveRequest):
     game["board_history"].append(board.copy())
 
     # Returner state etter spillerens trekk (IKKE AI-trekk enna)
+    draw = _draw_status(game)
     return {
         "state": board_to_dict(board),
         "valid_moves": get_valid_moves(board),
-        "game_over": board.check_winner() is not None,
+        "game_over": board.check_winner() is not None or draw is not None,
+        "draw": draw,
     }
+
+
+def _recent_hashes(game: dict) -> list[int]:
+    """Hashes of positions since the last irreversible event (incl. current).
+
+    Passed to the engine so search scores repetitions of actual game
+    positions as draws. Only these can repeat: the Zobrist off-board keys
+    guarantee no hash collisions across irreversible events.
+    """
+    history = game.get("board_history", [])
+    recent: list[int] = []
+    for b in reversed(history):
+        recent.append(b.get_hash())
+        if b.halfmove_clock == 0:
+            break
+    recent.reverse()
+    return recent
+
+
+def _draw_status(game: dict) -> Optional[str]:
+    """Return 'threefold' / 'no_progress' if the game is drawn, else None."""
+    board = game["board"]
+    if board.check_winner() is not None:
+        return None
+    if board.halfmove_clock >= 60:
+        return "no_progress"
+    current = board.get_hash()
+    count = sum(1 for b in game.get("board_history", []) if b.get_hash() == current)
+    if count >= 3:
+        return "threefold"
+    return None
 
 
 def _do_ai_move(game: dict) -> Optional[dict]:
@@ -293,33 +326,32 @@ def _do_ai_move(game: dict) -> Optional[dict]:
     board = game["board"]
     engine_type = game.get("engine_type", "heuristic")
 
-    if board.check_winner() is not None:
-        return None
-
-    # Handle pail-only phase: pick a center-biased random pail placement
-    moves = board.generate_moves()
-    if moves and moves[0].is_pail_only:
-        weights = []
-        for m in moves:
-            pos = m.place_pail
-            dist = abs(pos.row - 2.5) + abs(pos.col - 2.5)
-            w = max(6.0 - dist, 0.5)
-            weights.append(w * w)
-        total = sum(weights)
-        weights = [w / total for w in weights]
-        chosen = random.choices(moves, weights=weights, k=1)[0]
-        pail_str = f"pail_only({chosen.place_pail.row},{chosen.place_pail.col})"
-        print(f"\n>>> AI: {pail_str}")
-        board.make_move(chosen)
-        if "board_history" in game:
-            game["board_history"].append(board.copy())
-
-    if board.check_winner() is not None:
+    if board.check_winner() is not None or _draw_status(game) is not None:
         return None
 
     start_time = time.time()
 
     if engine_type == "alphazero" and "eval_fn" in game:
+        # AlphaZero models were trained with pail placed on the first turn:
+        # keep the center-biased random pail placement for them.
+        moves = [m for m in board.generate_moves() if m.is_pail_only]
+        if moves:
+            weights = []
+            for m in moves:
+                pos = m.place_pail
+                dist = abs(pos.row - 2.5) + abs(pos.col - 2.5)
+                w = max(6.0 - dist, 0.5)
+                weights.append(w * w)
+            total = sum(weights)
+            weights = [w / total for w in weights]
+            chosen = random.choices(moves, weights=weights, k=1)[0]
+            pail_str = f"pail_only({chosen.place_pail.row},{chosen.place_pail.col})"
+            print(f"\n>>> AI: {pail_str}")
+            board.make_move(chosen)
+            if "board_history" in game:
+                game["board_history"].append(board.copy())
+        if board.check_winner() is not None:
+            return None
         # AlphaZero: use MCTS with neural network — fresh engine each move to avoid stale tree
         mcts_engine = MCTSEngine(game.get("mcts_simulations", 300), 1.4)
         eval_fn = game["eval_fn"]
@@ -351,31 +383,56 @@ def _do_ai_move(game: dict) -> Optional[dict]:
                 "ai_score": score_cp,
             }
     else:
-        # Heuristic: use alpha-beta search
+        # Heuristic: alpha-beta decides the whole turn, including whether to
+        # spend the pail (an optional sub-move). If search picks a pail
+        # placement, the AI is still to move — search again for the barrel.
         engine = game["engine"]
-        ai_result = engine.search(board, game["ai_depth"])
-        elapsed = time.time() - start_time
+        pail_pos = None
+        barrel_move = None
+        last_result = None
+        total_nodes = 0
 
-        if ai_result.best_move:
+        for _ in range(2):  # at most: pail sub-move + barrel move
+            engine.set_game_history(_recent_hashes(game))
+            ai_result = engine.search(board, game["ai_depth"])
+            if ai_result.best_move is None:
+                break
             move = ai_result.best_move
-            move_str = _format_move(move)
-            score_str = f"+{ai_result.score}" if ai_result.score >= 0 else str(ai_result.score)
-            nps = int(ai_result.nodes_searched / elapsed) if elapsed > 0 else 0
+            move_str = _format_move(move) if not move.is_pail_only else \
+                f"pail_only({move.place_pail.row},{move.place_pail.col})"
+            last_result = ai_result
+            total_nodes += ai_result.nodes_searched
 
+            elapsed = time.time() - start_time
+            score_str = f"+{ai_result.score}" if ai_result.score >= 0 else str(ai_result.score)
+            nps = int(total_nodes / elapsed) if elapsed > 0 else 0
             print(f"\n{'='*50}")
             print(f"info depth {ai_result.depth} score cp {ai_result.score} nodes {ai_result.nodes_searched} nps {nps} time {int(elapsed*1000)}ms")
             print(f"info string eval: {score_str} ({'hvit' if ai_result.score > 0 else 'svart' if ai_result.score < 0 else 'likt'} leder)")
-            print(f"info string tt_hits: {ai_result.tt_hits} cutoffs: {ai_result.cutoffs}")
             print(f"bestmove {move_str}")
             print(f"{'='*50}\n")
 
             board.make_move(move)
             if "board_history" in game:
                 game["board_history"].append(board.copy())
+
+            if move.is_pail_only:
+                pail_pos = move.place_pail
+                continue  # turn not complete — search the barrel move
+            barrel_move = move
+            break
+
+        if last_result is not None:
+            move_dict = move_to_dict(barrel_move) if barrel_move is not None else {
+                "place_pail": None, "is_barrel_placement": False,
+                "barrel_from": None, "barrel_to": None,
+            }
+            if pail_pos is not None:
+                move_dict["place_pail"] = (pail_pos.row, pail_pos.col)
             return {
-                "ai_move": move_to_dict(move),
-                "ai_score": ai_result.score,
-                "ai_nodes": ai_result.nodes_searched,
+                "ai_move": move_dict,
+                "ai_score": last_result.score,
+                "ai_nodes": total_nodes,
             }
 
     return None
@@ -422,6 +479,7 @@ def ai_move(game_id: str):
         result.update(ai_result)
         result["state"] = board_to_dict(board)
         result["valid_moves"] = get_valid_moves(board)
+    result["draw"] = _draw_status(game)
 
     return result
 
