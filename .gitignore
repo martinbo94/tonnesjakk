@@ -32,6 +32,16 @@ nnue_weights*.json
 *.npz
 *.bin
 *_meta.json
+*.onnx
+*.onnx.data
+alphazero_*/
+bootstrap_*.npz
+
+# Measurement artifacts (conclusions live in ENGINE_ROADMAP.md)
+scripts/results/
+scripts/tuning_results.json
+scripts/tune_*.json
+benchmark_results.json
 
 # Project docs (kept locally only)
 CLAUDE.md
