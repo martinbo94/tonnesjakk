@@ -2,6 +2,7 @@ use pyo3::prelude::*;
 
 pub mod board;
 pub mod nnue;
+pub mod race;
 pub mod search;
 pub mod mcts;
 
@@ -382,28 +383,30 @@ mod tests {
     /// Test at prekalkulerte tabeller er korrekte
     #[test]
     fn test_precomputed_tables() {
-        // Test ADJACENT
-        // Hjørne (0,0) har 2 naboer
+        // Test ADJACENT (8 retninger)
+        // Hjørne (0,0) har 3 naboer (høyre, ned, ned-høyre)
         let adj_00 = ADJACENT[sq(0, 0)];
-        assert_eq!(adj_00.count_ones(), 2);
+        assert_eq!(adj_00.count_ones(), 3);
         assert!(adj_00 & bit(sq(0, 1)) != 0); // høyre
         assert!(adj_00 & bit(sq(1, 0)) != 0); // ned
+        assert!(adj_00 & bit(sq(1, 1)) != 0); // ned-høyre
 
-        // Senter (2,2) har 4 naboer
+        // Senter (2,2) har 8 naboer
         let adj_22 = ADJACENT[sq(2, 2)];
-        assert_eq!(adj_22.count_ones(), 4);
+        assert_eq!(adj_22.count_ones(), 8);
 
         // Test JUMP_LANDING
-        // Fra (2,2) kan vi hoppe i alle 4 retninger
-        for dir in 0..4 {
+        // Fra (2,2) kan vi hoppe i alle 8 retninger
+        for dir in 0..NUM_JUMP_DIRS {
             assert!(JUMP_LANDING[sq(2, 2)][dir] >= 0);
         }
 
-        // Fra (0,0) kan vi bare hoppe ned og høyre
+        // Fra (0,0) kan vi bare hoppe ned, høyre og ned-høyre
         assert!(JUMP_LANDING[sq(0, 0)][0] < 0); // opp - ugyldig
         assert!(JUMP_LANDING[sq(0, 0)][1] >= 0); // ned - gyldig
         assert!(JUMP_LANDING[sq(0, 0)][2] < 0); // venstre - ugyldig
         assert!(JUMP_LANDING[sq(0, 0)][3] >= 0); // høyre - gyldig
+        assert!(JUMP_LANDING[sq(0, 0)][7] >= 0); // ned-høyre - gyldig
 
         println!("✓ Precomputed tables are correct");
     }
@@ -527,4 +530,121 @@ mod tests {
             score
         });
     }
+
+    // ═══════════════════════════════════════════════════════════════
+    // Draw-rule tests (halfmove clock, off-board Zobrist keys, repetition)
+    // ═══════════════════════════════════════════════════════════════
+
+    /// Play a pail placement + a barrel placement for the side to move.
+    fn place_pail_and_barrel(bb: &mut BitBoard, pail_sq: u8) {
+        bb.make_move(&BitMove::new_pail_placement(pail_sq));
+        let placement = bb
+            .generate_moves()
+            .into_iter()
+            .find(|m| m.is_placement())
+            .expect("placement available");
+        bb.make_move(&placement);
+    }
+
+    #[test]
+    fn test_halfmove_clock() {
+        let mut bb = BitBoard::new();
+        assert_eq!(bb.halfmove_clock, 0);
+
+        place_pail_and_barrel(&mut bb, sq(2, 0) as u8); // white
+        assert_eq!(bb.halfmove_clock, 0, "placement resets clock");
+        place_pail_and_barrel(&mut bb, sq(3, 5) as u8); // black
+        assert_eq!(bb.halfmove_clock, 0);
+
+        // Reversible barrel moves increment the clock
+        for expected in 1..=4u16 {
+            let mv = bb
+                .generate_moves()
+                .into_iter()
+                .find(|m| !m.is_placement() && !m.is_pail_placement())
+                .expect("barrel move available");
+            bb.make_move(&mv);
+            assert_eq!(bb.halfmove_clock, expected);
+        }
+
+        // Placement resets again
+        let mv = bb
+            .generate_moves()
+            .into_iter()
+            .find(|m| m.is_placement())
+            .expect("placement available");
+        bb.make_move(&mv);
+        assert_eq!(bb.halfmove_clock, 0);
+    }
+
+    /// Off-board Zobrist keys: same board occupancy with different
+    /// off-board/scored splits must hash differently.
+    #[test]
+    fn test_offboard_hash_keys() {
+        let a = BitBoard::new();
+        let mut b = BitBoard::new();
+        // Simulate "one white barrel scored, none in hand difference":
+        // manually alter off-board count and re-derive expected hash change.
+        b.hash ^= ZOBRIST_TEST_KEYS(0, 4);
+        b.hash ^= ZOBRIST_TEST_KEYS(0, 3);
+        b.white_barrels_off_board = 3;
+        b.white_scored = 1;
+        assert_ne!(a.hash, b.hash, "off-board count must affect the hash");
+    }
+
+    /// Repetition: with the position already in game history, search must
+    /// score the repeating line as a draw (0), not as the static eval.
+    #[test]
+    fn test_repetition_scored_as_draw() {
+        let mut bb = BitBoard::new();
+        place_pail_and_barrel(&mut bb, sq(2, 0) as u8);
+        place_pail_and_barrel(&mut bb, sq(3, 5) as u8);
+
+        let mut engine = BitBoardEngine::new();
+
+        // Baseline: no history → normal score
+        engine.game_history.clear();
+        let (score_free, _) = engine.search(&bb, 4);
+
+        // Poison history: every child position of every white move is
+        // "already seen twice" → every line starts with a repetition draw.
+        let mut all_children = Vec::new();
+        for mv in bb.generate_moves() {
+            let mut child = bb;
+            child.make_move(&mv);
+            all_children.push(child.hash);
+        }
+        engine.full_reset();
+        engine.game_history = all_children;
+        let (score_rep, _) = engine.search(&bb, 4);
+
+        assert_eq!(score_rep, 0, "all-repetition position must score as draw");
+        assert_ne!(score_free, score_rep, "baseline should differ from draw score");
+    }
+
+    /// No-progress rule: a position at the clock limit scores as a draw one
+    /// ply into the search.
+    #[test]
+    fn test_no_progress_draw() {
+        let mut bb = BitBoard::new();
+        place_pail_and_barrel(&mut bb, sq(2, 0) as u8);
+        place_pail_and_barrel(&mut bb, sq(3, 5) as u8);
+        bb.halfmove_clock = 59;
+
+        let mut engine = BitBoardEngine::new();
+        engine.no_progress_limit = 60;
+        // Only reversible moves exist here besides placements; a placement
+        // resets the clock, so search should either place a barrel (progress)
+        // or accept the draw — never return a large advantage from shuffling.
+        let (score, mv) = engine.search(&bb, 6);
+        assert!(mv.is_some());
+        assert!(score.abs() < 90_000);
+    }
+}
+
+/// Test-only accessor for the off-board Zobrist keys (keeps ZOBRIST private).
+#[cfg(test)]
+#[allow(non_snake_case)]
+fn ZOBRIST_TEST_KEYS(player: usize, count: usize) -> u64 {
+    crate::board::zobrist_off_board_key(player, count)
 }
