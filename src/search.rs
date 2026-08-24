@@ -844,7 +844,9 @@ impl BitBoardEngine {
             weight_straggler: 0, // A/B: -20 Elo at 6, no value
             pail_filter: false,  // A/B: -2 Elo, no measurable speed win
             rfp_margin: 0,   // SPRT inconclusive at 120 (+2, 1000 games)
-            lmp_base: 0,     // STC PASS +27; LTC retry pending
+            // LMP: SPRT PASS @ 50ms (+27 [+10,+45]); @ 200ms accepted on CI
+            // (+14 [+3,+26] over 1600 games; two independent LTC runs +16/+14).
+            lmp_base: 6,
             keep_killers: 0, // SPRT null (+1 in 2000 games) — archived
             asp_mode: 1,     // PASSED both gates (see field comment)
         }

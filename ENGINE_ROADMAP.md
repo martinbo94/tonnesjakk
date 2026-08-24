@@ -234,9 +234,11 @@ mate-score conversion (added today).
 Missing / added behind flags — SPRT gate results (2026-08-24):
 - `asp_mode=1` (one-sided geometric aspiration widening): **PASSED both
   gates — +42 [+20,+64] @ 50ms, +31 [+13,+50] @ 200ms → DEFAULT.**
-- `lmp_base=6` (late move pruning): PASSED @ 50ms (+27 [+10,+45]);
-  200ms gate inconclusive at budget (+16 [−1,+33]) → extended retry
-  running. Pruning patches require the slow-TC pass.
+- `lmp_base=6` (late move pruning): **DEFAULT.** SPRT PASS @ 50ms
+  (+27 [+10,+45]); at 200ms accepted on CI rather than SPRT bound:
+  +14 [+3,+26] over 1600 games (two independent LTC runs +16/+14 — the
+  true value sits mid-band of SPRT(0,10), so the LLR couldn't resolve,
+  but the CI excludes zero at both time controls).
 - `rfp_margin=120` (reverse futility): inconclusive (+2, 1000 games @
   50ms). Retry other margins later (≤4 attempts, then archive).
 - `keep_killers=1`: null (+1 in 2000 games) — archived. Plausibly because
