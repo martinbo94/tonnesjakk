@@ -32,13 +32,9 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 
-# Try to import Rust-accelerated HalfPail decoders
-try:
-    from tonnesjakk import decode_halfpail as _rust_decode_halfpail
-    from tonnesjakk import decode_halfpail_batch as _rust_decode_batch
-except ImportError:
-    _rust_decode_halfpail = None
-    _rust_decode_batch = None
+# Model / trainer / export live in nnue_arch.py (generic over architectures);
+# this module owns data generation, the CLI, and comparison utilities.
+from .nnue_arch import NnueArch, train_sparse_model, export_sparse_json
 
 # Constants
 BOARD_SIZE = 6
@@ -322,542 +318,17 @@ def test_halfpail_decoding(n_positions: int = 100):
     return errors == 0
 
 
-# =============================================================================
-# HalfPail Neural Network
-# =============================================================================
 
-class HalfPailNNUE(nn.Module):
-    """
-    HalfPail NNUE with dual-perspective sparse features.
 
-    Architecture:
-        White sparse indices → EmbeddingBag(3996, H1, sum) + bias → ReLU → acc_white
-        Black sparse indices → EmbeddingBag(3996, H1, sum) + bias → ReLU → acc_black
-                                    (shared weights)
-        concat(acc_white, acc_black, dense_20) → FC2(2*H1+20, H2) → ReLU → FC3(H2, 1) → Tanh
-    """
 
-    def __init__(self, hidden1: int = 128, hidden2: int = 32):
-        super().__init__()
-        self.hidden1 = hidden1
-        self.hidden2 = hidden2
-        self.num_perspective_features = HALFPAIL_FEATURES  # 3996
-        self.dense_size = HALFPAIL_DENSE  # 20
 
-        # Shared perspective embedding (FC1 equivalent)
-        # EmbeddingBag with mode='sum' acts like sparse matrix multiplication
-        self.embedding = nn.EmbeddingBag(
-            num_embeddings=HALFPAIL_FEATURES,
-            embedding_dim=hidden1,
-            mode='sum',
-        )
-        self.fc1_bias = nn.Parameter(torch.zeros(hidden1))
 
-        # FC2: takes concat of both accumulators + dense features
-        fc2_input = 2 * hidden1 + HALFPAIL_DENSE
-        self.fc2 = nn.Linear(fc2_input, hidden2)
-        self.fc3 = nn.Linear(hidden2, 1)
 
-        # Initialize
-        nn.init.xavier_uniform_(self.embedding.weight)
-        nn.init.xavier_uniform_(self.fc2.weight)
-        nn.init.zeros_(self.fc2.bias)
-        nn.init.xavier_uniform_(self.fc3.weight)
-        nn.init.zeros_(self.fc3.bias)
 
-    def forward(self, white_indices, white_offsets, black_indices, black_offsets, dense):
-        """
-        Forward pass with packed EmbeddingBag inputs.
 
-        Args:
-            white_indices: packed 1D tensor of white perspective feature indices
-            white_offsets: start offset for each sample in white_indices
-            black_indices: packed 1D tensor of black perspective feature indices
-            black_offsets: start offset for each sample in black_indices
-            dense: [batch_size, 20] dense features
-        """
-        # Shared embedding for both perspectives
-        acc_white = self.embedding(white_indices, white_offsets) + self.fc1_bias
-        acc_white = torch.relu(acc_white)
 
-        acc_black = self.embedding(black_indices, black_offsets) + self.fc1_bias
-        acc_black = torch.relu(acc_black)
 
-        # Concatenate: [acc_white, acc_black, dense]
-        combined = torch.cat([acc_white, acc_black, dense], dim=1)
 
-        # FC2 → ReLU → FC3 → Tanh
-        h = torch.relu(self.fc2(combined))
-        out = torch.tanh(self.fc3(h))
-        return out
-
-    @property
-    def num_parameters(self) -> int:
-        return sum(p.numel() for p in self.parameters())
-
-
-class HalfPailDataset(torch.utils.data.Dataset):
-    """Dataset that decodes 164-dim dense features to HalfPail sparse indices on-the-fly.
-
-    Wraps existing memmap or numpy array of shape (N, 164) with labels (N,).
-    Supports multi-worker DataLoader on Windows (spawn) by lazily re-opening
-    memmap files in each worker process instead of pickling the arrays.
-    """
-
-    def __init__(self, X, y, start: int = 0, end: int = None):
-        """
-        Args:
-            X: features array (N, 164) - numpy array or memmap (full, unsliced)
-            y: labels array (N,) or (N, 1)
-            start: start index for this subset
-            end: end index for this subset (None = len(X))
-        """
-        self._start = start
-        self._end = end if end is not None else len(X)
-        self.n = self._end - self._start
-        # Store memmap metadata for lazy re-opening in worker processes
-        if isinstance(X, np.memmap):
-            self._x_path = X.filename
-            self._x_shape = (len(X), X.shape[1]) if X.ndim == 2 else (len(X),)
-            self._y_path = y.filename
-            self._y_shape = y.shape
-            self._is_memmap = True
-            self.X = None
-            self.y = None
-        else:
-            self._is_memmap = False
-            self.X = X
-            self.y = y
-
-    def __getstate__(self):
-        """Exclude memmap arrays from pickling (for Windows spawn workers)."""
-        state = self.__dict__.copy()
-        if self._is_memmap:
-            state['X'] = None
-            state['y'] = None
-        return state
-
-    def _ensure_open(self):
-        """Lazily re-open memmap files (called in worker processes)."""
-        if self._is_memmap and self.X is None:
-            self.X = np.memmap(self._x_path, dtype=np.float32, mode='r', shape=self._x_shape)
-            self.y = np.memmap(self._y_path, dtype=np.float32, mode='r', shape=self._y_shape)
-
-    def __len__(self):
-        return self.n
-
-    def __getitem__(self, idx):
-        self._ensure_open()
-        real_idx = self._start + idx
-        row = np.array(self.X[real_idx], dtype=np.float32)
-        label = float(self.y[real_idx]) if self.y.ndim == 1 else float(self.y[real_idx, 0])
-
-        if _rust_decode_halfpail is not None:
-            w_idx, b_idx, dense = _rust_decode_halfpail(row.tolist())
-        else:
-            board = decode_board_from_dense164(row)
-            w_idx, b_idx, dense = board_to_halfpail_indices(board)
-
-        return (
-            torch.tensor(w_idx, dtype=torch.long),
-            torch.tensor(b_idx, dtype=torch.long),
-            torch.tensor(dense, dtype=torch.float32),
-            torch.tensor([label], dtype=torch.float32),
-        )
-
-
-def halfpail_collate_fn(batch):
-    """Custom collate function for HalfPailDataset.
-
-    Packs variable-length index lists into the format EmbeddingBag expects:
-    a single 1D tensor of indices and a 1D tensor of offsets.
-    """
-    all_w_idx = []
-    all_b_idx = []
-    w_offsets = [0]
-    b_offsets = [0]
-    dense_list = []
-    label_list = []
-
-    for w_idx, b_idx, dense, label in batch:
-        all_w_idx.append(w_idx)
-        all_b_idx.append(b_idx)
-        w_offsets.append(w_offsets[-1] + len(w_idx))
-        b_offsets.append(b_offsets[-1] + len(b_idx))
-        dense_list.append(dense)
-        label_list.append(label)
-
-    white_indices = torch.cat(all_w_idx) if all_w_idx else torch.tensor([], dtype=torch.long)
-    black_indices = torch.cat(all_b_idx) if all_b_idx else torch.tensor([], dtype=torch.long)
-    white_offsets = torch.tensor(w_offsets[:-1], dtype=torch.long)
-    black_offsets = torch.tensor(b_offsets[:-1], dtype=torch.long)
-    dense = torch.stack(dense_list)
-    labels = torch.stack(label_list)
-
-    return white_indices, white_offsets, black_indices, black_offsets, dense, labels
-
-
-class ChunkedBatchSampler(torch.utils.data.Sampler):
-    """Yields batches of contiguous indices with shuffled chunk order.
-
-    Instead of globally shuffling indices (terrible for memmap I/O),
-    divides the dataset into large contiguous chunks, shuffles the chunk order,
-    and yields batch_size-sized slices from each chunk sequentially.
-    """
-
-    def __init__(self, dataset_size: int, batch_size: int, chunk_size: int, shuffle: bool = True):
-        self.dataset_size = dataset_size
-        self.batch_size = batch_size
-        self.chunk_size = chunk_size
-        self.shuffle = shuffle
-
-    def __iter__(self):
-        n_chunks = (self.dataset_size + self.chunk_size - 1) // self.chunk_size
-        chunk_order = np.arange(n_chunks)
-        if self.shuffle:
-            np.random.shuffle(chunk_order)
-
-        for ci in chunk_order:
-            chunk_start = ci * self.chunk_size
-            chunk_end = min(chunk_start + self.chunk_size, self.dataset_size)
-            # Yield batch_size slices of contiguous indices within this chunk
-            for bs in range(chunk_start, chunk_end, self.batch_size):
-                yield list(range(bs, min(bs + self.batch_size, chunk_end)))
-
-    def __len__(self):
-        return (self.dataset_size + self.batch_size - 1) // self.batch_size
-
-
-def _rust_batch_decode_chunk(X_chunk, y_chunk):
-    """Decode a contiguous chunk of rows using Rust batch decoder.
-
-    Returns tensors ready for model forward pass, same format as halfpail_collate_fn.
-    """
-    # Convert to flat Python lists for Rust extraction (fastest measured path)
-    flat_x = np.ascontiguousarray(X_chunk, dtype=np.float32).ravel().tolist()
-    flat_y = np.ascontiguousarray(y_chunk, dtype=np.float32).ravel().tolist()
-
-    w_idx, w_off, b_idx, b_off, dense_flat, labels_flat = _rust_decode_batch(flat_x, flat_y)
-
-    n = len(w_off)
-    return (
-        torch.tensor(w_idx, dtype=torch.long),
-        torch.tensor(w_off, dtype=torch.long),
-        torch.tensor(b_idx, dtype=torch.long),
-        torch.tensor(b_off, dtype=torch.long),
-        torch.tensor(dense_flat, dtype=torch.float32).view(n, HALFPAIL_DENSE),
-        torch.tensor(labels_flat, dtype=torch.float32).unsqueeze(1),
-    )
-
-
-def train_halfpail_model(
-    X,  # np.ndarray or np.memmap, shape (N, 164)
-    y,  # np.ndarray or np.memmap, shape (N,), (N, 1), or (N, 2) [search_score, outcome]
-    hidden1: int = 128,
-    hidden2: int = 32,
-    epochs: int = 200,
-    batch_size: int = 4096,
-    learning_rate: float = 0.003,
-    validation_split: float = 0.1,
-    verbose: bool = True,
-    loss_fn: str = "wdl-ce",
-    num_workers: int = 0,
-    resume_from: Optional[str] = None,
-    lambda_blend: Optional[float] = None,
-) -> tuple:
-    """Train a HalfPail NNUE model.
-
-    Uses Rust batch decoding for fast on-the-fly feature computation.
-    Falls back to Python DataLoader if Rust batch decoder is unavailable.
-
-    If y has 2 columns [search_score, outcome], lambda_blend controls the mix:
-      label = lambda * search_score + (1 - lambda) * outcome
-    Default lambda_blend=1.0 uses pure search scores (backward compatible).
-
-    Returns:
-        (model, history)
-    """
-    n = len(X)
-    split = int((1 - validation_split) * n)
-    train_n = split
-
-    # Handle 2-column labels: blend search_score and outcome at training time
-    if y.ndim == 2 and y.shape[1] == 2:
-        lb = lambda_blend if lambda_blend is not None else 1.0
-        y_flat = (lb * y[:, 0] + (1 - lb) * y[:, 1]).astype(np.float32)
-        if verbose:
-            print(f"  Label blend: {lb:.2f} * search_score + {1-lb:.2f} * outcome")
-    else:
-        y_flat = y.ravel() if y.ndim > 1 else y
-
-    use_rust_batch = _rust_decode_batch is not None
-    # CUDA > MPS (Apple Silicon GPU) > CPU
-    from .utils import get_device
-    device = get_device("auto")
-
-    model = HalfPailNNUE(hidden1, hidden2)
-    if resume_from:
-        state = torch.load(resume_from, map_location="cpu", weights_only=True)
-        model.load_state_dict(state)
-        if verbose:
-            print(f"  Resumed from: {resume_from}")
-    model = model.to(device)
-    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
-
-    # Cosine annealing: LR decays from initial to ~0 over all epochs
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=learning_rate * 0.01)
-
-    if loss_fn == "wdl-ce":
-        criterion = wdl_cross_entropy
-    else:
-        criterion = nn.MSELoss()
-
-    history = {'train_loss': [], 'val_loss': []}
-    best_val_loss = float('inf')
-    best_model_state = None
-
-    if verbose:
-        fc2_input = 2 * hidden1 + HALFPAIL_DENSE
-        print(f"  Training set: {train_n:,} positions")
-        print(f"  Validation set: {n - split:,} positions")
-        mode = "Rust batch decode (contiguous reads)" if use_rust_batch else "Python DataLoader"
-        print(f"  Mode: HalfPail dual-perspective sparse features")
-        print(f"  Decoder: {mode}")
-        print(f"  Device: {device}")
-        print(f"  Loss: {loss_fn}")
-        print(f"  LR: {learning_rate} (cosine annealing -> {learning_rate * 0.01:.6f})")
-        print(f"  Architecture: EmbeddingBag({HALFPAIL_FEATURES}, {hidden1}) shared")
-        print(f"    FC2: {fc2_input} -> {hidden2}, FC3: {hidden2} -> 1")
-        print(f"  Parameters: {model.num_parameters:,}")
-
-    if use_rust_batch:
-        # Pre-decode all positions once, then train purely on GPU
-        n_chunks = (train_n + batch_size - 1) // batch_size
-        chunk_order = np.arange(n_chunks)
-        val_n = n - split
-        val_n_chunks = (val_n + batch_size - 1) // batch_size
-
-        # Pre-decode phase: decode all batches and move to GPU
-        decode_chunk_size = 65536  # decode in large chunks for efficiency
-        if verbose:
-            print(f"  Pre-decoding {n:,} positions to GPU...", flush=True)
-
-        def _predecode_to_gpu(X_data, y_data, start_idx, count, bs, dev):
-            """Pre-decode positions and return list of GPU-resident batch tuples."""
-            batches = []
-            n_decode_chunks = (count + decode_chunk_size - 1) // decode_chunk_size
-            for di in range(n_decode_chunks):
-                ds = start_idx + di * decode_chunk_size
-                de = min(ds + decode_chunk_size, start_idx + count)
-                # Rust decode
-                w_idx, w_off, b_idx, b_off, dense, labels = _rust_batch_decode_chunk(
-                    X_data[ds:de], y_data[ds:de]
-                )
-                # Split into training batch sizes and move to GPU
-                chunk_n = de - ds
-                for bi in range(0, chunk_n, bs):
-                    be = min(bi + bs, chunk_n)
-                    # Compute index ranges for sparse indices
-                    off_start = int(w_off[bi])
-                    off_end = int(w_off[be]) if be < chunk_n else len(w_idx)
-                    b_off_start = int(b_off[bi])
-                    b_off_end = int(b_off[be]) if be < chunk_n else len(b_idx)
-                    batches.append((
-                        w_idx[off_start:off_end].to(dev),
-                        (w_off[bi:be] - w_off[bi]).to(dev),
-                        b_idx[b_off_start:b_off_end].to(dev),
-                        (b_off[bi:be] - b_off[bi]).to(dev),
-                        dense[bi:be].to(dev),
-                        labels[bi:be].to(dev),
-                    ))
-                if verbose:
-                    done = min((di + 1) * decode_chunk_size, count)
-                    print(f"    {done:,}/{count:,} decoded", flush=True)
-            return batches
-
-        t0 = time.time()
-        train_batches = _predecode_to_gpu(X, y_flat, 0, train_n, batch_size, device)
-        val_batches_list = _predecode_to_gpu(X, y_flat, split, val_n, batch_size, device)
-        decode_time = time.time() - t0
-        if verbose:
-            print(f"  Pre-decode complete: {len(train_batches)} train + {len(val_batches_list)} val batches "
-                  f"in {decode_time:.1f}s", flush=True)
-
-        train_start = time.time()
-        for epoch in range(epochs):
-            epoch_start = time.time()
-            model.train()
-            # Shuffle batch order (data is already on GPU)
-            perm = np.random.permutation(len(train_batches))
-            total_loss = 0.0
-            num_batches = 0
-
-            for bi in perm:
-                w_idx, w_off, b_idx, b_off, dense, labels = train_batches[bi]
-                optimizer.zero_grad()
-                pred = model(w_idx, w_off, b_idx, b_off, dense)
-                loss = criterion(pred, labels)
-                loss.backward()
-                optimizer.step()
-                total_loss += loss.item()
-                num_batches += 1
-
-            train_loss = total_loss / max(num_batches, 1)
-
-            # Validation
-            model.eval()
-            val_loss_total = 0.0
-            val_count = 0
-            with torch.no_grad():
-                for w_idx, w_off, b_idx, b_off, dense, labels in val_batches_list:
-                    pred = model(w_idx, w_off, b_idx, b_off, dense)
-                    batch_n = labels.shape[0]
-                    val_loss_total += criterion(pred, labels).item() * batch_n
-                    val_count += batch_n
-            val_loss = val_loss_total / max(val_count, 1)
-
-            history['train_loss'].append(train_loss)
-            history['val_loss'].append(val_loss)
-
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
-                best_model_state = {k: v.clone() for k, v in model.state_dict().items()}
-                marker = " *"
-            else:
-                marker = ""
-
-            scheduler.step()
-
-            if verbose:
-                current_lr = optimizer.param_groups[0]['lr']
-                epoch_time = time.time() - epoch_start
-                elapsed = time.time() - train_start
-                eta = epoch_time * (epochs - epoch - 1)
-                print(f"  Epoch {epoch+1:3d}/{epochs}: "
-                      f"train={train_loss:.4f}, val={val_loss:.4f} "
-                      f"lr={current_lr:.6f} "
-                      f"({epoch_time:.0f}s, total {elapsed:.0f}s, ETA {eta/60:.0f}m){marker}", flush=True)
-    else:
-        # Fallback: Python DataLoader with per-sample decode
-        train_dataset = HalfPailDataset(X, y, start=0, end=split)
-        val_dataset = HalfPailDataset(X, y, start=split, end=n)
-
-        chunk_size = batch_size * max(num_workers, 1) * 4
-        train_sampler = ChunkedBatchSampler(len(train_dataset), batch_size, chunk_size, shuffle=True)
-
-        train_loader = torch.utils.data.DataLoader(
-            train_dataset,
-            batch_sampler=train_sampler,
-            collate_fn=halfpail_collate_fn,
-            num_workers=num_workers,
-            pin_memory=torch.cuda.is_available(),
-        )
-        val_loader = torch.utils.data.DataLoader(
-            val_dataset,
-            batch_size=batch_size,
-            shuffle=False,
-            collate_fn=halfpail_collate_fn,
-            num_workers=num_workers,
-            pin_memory=torch.cuda.is_available(),
-        )
-
-        train_start = time.time()
-        for epoch in range(epochs):
-            epoch_start = time.time()
-            model.train()
-            total_loss = 0.0
-            num_batches = 0
-
-            for w_idx, w_off, b_idx, b_off, dense, labels in train_loader:
-                w_idx, w_off = w_idx.to(device), w_off.to(device)
-                b_idx, b_off = b_idx.to(device), b_off.to(device)
-                dense, labels = dense.to(device), labels.to(device)
-                optimizer.zero_grad()
-                pred = model(w_idx, w_off, b_idx, b_off, dense)
-                loss = criterion(pred, labels)
-                loss.backward()
-                optimizer.step()
-                total_loss += loss.item()
-                num_batches += 1
-
-            train_loss = total_loss / max(num_batches, 1)
-
-            model.eval()
-            val_loss_total = 0.0
-            val_batches = 0
-            with torch.no_grad():
-                for w_idx, w_off, b_idx, b_off, dense, labels in val_loader:
-                    w_idx, w_off = w_idx.to(device), w_off.to(device)
-                    b_idx, b_off = b_idx.to(device), b_off.to(device)
-                    dense, labels = dense.to(device), labels.to(device)
-                    pred = model(w_idx, w_off, b_idx, b_off, dense)
-                    val_loss_total += criterion(pred, labels).item()
-                    val_batches += 1
-
-            val_loss = val_loss_total / max(val_batches, 1)
-
-            history['train_loss'].append(train_loss)
-            history['val_loss'].append(val_loss)
-
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
-                best_model_state = {k: v.clone() for k, v in model.state_dict().items()}
-                marker = " *"
-            else:
-                marker = ""
-
-            scheduler.step()
-
-            if verbose:
-                current_lr = optimizer.param_groups[0]['lr']
-                epoch_time = time.time() - epoch_start
-                elapsed = time.time() - train_start
-                eta = epoch_time * (epochs - epoch - 1)
-                print(f"  Epoch {epoch+1:3d}/{epochs}: "
-                      f"train={train_loss:.4f}, val={val_loss:.4f} "
-                      f"lr={current_lr:.6f} "
-                      f"({epoch_time:.0f}s, total {elapsed:.0f}s, ETA {eta/60:.0f}m){marker}", flush=True)
-
-    if best_model_state is not None:
-        model.load_state_dict(best_model_state)
-
-    if verbose:
-        print(f"  Best validation loss: {best_val_loss:.4f}")
-
-    return model, history
-
-
-def export_halfpail_json(model: HalfPailNNUE, output_path: str):
-    """Export HalfPail NNUE weights to JSON for Rust inference.
-
-    The JSON includes a "halfpail": true marker so the Rust engine
-    can detect the model format and load accordingly.
-    """
-    state = model.state_dict()
-
-    weights = {
-        "fc1_weight": state['embedding.weight'].tolist(),  # [3996][H1]
-        "fc1_bias": state['fc1_bias'].tolist(),             # [H1]
-        "fc2_weight": state['fc2.weight'].tolist(),         # [H2][2*H1+20]
-        "fc2_bias": state['fc2.bias'].tolist(),             # [H2]
-        "fc3_weight": state['fc3.weight'].tolist(),         # [1][H2]
-        "fc3_bias": state['fc3.bias'].tolist(),             # [1]
-    }
-
-    output = {
-        "halfpail": True,
-        "hidden1": model.hidden1,
-        "hidden2": model.hidden2,
-        "num_perspective_features": model.num_perspective_features,
-        "dense_size": model.dense_size,
-        "weights": weights,
-    }
-
-    with open(output_path, "w") as f:
-        json.dump(output, f)
-
-    file_size = Path(output_path).stat().st_size
-    print(f"Exported HalfPail model to {output_path} ({file_size / 1024 / 1024:.1f} MB)")
 
 
 # =============================================================================
@@ -1687,9 +1158,13 @@ def train_nnue(
     learning_rate: float = 0.001,
     num_workers: int = 0,
     resume_from: Optional[str] = None,
+    feature_set: str = "halfpail",
+    mirror_black: bool = False,
+    dense_size: int = 20,
+    output_buckets: int = 1,
 ) -> Optional[nn.Module]:
     """
-    Complete HalfPail NNUE training pipeline.
+    Complete NNUE training pipeline (data generation, training, export).
 
     Recommended settings:
     - num_games: 10,000 - 20,000 for good results
@@ -1703,15 +1178,17 @@ def train_nnue(
     - save_data: Save generated positions to file for reuse
     - load_data: Load positions from file instead of generating
     """
+    arch = NnueArch(feature_set=feature_set, mirror_black=mirror_black, dense_size=dense_size,
+                    hidden1=hidden1, hidden2=hidden2, output_buckets=output_buckets)
     print("=" * 60)
-    print("HALFPAIL NNUE TRAINING FOR TONNESJAKK")
+    print("NNUE TRAINING FOR TONNESJAKK")
     print("=" * 60)
     print(f"\nSettings:")
-    print(f"  Architecture: HalfPail EmbeddingBag({HALFPAIL_FEATURES}, {hidden1}) -> FC2({2*hidden1+HALFPAIL_DENSE}, {hidden2}) -> 1")
+    print(f"  Architecture: {arch.tag()}  (EmbeddingBag({arch.num_features}, {hidden1}) -> "
+          f"FC2({arch.fc2_input}, {hidden2}) x{output_buckets} -> 1)")
     if resume_from:
         print(f"  Resuming from: {resume_from}")
     print(f"  Loss: {loss_fn} ({'WDL cross-entropy' if loss_fn == 'wdl-ce' else 'mean squared error'})")
-    print(f"  Features: HalfPail sparse ({HALFPAIL_FEATURES} perspective features, {HALFPAIL_DENSE} dense)")
 
     # Step 1: Generate or load data
     if load_data:
@@ -1792,15 +1269,12 @@ def train_nnue(
 
     # Step 2: Train
     print(f"\n[2/3] Training model...")
-    model, history = train_halfpail_model(
-        X, y,
-        hidden1=hidden1,
-        hidden2=hidden2,
+    model, history = train_sparse_model(
+        X, y, arch,
         epochs=epochs,
         batch_size=batch_size,
         learning_rate=learning_rate,
         loss_fn=loss_fn,
-        num_workers=num_workers,
         resume_from=resume_from,
         lambda_blend=lambda_blend,
     )
@@ -1829,7 +1303,7 @@ def train_nnue(
     print(f"  PyTorch model: {torch_path}")
 
     # Save JSON for Rust
-    export_halfpail_json(model, str(json_path))
+    export_sparse_json(model, str(json_path))
     print(f"  JSON weights: {json_path}")
 
     # Step 4: Compare with heuristic baseline (and optionally previous version)
@@ -1882,7 +1356,7 @@ def train_nnue(
             "games": num_games,
             "depth": depth,
             "random_moves": random_moves,
-            "arch": [hidden1, hidden2],
+            "arch": arch.tag(),
             "epochs": epochs,
             "used_nnue": use_nnue is not None,
             "search_scores": use_search_scores,
@@ -2161,6 +1635,14 @@ Examples:
                         help="Equal-time comparison: MS per move (use 'heuristic' for no NNUE)")
     parser.add_argument("--halfpail", action="store_true",
                         help="Use HalfPail architecture (default, kept for backward compatibility)")
+    parser.add_argument("--feature-set", type=str, default="halfpail", choices=["halfpail", "plain"],
+                        help="Sparse feature set: halfpail (pail-square buckets) or plain (default: halfpail)")
+    parser.add_argument("--mirror", action="store_true",
+                        help="Mirror the board for the black perspective (orientation-consistent shared weights)")
+    parser.add_argument("--no-dense", action="store_true",
+                        help="Drop the 20 dense relational features")
+    parser.add_argument("--output-buckets", type=int, default=1, choices=[1, 25],
+                        help="Output heads: 1, or 25 keyed on (white_scored, black_scored)")
     parser.add_argument("--resume-from", type=str, default=None,
                         help="Resume training from a saved .pt model file")
     parser.add_argument("--num-workers", type=int, default=0,
@@ -2223,6 +1705,10 @@ Examples:
             learning_rate=args.lr,
             num_workers=args.num_workers,
             resume_from=args.resume_from,
+            feature_set=args.feature_set,
+            mirror_black=args.mirror,
+            dense_size=0 if args.no_dense else 20,
+            output_buckets=args.output_buckets,
         )
 
 

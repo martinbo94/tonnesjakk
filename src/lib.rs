@@ -178,6 +178,65 @@ fn decode_halfpail_batch(
     Ok((all_w_idx, w_offsets, all_b_idx, b_offsets, dense_flat, labels_out))
 }
 
+/// Generic batch decoder: 164-feature rows -> sparse indices for ANY
+/// architecture the Rust evaluator supports. Feature indices come from the
+/// same `NnueConfig::active_features` the engine uses, so training and
+/// inference can never disagree on the encoding.
+///
+/// Returns (white_indices, white_offsets, black_indices, black_offsets,
+///          dense_flat, output_bucket_per_sample, labels).
+#[pyfunction]
+#[pyo3(signature = (data, labels, feature_set, mirror_black, dense_size, output_buckets))]
+fn decode_sparse_batch(
+    data: Vec<f32>,
+    labels: Vec<f32>,
+    feature_set: &str,
+    mirror_black: bool,
+    dense_size: usize,
+    output_buckets: usize,
+) -> PyResult<(Vec<i64>, Vec<i64>, Vec<i64>, Vec<i64>, Vec<f32>, Vec<i64>, Vec<f32>)> {
+    let n = labels.len();
+    if data.len() != n * 164 {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            format!("Expected {} floats ({}×164), got {}", n * 164, n, data.len())
+        ));
+    }
+    let fs = FeatureSet::from_name(feature_set).ok_or_else(|| {
+        pyo3::exceptions::PyValueError::new_err(format!("unknown feature_set '{}'", feature_set))
+    })?;
+    let config = NnueConfig {
+        feature_set: fs, mirror_black, dense_size, hidden1: 0, hidden2: 0, output_buckets,
+    };
+
+    let mut w_idx: Vec<i64> = Vec::with_capacity(n * 10);
+    let mut b_idx: Vec<i64> = Vec::with_capacity(n * 10);
+    let mut w_off: Vec<i64> = Vec::with_capacity(n);
+    let mut b_off: Vec<i64> = Vec::with_capacity(n);
+    let mut dense_flat: Vec<f32> = Vec::with_capacity(n * dense_size);
+    let mut buckets: Vec<i64> = Vec::with_capacity(n);
+    let mut feats = [0u16; MAX_ACTIVE_FEATURES];
+
+    for i in 0..n {
+        let row = &data[i * 164..(i + 1) * 164];
+        let bb = bitboard_from_dense164(row);
+
+        w_off.push(w_idx.len() as i64);
+        let nw = config.active_features(&bb, Player::White, &mut feats);
+        w_idx.extend(feats[..nw].iter().map(|&f| f as i64));
+
+        b_off.push(b_idx.len() as i64);
+        let nb = config.active_features(&bb, Player::Black, &mut feats);
+        b_idx.extend(feats[..nb].iter().map(|&f| f as i64));
+
+        if dense_size > 0 {
+            dense_flat.extend_from_slice(&row[144..144 + dense_size]);
+        }
+        buckets.push(config.output_bucket(&bb) as i64);
+    }
+
+    Ok((w_idx, w_off, b_idx, b_off, dense_flat, buckets, labels))
+}
+
 /// Python-modul
 #[pymodule]
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -190,6 +249,7 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<SearchResult>()?;
     m.add_function(wrap_pyfunction!(decode_halfpail, m)?)?;
     m.add_function(wrap_pyfunction!(decode_halfpail_batch, m)?)?;
+    m.add_function(wrap_pyfunction!(decode_sparse_batch, m)?)?;
     m.add("BOARD_SIZE", BOARD_SIZE)?;
     m.add("BARRELS_PER_PLAYER", BARRELS_PER_PLAYER)?;
     m.add("POLICY_SIZE", mcts::POLICY_SIZE)?;

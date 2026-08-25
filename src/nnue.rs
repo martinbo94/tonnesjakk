@@ -6,57 +6,205 @@ use crate::board::*;
 /// Maximum supported hidden layer sizes (for fixed-size accumulator arrays)
 pub const MAX_HIDDEN1: usize = 512;
 pub const MAX_HIDDEN2: usize = 128;
-
-// ============================================================================
-// HALFPAIL NNUE - Dual-perspective sparse feature evaluation
-// ============================================================================
-
-/// HalfPail feature constants
-#[allow(dead_code)]
-const HALFPAIL_BUCKETS: usize = 37;    // 36 pail squares + 1 for "no pail"
-pub const HALFPAIL_PIECE_TYPES: usize = 3; // 0=friendly barrel, 1=enemy barrel, 2=enemy pail
-pub const HALFPAIL_FEATURES_PER_BUCKET: usize = NUM_SQUARES * HALFPAIL_PIECE_TYPES; // 108
-#[allow(dead_code)]
-const HALFPAIL_FEATURES: usize = HALFPAIL_BUCKETS * HALFPAIL_FEATURES_PER_BUCKET; // 3996
+/// Dense (relational) feature count when enabled
 pub const HALFPAIL_DENSE: usize = 20;
+/// Upper bound on simultaneously active sparse features per perspective:
+/// 4 own barrels + 4 enemy barrels + 2 pails.
+pub const MAX_ACTIVE_FEATURES: usize = 12;
 
-/// Compute HalfPail feature index
+// ============================================================================
+// FEATURE SETS
+// ============================================================================
+//
+// One generic evaluator, many input encodings. A feature set maps a board
+// (seen from one perspective: "own" vs "opponent" pieces) to a small set of
+// active sparse indices. Everything else — accumulators, incremental updates,
+// the dense stack, JSON loading — is shared, so a new architecture costs one
+// indexing function here plus its mirror in the Python trainer.
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FeatureSet {
+    /// Pail-square buckets: own pail square (36 + "not placed") conditions
+    /// every piece feature (king-bucket analog). 3 piece types per square:
+    /// own barrel, enemy barrel, enemy pail. 37 * 36 * 3 = 3996 features.
+    HalfPail,
+    /// No buckets: 4 piece types per square (own barrel, enemy barrel,
+    /// enemy pail, own pail). 36 * 4 = 144 features.
+    Plain,
+}
+
+impl FeatureSet {
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "halfpail" => Some(FeatureSet::HalfPail),
+            "plain" => Some(FeatureSet::Plain),
+            _ => None,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            FeatureSet::HalfPail => "halfpail",
+            FeatureSet::Plain => "plain",
+        }
+    }
+
+    pub const fn num_features(self) -> usize {
+        match self {
+            FeatureSet::HalfPail => (NUM_SQUARES + 1) * NUM_SQUARES * 3,
+            FeatureSet::Plain => NUM_SQUARES * 4,
+        }
+    }
+}
+
+/// Mirror a square vertically (row r -> BOARD_SIZE-1-r). Used so the black
+/// perspective sees the board in white's orientation and shared weights mean
+/// the same thing for both colors ("own barrel one row from goal").
+#[inline(always)]
+pub const fn mirror_sq(sq: usize) -> usize {
+    (BOARD_SIZE - 1 - sq / BOARD_SIZE) * BOARD_SIZE + sq % BOARD_SIZE
+}
+
+/// HalfPail feature index (kept public: the legacy decoder uses it)
 #[inline(always)]
 pub const fn halfpail_feature_index(bucket: usize, sq: usize, piece_type: usize) -> u16 {
-    (bucket * HALFPAIL_FEATURES_PER_BUCKET + sq * HALFPAIL_PIECE_TYPES + piece_type) as u16
+    (bucket * (NUM_SQUARES * 3) + sq * 3 + piece_type) as u16
 }
 
-/// JSON format for HalfPail NNUE weights
-#[derive(Deserialize)]
-pub(crate) struct HalfPailWeights {
-    fc1_weight: Vec<Vec<f32>>,  // [num_perspective_features][hidden1] - shared embedding
-    fc1_bias: Vec<f32>,          // [hidden1]
-    fc2_weight: Vec<Vec<f32>>,  // [hidden2][2*hidden1 + dense_size]
-    fc2_bias: Vec<f32>,          // [hidden2]
-    fc3_weight: Vec<Vec<f32>>,  // [1][hidden2]
-    fc3_bias: Vec<f32>,          // [1]
+/// Architecture description shared by the Rust evaluator, the training-data
+/// decoder, and the Python trainer (via JSON).
+#[derive(Clone, Copy, Debug)]
+pub struct NnueConfig {
+    pub feature_set: FeatureSet,
+    /// Black perspective sees a vertically mirrored board.
+    pub mirror_black: bool,
+    /// 0 or HALFPAIL_DENSE relational features appended before FC2.
+    pub dense_size: usize,
+    pub hidden1: usize,
+    pub hidden2: usize,
+    /// 1, or 25 = separate output head per (white_scored, black_scored).
+    pub output_buckets: usize,
 }
 
-#[derive(Deserialize)]
-pub(crate) struct HalfPailJson {
-    #[allow(dead_code)]
-    halfpail: bool,
-    hidden1: usize,
-    hidden2: usize,
-    num_perspective_features: usize,
-    #[allow(dead_code)]
-    dense_size: usize,
-    weights: HalfPailWeights,
+impl NnueConfig {
+    /// Active sparse features for one perspective. Returns the count written
+    /// into `out`.
+    pub fn active_features(&self, bb: &BitBoard, persp: Player, out: &mut [u16; MAX_ACTIVE_FEATURES]) -> usize {
+        let (own_b, opp_b, own_p, opp_p) = match persp {
+            Player::White => (bb.white_barrels, bb.black_barrels, bb.white_pail, bb.black_pail),
+            Player::Black => (bb.black_barrels, bb.white_barrels, bb.black_pail, bb.white_pail),
+        };
+        let flip = self.mirror_black && persp == Player::Black;
+        let tf = |sq: usize| if flip { mirror_sq(sq) } else { sq };
+
+        let mut n = 0usize;
+        match self.feature_set {
+            FeatureSet::HalfPail => {
+                let bucket = if own_p != 0 { tf(own_p.trailing_zeros() as usize) } else { NUM_SQUARES };
+                let mut m = own_b;
+                while m != 0 {
+                    out[n] = halfpail_feature_index(bucket, tf(m.trailing_zeros() as usize), 0);
+                    n += 1;
+                    m &= m - 1;
+                }
+                m = opp_b;
+                while m != 0 {
+                    out[n] = halfpail_feature_index(bucket, tf(m.trailing_zeros() as usize), 1);
+                    n += 1;
+                    m &= m - 1;
+                }
+                if opp_p != 0 {
+                    out[n] = halfpail_feature_index(bucket, tf(opp_p.trailing_zeros() as usize), 2);
+                    n += 1;
+                }
+            }
+            FeatureSet::Plain => {
+                let mut m = own_b;
+                while m != 0 {
+                    out[n] = (tf(m.trailing_zeros() as usize) * 4) as u16;
+                    n += 1;
+                    m &= m - 1;
+                }
+                m = opp_b;
+                while m != 0 {
+                    out[n] = (tf(m.trailing_zeros() as usize) * 4 + 1) as u16;
+                    n += 1;
+                    m &= m - 1;
+                }
+                if opp_p != 0 {
+                    out[n] = (tf(opp_p.trailing_zeros() as usize) * 4 + 2) as u16;
+                    n += 1;
+                }
+                if own_p != 0 {
+                    out[n] = (tf(own_p.trailing_zeros() as usize) * 4 + 3) as u16;
+                    n += 1;
+                }
+            }
+        }
+        n
+    }
+
+    /// Output head index for a position.
+    #[inline]
+    pub fn output_bucket(&self, bb: &BitBoard) -> usize {
+        if self.output_buckets >= 25 {
+            (bb.white_scored as usize) * 5 + bb.black_scored as usize
+        } else {
+            0
+        }
+    }
+
+    /// Does this perspective's feature bucket change between two positions
+    /// (HalfPail: own pail placed)? Then a full recompute beats a diff.
+    #[inline]
+    fn bucket_changed(&self, before: &BitBoard, after: &BitBoard, persp: Player) -> bool {
+        if self.feature_set != FeatureSet::HalfPail {
+            return false;
+        }
+        let (b, a) = match persp {
+            Player::White => (before.white_pail, after.white_pail),
+            Player::Black => (before.black_pail, after.black_pail),
+        };
+        b != a
+    }
+}
+
+/// Rebuild a BitBoard from the 164-float training row (144 one-hot piece
+/// planes + 20 relational features). Used by the training-data decoder so
+/// feature indices come from the exact same code the engine evaluates with.
+pub fn bitboard_from_dense164(row: &[f32]) -> BitBoard {
+    let mut bb = BitBoard::new();
+    bb.white_barrels = 0;
+    bb.black_barrels = 0;
+    for sq in 0..NUM_SQUARES {
+        let base = sq * 4;
+        if row[base] > 0.5 { bb.white_barrels |= 1u64 << sq; }
+        if row[base + 1] > 0.5 { bb.black_barrels |= 1u64 << sq; }
+        if row[base + 2] > 0.5 { bb.white_pail = 1u64 << sq; }
+        if row[base + 3] > 0.5 { bb.black_pail = 1u64 << sq; }
+    }
+    bb.occupied = bb.white_barrels | bb.black_barrels | bb.white_pail | bb.black_pail;
+    bb.white_pail_placed = bb.white_pail != 0;
+    bb.black_pail_placed = bb.black_pail != 0;
+    let rel = &row[144..];
+    bb.white_scored = (rel[8] * 4.0).round() as u8;
+    bb.black_scored = (rel[9] * 4.0).round() as u8;
+    bb.current_player = if rel[12] < 0.0 { Player::Black } else { Player::White };
+    let w_on = bb.white_barrels.count_ones() as u8;
+    let b_on = bb.black_barrels.count_ones() as u8;
+    bb.white_barrels_off_board = (BARRELS_PER_PLAYER as u8).saturating_sub(w_on + bb.white_scored);
+    bb.black_barrels_off_board = (BARRELS_PER_PLAYER as u8).saturating_sub(b_on + bb.black_scored);
+    bb
 }
 
 // ============================================================================
-// DENSE FEATURES - 20 relational features used by HalfPail
+// DENSE FEATURES - 20 relational features
 // ============================================================================
 
 /// Compute 20 relational/dense features from a BitBoard position.
 ///
-/// These are the same features as the legacy NNUE training data
-/// (features 144-163 of the 164-feature encoding):
+/// These are the same features as the training data (features 144-163 of the
+/// 164-feature encoding):
 ///   [0-3]   White barrel distances to goal (sorted, normalized /5)
 ///   [4-7]   Black barrel distances to goal (sorted, normalized /5)
 ///   [8-9]   White/black scored barrels (/4)
@@ -186,18 +334,11 @@ pub fn compute_relational_features(bb: &BitBoard) -> [f32; HALFPAIL_DENSE] {
 // DUAL ACCUMULATOR - Stack-based caching for search tree
 // ============================================================================
 
-/// Represents a change in HalfPail features for one perspective
-#[derive(Clone, Copy, Debug)]
-pub struct HalfPailDelta {
-    pub index: u16,   // 0-3995: which perspective feature
-    pub delta: i8,    // +1 (added) or -1 (removed)
-}
-
-/// Dual-perspective accumulator for HalfPail NNUE
+/// Dual-perspective accumulator (pre-activation first-layer sums)
 #[derive(Clone)]
 pub struct DualAccumulator {
-    pub white_pre: [f32; MAX_HIDDEN1],  // White perspective pre-activation
-    pub black_pre: [f32; MAX_HIDDEN1],  // Black perspective pre-activation
+    pub white_pre: [f32; MAX_HIDDEN1],
+    pub black_pre: [f32; MAX_HIDDEN1],
 }
 
 impl Default for DualAccumulator {
@@ -251,6 +392,7 @@ impl DualAccumulatorStack {
         &mut self.accumulators[self.depth]
     }
 
+    /// Push a copy of the current accumulator (child inherits parent's state).
     #[inline]
     pub fn push(&mut self) {
         if self.depth + 1 < MAX_DEPTH {
@@ -274,459 +416,309 @@ impl DualAccumulatorStack {
 }
 
 // ============================================================================
-// HALFPAIL NNUE EVALUATOR
+// SPARSE NNUE EVALUATOR (generic over feature set)
 // ============================================================================
 
-/// HalfPail NNUE evaluator
-///
 /// Architecture:
-///   White sparse -> EmbeddingBag(3996, H1) + bias -> ReLU -> acc_white
-///   Black sparse -> EmbeddingBag(3996, H1) + bias -> ReLU -> acc_black
-///                       (shared weights)
-///   concat(acc_white, acc_black, dense_20) -> FC2 -> ReLU -> FC3 -> Tanh
-pub struct HalfPailNNUE {
-    /// FC1 transposed weights: [HALFPAIL_FEATURES * hidden1]
+///   own-perspective sparse -> Embedding(F, H1) + bias -> ReLU -> acc_white
+///   opp-perspective sparse -> Embedding(F, H1) + bias -> ReLU -> acc_black
+///                              (shared weights; black optionally mirrored)
+///   concat(acc_white, acc_black[, dense]) -> FC2[bucket] -> ReLU -> FC3[bucket] -> tanh
+pub struct SparseNNUE {
+    pub config: NnueConfig,
+    /// [num_features * hidden1]
     fc1_weight_t: Vec<f32>,
-    /// FC1 bias: [hidden1]
-    pub(crate) fc1_bias: Vec<f32>,
-    /// FC2 weights: [hidden2 * (2*hidden1 + HALFPAIL_DENSE)]
+    /// [hidden1]
+    fc1_bias: Vec<f32>,
+    /// [buckets * hidden2 * fc2_input]
     fc2_weight: Vec<f32>,
-    /// FC2 bias: [hidden2]
+    /// [buckets * hidden2]
     fc2_bias: Vec<f32>,
-    /// FC3 weights: [hidden2]
+    /// [buckets * hidden2]
     fc3_weight: Vec<f32>,
-    /// FC3 bias: scalar
-    fc3_bias: f32,
-    pub(crate) hidden1: usize,
-    hidden2: usize,
+    /// [buckets]
+    fc3_bias: Vec<f32>,
 }
 
-impl HalfPailNNUE {
-    /// Load from parsed JSON
-    pub(crate) fn from_json(json: HalfPailJson) -> Result<Self, Box<dyn std::error::Error>> {
-        let hidden1 = json.hidden1;
-        let hidden2 = json.hidden2;
-        let num_features = json.num_perspective_features;
+// ─── JSON formats ───
 
-        // fc1_weight comes as [num_features][hidden1], transpose to [num_features * hidden1]
-        let mut fc1_weight_t = vec![0.0f32; num_features * hidden1];
-        for (feat, row) in json.weights.fc1_weight.iter().enumerate() {
-            for (neuron, &w) in row.iter().enumerate() {
-                fc1_weight_t[feat * hidden1 + neuron] = w;
-            }
+/// Legacy HalfPail export (single output head, 20 dense, no mirroring).
+#[derive(Deserialize)]
+struct LegacyWeights {
+    fc1_weight: Vec<Vec<f32>>,
+    fc1_bias: Vec<f32>,
+    fc2_weight: Vec<Vec<f32>>,
+    fc2_bias: Vec<f32>,
+    fc3_weight: Vec<Vec<f32>>,
+    fc3_bias: Vec<f32>,
+}
+
+#[derive(Deserialize)]
+struct LegacyHalfPailJson {
+    #[allow(dead_code)]
+    halfpail: bool,
+    hidden1: usize,
+    hidden2: usize,
+    #[allow(dead_code)]
+    num_perspective_features: usize,
+    #[allow(dead_code)]
+    dense_size: usize,
+    weights: LegacyWeights,
+}
+
+/// Generic v2 export: `"format": "sparse_nnue_v2"`.
+#[derive(Deserialize)]
+struct V2Weights {
+    fc1_weight: Vec<Vec<f32>>,       // [F][H1]
+    fc1_bias: Vec<f32>,              // [H1]
+    fc2_weight: Vec<Vec<Vec<f32>>>,  // [B][H2][2*H1 + dense]
+    fc2_bias: Vec<Vec<f32>>,         // [B][H2]
+    fc3_weight: Vec<Vec<f32>>,       // [B][H2]
+    fc3_bias: Vec<f32>,              // [B]
+}
+
+#[derive(Deserialize)]
+struct SparseJsonV2 {
+    #[allow(dead_code)]
+    format: String,
+    feature_set: String,
+    mirror_black: bool,
+    dense_size: usize,
+    hidden1: usize,
+    hidden2: usize,
+    output_buckets: usize,
+    weights: V2Weights,
+}
+
+impl SparseNNUE {
+    pub fn load(path: &str) -> Result<Self, Box<dyn std::error::Error>> {
+        let json_str = std::fs::read_to_string(path)?;
+        Self::from_json_str(&json_str)
+    }
+
+    pub fn from_json_str(json_str: &str) -> Result<Self, Box<dyn std::error::Error>> {
+        if let Ok(v2) = serde_json::from_str::<SparseJsonV2>(json_str) {
+            return Self::from_v2(v2);
         }
+        let legacy: LegacyHalfPailJson = serde_json::from_str(json_str)?;
+        Self::from_legacy(legacy)
+    }
 
-        // FC2: flatten [hidden2][fc2_input_size]
-        let fc2_weight: Vec<f32> = json.weights.fc2_weight.into_iter().flatten().collect();
-        let fc3_weight: Vec<f32> = json.weights.fc3_weight.into_iter().flatten().collect();
-
+    fn from_v2(j: SparseJsonV2) -> Result<Self, Box<dyn std::error::Error>> {
+        let feature_set = FeatureSet::from_name(&j.feature_set)
+            .ok_or_else(|| format!("unknown feature_set '{}'", j.feature_set))?;
+        let config = NnueConfig {
+            feature_set,
+            mirror_black: j.mirror_black,
+            dense_size: j.dense_size,
+            hidden1: j.hidden1,
+            hidden2: j.hidden2,
+            output_buckets: j.output_buckets.max(1),
+        };
+        Self::validate(&config)?;
+        if j.weights.fc1_weight.len() != feature_set.num_features() {
+            return Err(format!(
+                "fc1_weight has {} rows, feature set {} needs {}",
+                j.weights.fc1_weight.len(), feature_set.name(), feature_set.num_features()
+            ).into());
+        }
+        let fc1_weight_t = transpose_embedding(&j.weights.fc1_weight, config.hidden1);
         Ok(Self {
+            config,
             fc1_weight_t,
-            fc1_bias: json.weights.fc1_bias,
-            fc2_weight,
-            fc2_bias: json.weights.fc2_bias,
-            fc3_weight,
-            fc3_bias: json.weights.fc3_bias[0],
-            hidden1,
-            hidden2,
+            fc1_bias: j.weights.fc1_bias,
+            fc2_weight: j.weights.fc2_weight.into_iter().flatten().flatten().collect(),
+            fc2_bias: j.weights.fc2_bias.into_iter().flatten().collect(),
+            fc3_weight: j.weights.fc3_weight.into_iter().flatten().collect(),
+            fc3_bias: j.weights.fc3_bias,
         })
     }
 
-    /// Add one sparse feature to an accumulator (SIMD)
-    #[inline]
-    pub(crate) fn add_feature(&self, acc: &mut [f32; MAX_HIDDEN1], feat: usize) {
-        let hidden1 = self.hidden1;
-        let base_idx = feat * hidden1;
-        let mut i = 0;
+    fn from_legacy(j: LegacyHalfPailJson) -> Result<Self, Box<dyn std::error::Error>> {
+        let config = NnueConfig {
+            feature_set: FeatureSet::HalfPail,
+            mirror_black: false,
+            dense_size: HALFPAIL_DENSE,
+            hidden1: j.hidden1,
+            hidden2: j.hidden2,
+            output_buckets: 1,
+        };
+        Self::validate(&config)?;
+        let fc1_weight_t = transpose_embedding(&j.weights.fc1_weight, config.hidden1);
+        Ok(Self {
+            config,
+            fc1_weight_t,
+            fc1_bias: j.weights.fc1_bias,
+            fc2_weight: j.weights.fc2_weight.into_iter().flatten().collect(),
+            fc2_bias: j.weights.fc2_bias,
+            fc3_weight: j.weights.fc3_weight.into_iter().flatten().collect(),
+            fc3_bias: j.weights.fc3_bias,
+        })
+    }
 
-        while i + 8 <= hidden1 {
-            let acc_vec = f32x8::new([
-                acc[i], acc[i+1], acc[i+2], acc[i+3],
-                acc[i+4], acc[i+5], acc[i+6], acc[i+7],
-            ]);
-            let wt_vec = f32x8::new([
-                self.fc1_weight_t[base_idx+i], self.fc1_weight_t[base_idx+i+1],
-                self.fc1_weight_t[base_idx+i+2], self.fc1_weight_t[base_idx+i+3],
-                self.fc1_weight_t[base_idx+i+4], self.fc1_weight_t[base_idx+i+5],
-                self.fc1_weight_t[base_idx+i+6], self.fc1_weight_t[base_idx+i+7],
-            ]);
-            let result = acc_vec + wt_vec;
-            let arr = result.to_array();
-            acc[i] = arr[0]; acc[i+1] = arr[1]; acc[i+2] = arr[2]; acc[i+3] = arr[3];
-            acc[i+4] = arr[4]; acc[i+5] = arr[5]; acc[i+6] = arr[6]; acc[i+7] = arr[7];
-            i += 8;
+    fn validate(c: &NnueConfig) -> Result<(), Box<dyn std::error::Error>> {
+        if c.hidden1 > MAX_HIDDEN1 || c.hidden1 % 8 != 0 {
+            return Err(format!("hidden1 must be a multiple of 8 and <= {}", MAX_HIDDEN1).into());
+        }
+        if c.hidden2 > MAX_HIDDEN2 || c.hidden2 % 8 != 0 {
+            return Err(format!("hidden2 must be a multiple of 8 and <= {}", MAX_HIDDEN2).into());
+        }
+        if c.dense_size != 0 && c.dense_size != HALFPAIL_DENSE {
+            return Err(format!("dense_size must be 0 or {}", HALFPAIL_DENSE).into());
+        }
+        if c.output_buckets != 1 && c.output_buckets != 25 {
+            return Err("output_buckets must be 1 or 25".into());
+        }
+        Ok(())
+    }
+
+    /// Test/benchmark helper: deterministic pseudo-random weights.
+    pub fn random(config: NnueConfig, seed: u64) -> Self {
+        let mut state = seed.wrapping_mul(0x9E3779B97F4A7C15) | 1;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            ((state >> 11) as f64 / (1u64 << 53) as f64) as f32 * 0.2 - 0.1
+        };
+        let f = config.feature_set.num_features();
+        let fc2_in = 2 * config.hidden1 + config.dense_size;
+        let b = config.output_buckets;
+        Self {
+            config,
+            fc1_weight_t: (0..f * config.hidden1).map(|_| next()).collect(),
+            fc1_bias: (0..config.hidden1).map(|_| next()).collect(),
+            fc2_weight: (0..b * config.hidden2 * fc2_in).map(|_| next()).collect(),
+            fc2_bias: (0..b * config.hidden2).map(|_| next()).collect(),
+            fc3_weight: (0..b * config.hidden2).map(|_| next()).collect(),
+            fc3_bias: (0..b).map(|_| next()).collect(),
         }
     }
 
-    /// Remove one sparse feature from an accumulator (SIMD)
+    #[inline]
+    fn add_feature(&self, acc: &mut [f32; MAX_HIDDEN1], feat: usize) {
+        let h = self.config.hidden1;
+        let w = &self.fc1_weight_t[feat * h..(feat + 1) * h];
+        for (a, wc) in acc[..h].chunks_exact_mut(8).zip(w.chunks_exact(8)) {
+            let r = f32x8::from(<[f32; 8]>::try_from(&*a).unwrap()) + f32x8::from(<[f32; 8]>::try_from(wc).unwrap());
+            a.copy_from_slice(&r.to_array());
+        }
+    }
+
     #[inline]
     fn remove_feature(&self, acc: &mut [f32; MAX_HIDDEN1], feat: usize) {
-        let hidden1 = self.hidden1;
-        let base_idx = feat * hidden1;
-        let mut i = 0;
-
-        while i + 8 <= hidden1 {
-            let acc_vec = f32x8::new([
-                acc[i], acc[i+1], acc[i+2], acc[i+3],
-                acc[i+4], acc[i+5], acc[i+6], acc[i+7],
-            ]);
-            let wt_vec = f32x8::new([
-                self.fc1_weight_t[base_idx+i], self.fc1_weight_t[base_idx+i+1],
-                self.fc1_weight_t[base_idx+i+2], self.fc1_weight_t[base_idx+i+3],
-                self.fc1_weight_t[base_idx+i+4], self.fc1_weight_t[base_idx+i+5],
-                self.fc1_weight_t[base_idx+i+6], self.fc1_weight_t[base_idx+i+7],
-            ]);
-            let result = acc_vec - wt_vec;
-            let arr = result.to_array();
-            acc[i] = arr[0]; acc[i+1] = arr[1]; acc[i+2] = arr[2]; acc[i+3] = arr[3];
-            acc[i+4] = arr[4]; acc[i+5] = arr[5]; acc[i+6] = arr[6]; acc[i+7] = arr[7];
-            i += 8;
+        let h = self.config.hidden1;
+        let w = &self.fc1_weight_t[feat * h..(feat + 1) * h];
+        for (a, wc) in acc[..h].chunks_exact_mut(8).zip(w.chunks_exact(8)) {
+            let r = f32x8::from(<[f32; 8]>::try_from(&*a).unwrap()) - f32x8::from(<[f32; 8]>::try_from(wc).unwrap());
+            a.copy_from_slice(&r.to_array());
         }
     }
 
-    /// Initialize both perspectives from scratch for a position
-    pub fn init_accumulators(&self, bb: &BitBoard, dual_acc: &mut DualAccumulator) {
-        // Reset to bias
-        for i in 0..self.hidden1 {
-            dual_acc.white_pre[i] = self.fc1_bias[i];
-            dual_acc.black_pre[i] = self.fc1_bias[i];
-        }
-
-        let w_bucket = if bb.white_pail != 0 {
-            bb.white_pail.trailing_zeros() as usize
-        } else {
-            36 // no pail placed
-        };
-        let b_bucket = if bb.black_pail != 0 {
-            bb.black_pail.trailing_zeros() as usize
-        } else {
-            36
-        };
-
-        // White barrels: friendly for white perspective, enemy for black
-        let mut barrels = bb.white_barrels;
-        while barrels != 0 {
-            let sq = barrels.trailing_zeros() as usize;
-            self.add_feature(&mut dual_acc.white_pre,
-                halfpail_feature_index(w_bucket, sq, 0) as usize);  // friendly
-            self.add_feature(&mut dual_acc.black_pre,
-                halfpail_feature_index(b_bucket, sq, 1) as usize);  // enemy
-            barrels &= barrels - 1;
-        }
-
-        // Black barrels: enemy for white perspective, friendly for black
-        barrels = bb.black_barrels;
-        while barrels != 0 {
-            let sq = barrels.trailing_zeros() as usize;
-            self.add_feature(&mut dual_acc.white_pre,
-                halfpail_feature_index(w_bucket, sq, 1) as usize);  // enemy
-            self.add_feature(&mut dual_acc.black_pre,
-                halfpail_feature_index(b_bucket, sq, 0) as usize);  // friendly
-            barrels &= barrels - 1;
-        }
-
-        // White pail: enemy pail for black perspective (not in white's own perspective)
-        if bb.white_pail != 0 {
-            let sq = bb.white_pail.trailing_zeros() as usize;
-            self.add_feature(&mut dual_acc.black_pre,
-                halfpail_feature_index(b_bucket, sq, 2) as usize);  // enemy pail
-        }
-
-        // Black pail: enemy pail for white perspective (not in black's own perspective)
-        if bb.black_pail != 0 {
-            let sq = bb.black_pail.trailing_zeros() as usize;
-            self.add_feature(&mut dual_acc.white_pre,
-                halfpail_feature_index(w_bucket, sq, 2) as usize);  // enemy pail
+    fn init_perspective(&self, bb: &BitBoard, persp: Player, acc: &mut [f32; MAX_HIDDEN1]) {
+        let h = self.config.hidden1;
+        acc[..h].copy_from_slice(&self.fc1_bias[..h]);
+        let mut feats = [0u16; MAX_ACTIVE_FEATURES];
+        let n = self.config.active_features(bb, persp, &mut feats);
+        for &f in &feats[..n] {
+            self.add_feature(acc, f as usize);
         }
     }
 
-    /// Compute feature deltas for a move, returns (white_deltas, black_deltas, white_recompute, black_recompute)
-    ///
-    /// When a player places their pail, their own perspective needs full recompute
-    /// (the bucket changes from 36 to the pail square).
-    pub fn compute_move_deltas(
-        &self,
-        bb: &BitBoard,
-        mv: &BitMove,
-    ) -> (Vec<HalfPailDelta>, Vec<HalfPailDelta>, bool, bool) {
-        let player = bb.current_player;
-        let mut white_deltas = Vec::with_capacity(8);
-        let mut black_deltas = Vec::with_capacity(8);
-        let mut white_recompute = false;
-        let mut black_recompute = false;
-
-        // Current buckets
-        let w_bucket = if bb.white_pail != 0 {
-            bb.white_pail.trailing_zeros() as usize
-        } else { 36 };
-        let b_bucket = if bb.black_pail != 0 {
-            bb.black_pail.trailing_zeros() as usize
-        } else { 36 };
-
-        // 1. Handle pail placement
-        if let Some(pail_sq) = mv.pail_pos() {
-            let pail_sq = pail_sq as usize;
-            match player {
-                Player::White => {
-                    white_recompute = true;
-                    black_deltas.push(HalfPailDelta {
-                        index: halfpail_feature_index(b_bucket, pail_sq, 2),
-                        delta: 1,
-                    });
-                }
-                Player::Black => {
-                    black_recompute = true;
-                    white_deltas.push(HalfPailDelta {
-                        index: halfpail_feature_index(w_bucket, pail_sq, 2),
-                        delta: 1,
-                    });
-                }
-            }
-        }
-
-        let w_bucket_for_deltas = w_bucket;
-        let b_bucket_for_deltas = b_bucket;
-
-        // 2. Handle barrel movement
-        if mv.is_placement() {
-            let to_sq = mv.barrel_to() as usize;
-            let goal_row = bb.goal_row(player);
-            let (to_row, _) = sq_to_coords(to_sq);
-
-            if to_row != goal_row {
-                match player {
-                    Player::White => {
-                        if !white_recompute {
-                            white_deltas.push(HalfPailDelta {
-                                index: halfpail_feature_index(w_bucket_for_deltas, to_sq, 0),
-                                delta: 1,
-                            });
-                        }
-                        if !black_recompute {
-                            black_deltas.push(HalfPailDelta {
-                                index: halfpail_feature_index(b_bucket_for_deltas, to_sq, 1),
-                                delta: 1,
-                            });
-                        }
-                    }
-                    Player::Black => {
-                        if !white_recompute {
-                            white_deltas.push(HalfPailDelta {
-                                index: halfpail_feature_index(w_bucket_for_deltas, to_sq, 1),
-                                delta: 1,
-                            });
-                        }
-                        if !black_recompute {
-                            black_deltas.push(HalfPailDelta {
-                                index: halfpail_feature_index(b_bucket_for_deltas, to_sq, 0),
-                                delta: 1,
-                            });
-                        }
-                    }
-                }
-            }
-        } else {
-            // Regular barrel move
-            let from_sq = mv.barrel_from().unwrap() as usize;
-            let to_sq = mv.barrel_to() as usize;
-            let goal_row = bb.goal_row(player);
-            let (to_row, _) = sq_to_coords(to_sq);
-
-            match player {
-                Player::White => {
-                    if !white_recompute {
-                        white_deltas.push(HalfPailDelta {
-                            index: halfpail_feature_index(w_bucket_for_deltas, from_sq, 0),
-                            delta: -1,
-                        });
-                    }
-                    if !black_recompute {
-                        black_deltas.push(HalfPailDelta {
-                            index: halfpail_feature_index(b_bucket_for_deltas, from_sq, 1),
-                            delta: -1,
-                        });
-                    }
-                    if to_row != goal_row {
-                        if !white_recompute {
-                            white_deltas.push(HalfPailDelta {
-                                index: halfpail_feature_index(w_bucket_for_deltas, to_sq, 0),
-                                delta: 1,
-                            });
-                        }
-                        if !black_recompute {
-                            black_deltas.push(HalfPailDelta {
-                                index: halfpail_feature_index(b_bucket_for_deltas, to_sq, 1),
-                                delta: 1,
-                            });
-                        }
-                    }
-                }
-                Player::Black => {
-                    if !white_recompute {
-                        white_deltas.push(HalfPailDelta {
-                            index: halfpail_feature_index(w_bucket_for_deltas, from_sq, 1),
-                            delta: -1,
-                        });
-                    }
-                    if !black_recompute {
-                        black_deltas.push(HalfPailDelta {
-                            index: halfpail_feature_index(b_bucket_for_deltas, from_sq, 0),
-                            delta: -1,
-                        });
-                    }
-                    if to_row != goal_row {
-                        if !white_recompute {
-                            white_deltas.push(HalfPailDelta {
-                                index: halfpail_feature_index(w_bucket_for_deltas, to_sq, 1),
-                                delta: 1,
-                            });
-                        }
-                        if !black_recompute {
-                            black_deltas.push(HalfPailDelta {
-                                index: halfpail_feature_index(b_bucket_for_deltas, to_sq, 0),
-                                delta: 1,
-                            });
-                        }
-                    }
-                }
-            }
-        }
-
-        (white_deltas, black_deltas, white_recompute, black_recompute)
+    /// Initialize both perspectives from scratch.
+    pub fn init_accumulators(&self, bb: &BitBoard, acc: &mut DualAccumulator) {
+        self.init_perspective(bb, Player::White, &mut acc.white_pre);
+        self.init_perspective(bb, Player::Black, &mut acc.black_pre);
     }
 
-    /// Apply deltas to one perspective accumulator
-    #[inline]
-    pub fn apply_deltas(&self, acc: &mut [f32; MAX_HIDDEN1], deltas: &[HalfPailDelta]) {
-        for d in deltas {
-            let feat = d.index as usize;
-            if d.delta > 0 {
-                self.add_feature(acc, feat);
-            } else {
-                self.remove_feature(acc, feat);
+    /// Incrementally update `acc` (holding `before`'s state) to `after`.
+    /// Generic diff of active feature sets — correct for any feature set with
+    /// no per-move special cases. Falls back to a full recompute of a
+    /// perspective when its bucket changed.
+    pub fn update(&self, before: &BitBoard, after: &BitBoard, acc: &mut DualAccumulator) {
+        for persp in [Player::White, Player::Black] {
+            let target = match persp {
+                Player::White => &mut acc.white_pre,
+                Player::Black => &mut acc.black_pre,
+            };
+            if self.config.bucket_changed(before, after, persp) {
+                self.init_perspective(after, persp, target);
+                continue;
+            }
+            let mut fb = [0u16; MAX_ACTIVE_FEATURES];
+            let mut fa = [0u16; MAX_ACTIVE_FEATURES];
+            let nb = self.config.active_features(before, persp, &mut fb);
+            let na = self.config.active_features(after, persp, &mut fa);
+            for &f in &fb[..nb] {
+                if !fa[..na].contains(&f) {
+                    self.remove_feature(target, f as usize);
+                }
+            }
+            for &f in &fa[..na] {
+                if !fb[..nb].contains(&f) {
+                    self.add_feature(target, f as usize);
+                }
             }
         }
     }
 
-    /// Evaluate from dual accumulator: apply ReLU, concat, FC2, FC3, tanh
-    /// Returns centipawn score
-    pub fn evaluate_from_dual_acc(&self, bb: &BitBoard, dual_acc: &DualAccumulator) -> i32 {
-        let hidden1 = self.hidden1;
-        let fc2_input_size = 2 * hidden1 + HALFPAIL_DENSE;
+    /// Evaluate from accumulator: ReLU, concat(+dense), FC2[bucket], ReLU,
+    /// FC3[bucket], tanh -> centipawns (White perspective).
+    pub fn evaluate(&self, bb: &BitBoard, acc: &DualAccumulator) -> i32 {
+        let h1 = self.config.hidden1;
+        let h2 = self.config.hidden2;
+        let dense_size = self.config.dense_size;
+        let fc2_in = 2 * h1 + dense_size;
+        let bucket = self.config.output_bucket(bb);
 
-        // Apply ReLU to both perspectives
-        let mut white_post = [0.0f32; MAX_HIDDEN1];
-        let mut black_post = [0.0f32; MAX_HIDDEN1];
-        {
-            let zero = f32x8::ZERO;
-            let mut i = 0;
-            while i + 8 <= hidden1 {
-                let w_vec = f32x8::new([
-                    dual_acc.white_pre[i], dual_acc.white_pre[i+1],
-                    dual_acc.white_pre[i+2], dual_acc.white_pre[i+3],
-                    dual_acc.white_pre[i+4], dual_acc.white_pre[i+5],
-                    dual_acc.white_pre[i+6], dual_acc.white_pre[i+7],
-                ]);
-                let b_vec = f32x8::new([
-                    dual_acc.black_pre[i], dual_acc.black_pre[i+1],
-                    dual_acc.black_pre[i+2], dual_acc.black_pre[i+3],
-                    dual_acc.black_pre[i+4], dual_acc.black_pre[i+5],
-                    dual_acc.black_pre[i+6], dual_acc.black_pre[i+7],
-                ]);
-                let w_relu = w_vec.max(zero);
-                let b_relu = b_vec.max(zero);
-                let w_arr = w_relu.to_array();
-                let b_arr = b_relu.to_array();
-                for k in 0..8 {
-                    white_post[i+k] = w_arr[k];
-                    black_post[i+k] = b_arr[k];
-                }
-                i += 8;
-            }
-        }
+        let zero = f32x8::ZERO;
+        let dense = if dense_size > 0 { compute_relational_features(bb) } else { [0.0f32; HALFPAIL_DENSE] };
 
-        // Compute dense features
-        let dense = compute_relational_features(bb);
-
-        // FC2: dot product over concat(white_post, black_post, dense)
-        let mut hidden2 = [0.0f32; MAX_HIDDEN2];
-        for neuron in 0..self.hidden2 {
-            let wt_base = neuron * fc2_input_size;
-            let mut sum = self.fc2_bias[neuron];
-
-            // White perspective part (SIMD)
+        let mut hidden = [0.0f32; MAX_HIDDEN2];
+        let fc2_w = &self.fc2_weight[bucket * h2 * fc2_in..(bucket + 1) * h2 * fc2_in];
+        let fc2_b = &self.fc2_bias[bucket * h2..(bucket + 1) * h2];
+        for neuron in 0..h2 {
+            let w = &fc2_w[neuron * fc2_in..(neuron + 1) * fc2_in];
             let mut sum_vec = f32x8::ZERO;
-            let mut j = 0;
-            while j + 8 <= hidden1 {
-                let input_vec = f32x8::new([
-                    white_post[j], white_post[j+1], white_post[j+2], white_post[j+3],
-                    white_post[j+4], white_post[j+5], white_post[j+6], white_post[j+7],
-                ]);
-                let wt_vec = f32x8::new([
-                    self.fc2_weight[wt_base+j], self.fc2_weight[wt_base+j+1],
-                    self.fc2_weight[wt_base+j+2], self.fc2_weight[wt_base+j+3],
-                    self.fc2_weight[wt_base+j+4], self.fc2_weight[wt_base+j+5],
-                    self.fc2_weight[wt_base+j+6], self.fc2_weight[wt_base+j+7],
-                ]);
-                sum_vec = sum_vec + input_vec * wt_vec;
-                j += 8;
+            for (a, wc) in acc.white_pre[..h1].chunks_exact(8).zip(w[..h1].chunks_exact(8)) {
+                let av = f32x8::from(<[f32; 8]>::try_from(a).unwrap()).max(zero);
+                sum_vec += av * f32x8::from(<[f32; 8]>::try_from(wc).unwrap());
             }
-            let arr = sum_vec.to_array();
-            sum += arr[0]+arr[1]+arr[2]+arr[3]+arr[4]+arr[5]+arr[6]+arr[7];
-
-            // Black perspective part (SIMD)
-            let black_offset = hidden1;
-            sum_vec = f32x8::ZERO;
-            j = 0;
-            while j + 8 <= hidden1 {
-                let input_vec = f32x8::new([
-                    black_post[j], black_post[j+1], black_post[j+2], black_post[j+3],
-                    black_post[j+4], black_post[j+5], black_post[j+6], black_post[j+7],
-                ]);
-                let wt_vec = f32x8::new([
-                    self.fc2_weight[wt_base+black_offset+j], self.fc2_weight[wt_base+black_offset+j+1],
-                    self.fc2_weight[wt_base+black_offset+j+2], self.fc2_weight[wt_base+black_offset+j+3],
-                    self.fc2_weight[wt_base+black_offset+j+4], self.fc2_weight[wt_base+black_offset+j+5],
-                    self.fc2_weight[wt_base+black_offset+j+6], self.fc2_weight[wt_base+black_offset+j+7],
-                ]);
-                sum_vec = sum_vec + input_vec * wt_vec;
-                j += 8;
+            for (a, wc) in acc.black_pre[..h1].chunks_exact(8).zip(w[h1..2 * h1].chunks_exact(8)) {
+                let av = f32x8::from(<[f32; 8]>::try_from(a).unwrap()).max(zero);
+                sum_vec += av * f32x8::from(<[f32; 8]>::try_from(wc).unwrap());
             }
-            let arr = sum_vec.to_array();
-            sum += arr[0]+arr[1]+arr[2]+arr[3]+arr[4]+arr[5]+arr[6]+arr[7];
-
-            // Dense part (20 values, scalar loop)
-            let dense_offset = 2 * hidden1;
-            for k in 0..HALFPAIL_DENSE {
-                sum += dense[k] * self.fc2_weight[wt_base + dense_offset + k];
+            let mut sum = fc2_b[neuron] + sum_vec.to_array().iter().sum::<f32>();
+            for k in 0..dense_size {
+                sum += dense[k] * w[2 * h1 + k];
             }
-
-            hidden2[neuron] = sum.max(0.0);  // ReLU
+            hidden[neuron] = sum.max(0.0);
         }
 
-        // FC3: dot product -> tanh -> centipawns
-        let mut output = self.fc3_bias;
-        let mut sum_vec = f32x8::ZERO;
-        let mut i = 0;
-        while i + 8 <= self.hidden2 {
-            let input_vec = f32x8::new([
-                hidden2[i], hidden2[i+1], hidden2[i+2], hidden2[i+3],
-                hidden2[i+4], hidden2[i+5], hidden2[i+6], hidden2[i+7],
-            ]);
-            let wt_vec = f32x8::new([
-                self.fc3_weight[i], self.fc3_weight[i+1],
-                self.fc3_weight[i+2], self.fc3_weight[i+3],
-                self.fc3_weight[i+4], self.fc3_weight[i+5],
-                self.fc3_weight[i+6], self.fc3_weight[i+7],
-            ]);
-            sum_vec = sum_vec + input_vec * wt_vec;
-            i += 8;
+        let fc3_w = &self.fc3_weight[bucket * h2..(bucket + 1) * h2];
+        let mut out = self.fc3_bias[bucket];
+        for i in 0..h2 {
+            out += hidden[i] * fc3_w[i];
         }
-        let arr = sum_vec.to_array();
-        output += arr[0]+arr[1]+arr[2]+arr[3]+arr[4]+arr[5]+arr[6]+arr[7];
-
-        (output.tanh() * 1000.0) as i32
+        (out.tanh() * 1000.0) as i32
     }
+
+    /// Convenience: evaluate a position from scratch (no incremental state).
+    pub fn evaluate_from_scratch(&self, bb: &BitBoard) -> i32 {
+        let mut acc = DualAccumulator::default();
+        self.init_accumulators(bb, &mut acc);
+        self.evaluate(bb, &acc)
+    }
+}
+
+fn transpose_embedding(rows: &[Vec<f32>], hidden1: usize) -> Vec<f32> {
+    let mut out = vec![0.0f32; rows.len() * hidden1];
+    for (feat, row) in rows.iter().enumerate() {
+        for (neuron, &w) in row.iter().enumerate().take(hidden1) {
+            out[feat * hidden1 + neuron] = w;
+        }
+    }
+    out
 }
 
 // ============================================================================
@@ -794,5 +786,129 @@ impl EvalCache {
     pub(crate) fn hit_ratio(&self) -> f64 {
         let total = self.hits + self.misses;
         if total == 0 { 0.0 } else { self.hits as f64 / total as f64 }
+    }
+}
+
+// ============================================================================
+// TESTS
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn all_configs() -> Vec<NnueConfig> {
+        let mut v = Vec::new();
+        for fs in [FeatureSet::HalfPail, FeatureSet::Plain] {
+            for mirror in [false, true] {
+                for buckets in [1usize, 25] {
+                    v.push(NnueConfig {
+                        feature_set: fs, mirror_black: mirror, dense_size: 20,
+                        hidden1: 64, hidden2: 16, output_buckets: buckets,
+                    });
+                }
+            }
+        }
+        v
+    }
+
+    /// Incremental updates must match from-scratch initialization along a
+    /// random game, for every feature set / mirroring / bucket combination.
+    #[test]
+    fn test_incremental_matches_scratch() {
+        for config in all_configs() {
+            let net = SparseNNUE::random(config, 7);
+            let mut state = 12345u64;
+            let mut next = || { state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); (state >> 33) as usize };
+
+            let mut bb = BitBoard::new();
+            let mut acc = DualAccumulator::default();
+            net.init_accumulators(&bb, &mut acc);
+
+            for ply in 0..60 {
+                let moves = bb.generate_moves();
+                if moves.is_empty() || bb.check_winner().is_some() { break; }
+                let mv = moves[next() % moves.len()];
+                let before = bb;
+                bb.make_move(&mv);
+                net.update(&before, &bb, &mut acc);
+
+                let mut fresh = DualAccumulator::default();
+                net.init_accumulators(&bb, &mut fresh);
+                let h = config.hidden1;
+                for i in 0..h {
+                    assert!((acc.white_pre[i] - fresh.white_pre[i]).abs() < 1e-3,
+                        "{:?} ply {} white[{}] incremental {} vs scratch {}", config, ply, i, acc.white_pre[i], fresh.white_pre[i]);
+                    assert!((acc.black_pre[i] - fresh.black_pre[i]).abs() < 1e-3,
+                        "{:?} ply {} black[{}]", config, ply, i);
+                }
+                // Evaluations agree too (bucket selection, dense, heads)
+                assert_eq!(net.evaluate(&bb, &acc), net.evaluate(&bb, &fresh));
+            }
+        }
+    }
+
+    /// Mirroring: with mirror_black, a color-swapped + vertically flipped
+    /// position must produce identical perspective features (own/opp swap).
+    #[test]
+    fn test_mirror_symmetry() {
+        let config = NnueConfig {
+            feature_set: FeatureSet::Plain, mirror_black: true, dense_size: 0,
+            hidden1: 64, hidden2: 16, output_buckets: 1,
+        };
+        let mut bb = BitBoard::new();
+        bb.white_barrels = (1u64 << 20) | (1u64 << 8);
+        bb.black_barrels = 1u64 << 27;
+        bb.white_pail = 1u64 << 14;
+        bb.white_pail_placed = true;
+        bb.occupied = bb.white_barrels | bb.black_barrels | bb.white_pail;
+
+        // Color-swap + flip
+        let mut sw = BitBoard::new();
+        sw.black_barrels = crate::race::mirror_rows(bb.white_barrels);
+        sw.white_barrels = crate::race::mirror_rows(bb.black_barrels);
+        sw.black_pail = crate::race::mirror_rows(bb.white_pail);
+        sw.black_pail_placed = true;
+        sw.occupied = sw.white_barrels | sw.black_barrels | sw.black_pail;
+
+        let mut a = [0u16; MAX_ACTIVE_FEATURES];
+        let mut b = [0u16; MAX_ACTIVE_FEATURES];
+        let na = config.active_features(&bb, Player::White, &mut a);
+        let nb = config.active_features(&sw, Player::Black, &mut b);
+        let (mut va, mut vb) = (a[..na].to_vec(), b[..nb].to_vec());
+        va.sort(); vb.sort();
+        assert_eq!(va, vb, "white view of position must equal black view of its mirror");
+    }
+
+    #[test]
+    fn test_dense164_roundtrip() {
+        // Build a row from a real board and decode it back
+        let mut bb = BitBoard::new();
+        let mut state = 99u64;
+        let mut next = || { state = state.wrapping_mul(6364136223846793005).wrapping_add(1); (state >> 33) as usize };
+        for _ in 0..14 {
+            let moves = bb.generate_moves();
+            if moves.is_empty() { break; }
+            let mv = moves[next() % moves.len()];
+            bb.make_move(&mv);
+        }
+        let mut row = vec![0.0f32; 164];
+        for sq in 0..NUM_SQUARES {
+            if bb.white_barrels & (1 << sq) != 0 { row[sq * 4] = 1.0; }
+            if bb.black_barrels & (1 << sq) != 0 { row[sq * 4 + 1] = 1.0; }
+            if bb.white_pail & (1 << sq) != 0 { row[sq * 4 + 2] = 1.0; }
+            if bb.black_pail & (1 << sq) != 0 { row[sq * 4 + 3] = 1.0; }
+        }
+        let rel = compute_relational_features(&bb);
+        row[144..].copy_from_slice(&rel);
+        let d = bitboard_from_dense164(&row);
+        assert_eq!(d.white_barrels, bb.white_barrels);
+        assert_eq!(d.black_barrels, bb.black_barrels);
+        assert_eq!(d.white_pail, bb.white_pail);
+        assert_eq!(d.black_pail, bb.black_pail);
+        assert_eq!(d.white_scored, bb.white_scored);
+        assert_eq!(d.black_scored, bb.black_scored);
+        assert_eq!(d.current_player, bb.current_player);
+        assert_eq!(d.white_barrels_off_board, bb.white_barrels_off_board);
     }
 }

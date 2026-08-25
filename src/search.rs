@@ -573,6 +573,16 @@ impl Engine {
         self.inner.asp_mode = value;
     }
 
+    #[getter]
+    fn qs_mode(&self) -> i32 {
+        self.inner.qs_mode
+    }
+
+    #[setter]
+    fn set_qs_mode(&mut self, value: i32) {
+        self.inner.qs_mode = value;
+    }
+
     /// Load NNUE weights from JSON file
     /// After loading, the engine will use NNUE for evaluation instead of heuristics
     fn load_nnue(&mut self, path: &str) -> PyResult<()> {
@@ -583,12 +593,41 @@ impl Engine {
 
     /// Check if NNUE is loaded
     fn has_nnue(&self) -> bool {
-        self.inner.halfpail_nnue.is_some()
+        self.inner.nnue.is_some()
     }
 
     /// Clear NNUE (revert to heuristic evaluation)
     fn clear_nnue(&mut self) {
         self.inner.clear_nnue();
+    }
+
+    /// Static NNUE evaluation of a position (White perspective, centipawns),
+    /// computed from scratch. For Python<->Rust parity checks and debugging.
+    fn nnue_eval(&self, board: &Board) -> PyResult<i32> {
+        let bb = BitBoard::from_board(board);
+        match self.inner.nnue {
+            Some(ref net) => Ok(net.evaluate_from_scratch(&bb)),
+            None => Err(pyo3::exceptions::PyRuntimeError::new_err("no NNUE loaded")),
+        }
+    }
+
+    /// Architecture description of the loaded NNUE (or None).
+    fn nnue_info(&self) -> Option<String> {
+        self.inner.nnue.as_ref().map(|n| format!("{:?}", n.config))
+    }
+
+    /// Evaluate raw 164-float training rows (N*164 flat) with the loaded NNUE,
+    /// from scratch. Lets the trainer verify Python<->Rust parity on the exact
+    /// data it trained on (scored counts included, which `Board` can't express).
+    fn nnue_eval_rows(&self, rows: Vec<f32>) -> PyResult<Vec<i32>> {
+        let net = self.inner.nnue.as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("no NNUE loaded"))?;
+        if rows.len() % 164 != 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err("rows must be N*164 floats"));
+        }
+        Ok(rows.chunks_exact(164)
+            .map(|r| net.evaluate_from_scratch(&bitboard_from_dense164(r)))
+            .collect())
     }
 
     /// Time-based search: iterative deepening that stops when time runs out.
@@ -693,10 +732,10 @@ pub struct BitBoardEngine {
     // Previous move (for continuation history indexing)
     prev_move: Option<BitMove>,
 
-    // HalfPail NNUE evaluator
-    halfpail_nnue: Option<HalfPailNNUE>,
+    // NNUE evaluator (generic over feature set; None = handcrafted eval)
+    nnue: Option<SparseNNUE>,
 
-    // Dual accumulator stack for HalfPail
+    // Dual-perspective accumulator stack for incremental NNUE updates
     dual_acc_stack: DualAccumulatorStack,
 
     // Time-based search: deadline for when to abort, checked every 1024 nodes
@@ -772,6 +811,11 @@ pub struct BitBoardEngine {
     // 1 = geometric one-sided widening starting at ±30.
     // Default 1: SPRT PASS at 50ms (+42 [+20,+64]) AND 200ms (+31 [+13,+50]).
     pub asp_mode: i32,
+    // Quiescence mode. 0 = legacy: any move landing within 2 rows of goal,
+    // 8 plies deep (measured ~360x main-node count in midgame — a full-width
+    // extension, not a quiescence search). 1 = scoring moves + moves to the
+    // row before goal, capped at 6 plies. 2 = scoring moves only, capped at 4.
+    pub qs_mode: i32,
 }
 
 impl Default for BitBoardEngine {
@@ -803,7 +847,7 @@ impl BitBoardEngine {
             history: [[0; NUM_SQUARES]; NUM_SQUARES],
             cont_history: [[0i32; NUM_SQUARES]; NUM_SQUARES],
             prev_move: None,
-            halfpail_nnue: None,
+            nnue: None,
             dual_acc_stack: DualAccumulatorStack::new(),
             deadline: None,
             nodes_since_check: 0,
@@ -849,6 +893,9 @@ impl BitBoardEngine {
             lmp_base: 6,
             keep_killers: 0, // SPRT null (+1 in 2000 games) — archived
             asp_mode: 1,     // PASSED both gates (see field comment)
+            // qs_mode 2 PASSED both gates: +53 [+28,+78] @ 50ms, +62 [+35,+91]
+            // @ 200ms vs legacy; beats qs_mode 1 head-to-head +29 [+11,+47].
+            qs_mode: 2,
         }
     }
 
@@ -888,18 +935,17 @@ impl BitBoardEngine {
         }
     }
 
-    /// Last NNUE-modell (auto-detects halfpail vs quantized vs f32 format)
+    /// Load an NNUE (v2 sparse format or legacy HalfPail JSON)
     pub fn load_nnue(&mut self, path: &str) -> Result<(), Box<dyn std::error::Error>> {
-        let json_str = std::fs::read_to_string(path)?;
-        let json: HalfPailJson = serde_json::from_str(&json_str)?;
-        let hp = HalfPailNNUE::from_json(json)?;
-        self.halfpail_nnue = Some(hp);
+        self.nnue = Some(SparseNNUE::load(path)?);
+        self.eval_cache.clear();
         Ok(())
     }
 
     /// Clear NNUE (revert to heuristic evaluation)
     pub fn clear_nnue(&mut self) {
-        self.halfpail_nnue = None;
+        self.nnue = None;
+        self.eval_cache.clear();
     }
 
     /// Tøm TT
@@ -1200,9 +1246,8 @@ impl BitBoardEngine {
             return score;
         }
 
-        let score = if let Some(ref hp) = self.halfpail_nnue {
-            let dual_acc = self.dual_acc_stack.current();
-            hp.evaluate_from_dual_acc(bb, dual_acc)
+        let score = if let Some(ref net) = self.nnue {
+            net.evaluate(bb, self.dual_acc_stack.current())
         } else {
             self.evaluate_heuristic(bb)
         };
@@ -1375,9 +1420,8 @@ impl BitBoardEngine {
 
         // Initialize accumulator
         self.dual_acc_stack.reset();
-        if let Some(ref hp) = self.halfpail_nnue {
-            let dual_acc = self.dual_acc_stack.current_mut();
-            hp.init_accumulators(bb, dual_acc);
+        if let Some(ref net) = self.nnue {
+            net.init_accumulators(bb, self.dual_acc_stack.current_mut());
         }
 
         let maximizing = bb.current_player == Player::White;
@@ -1439,7 +1483,11 @@ impl BitBoardEngine {
     /// Søker kun "spennende" trekk: tønner som når/nærmer seg mål
     /// qsdepth: current quiescence depth (starts at 0, max MAX_QSEARCH_DEPTH)
     fn quiesce(&mut self, bb: &BitBoard, mut alpha: i32, beta: i32, maximizing: bool, qsdepth: u8) -> i32 {
-        const MAX_QSEARCH_DEPTH: u8 = 8; // Prevent stack overflow
+        let max_qsearch_depth: u8 = match self.qs_mode {
+            0 => 8,
+            1 => 6,
+            _ => 4,
+        };
 
         self.quiesce_nodes += 1;
 
@@ -1452,7 +1500,7 @@ impl BitBoardEngine {
         let stand_pat = self.evaluate(bb);
 
         // Prevent stack overflow from unbounded quiescence search
-        if qsdepth >= MAX_QSEARCH_DEPTH {
+        if qsdepth >= max_qsearch_depth {
             return stand_pat;
         }
 
@@ -1473,15 +1521,17 @@ impl BitBoardEngine {
         // Finn "taktiske" trekk: tønner nær mål, eller fremover-trekk ved dist 2
         // Expanded from dist<=1 to also catch 2-step scoring sequences
         let player = bb.current_player;
+        let qs_mode = self.qs_mode;
 
         let moves = bb.generate_moves();
-        let tactical_moves: Vec<BitMove> = moves
+        // Collect (sort_key, move): scoring moves first, then threats.
+        let mut tactical: Vec<(u8, BitMove)> = moves
             .into_iter()
-            .filter(|mv| {
+            .filter_map(|mv| {
                 // Pail placements are strategic, never tactical-scoring moves
                 // (their target square is the pail square, not a barrel).
                 if mv.is_pail_placement() {
-                    return false;
+                    return None;
                 }
                 let to_sq = mv.barrel_to() as usize;
                 let (to_row, _) = sq_to_coords(to_sq);
@@ -1491,12 +1541,22 @@ impl BitBoardEngine {
                     BOARD_SIZE - 1 - to_row // Black's goal is row 5
                 };
 
-                // Always include barrels within 1 step of goal
-                if dist_to_goal <= 1 {
-                    return true;
+                // Scoring move: always tactical, searched first
+                if dist_to_goal == 0 {
+                    return Some((0u8, mv));
                 }
-
-                // At distance 2: only include if barrel moved forward toward goal
+                // Mode 2: scoring moves only
+                if qs_mode >= 2 {
+                    return None;
+                }
+                // Move to the row before goal (immediate scoring threat)
+                if dist_to_goal == 1 {
+                    return Some((1u8, mv));
+                }
+                // Mode 1 stops here; legacy mode also takes forward moves to dist 2
+                if qs_mode == 1 {
+                    return None;
+                }
                 if dist_to_goal == 2 {
                     if let Some(from_sq) = mv.barrel_from() {
                         let (from_row, _) = sq_to_coords(from_sq as usize);
@@ -1505,19 +1565,21 @@ impl BitBoardEngine {
                         } else {
                             BOARD_SIZE - 1 - from_row
                         };
-                        // Only tactical if moving closer to goal
-                        return from_dist > dist_to_goal;
+                        if from_dist > dist_to_goal {
+                            return Some((2u8, mv));
+                        }
                     }
                 }
-
-                false
+                None
             })
             .collect();
 
         // Ingen taktiske trekk - returner stand-pat
-        if tactical_moves.is_empty() {
+        if tactical.is_empty() {
             return stand_pat;
         }
+        tactical.sort_by_key(|(k, _)| *k);
+        let tactical_moves: Vec<BitMove> = tactical.into_iter().map(|(_, mv)| mv).collect();
 
         if maximizing {
             let mut best = stand_pat;
@@ -1525,25 +1587,16 @@ impl BitBoardEngine {
                 let mut new_bb = *bb;
                 new_bb.make_move(&mv);
 
-                // Oppdater accumulator (halfpail, quantized, or float)
-                if let Some(ref hp) = self.halfpail_nnue {
-                    let (w_deltas, b_deltas, w_recomp, b_recomp) = hp.compute_move_deltas(bb, &mv);
+                // Incremental NNUE accumulator update (generic feature diff)
+                if let Some(ref net) = self.nnue {
                     self.dual_acc_stack.push();
-                    if w_recomp || b_recomp {
-                        let hp = self.halfpail_nnue.as_ref().unwrap();
-                        hp.init_accumulators(&new_bb, self.dual_acc_stack.current_mut());
-                    } else {
-                        let hp = self.halfpail_nnue.as_ref().unwrap();
-                        let dual_acc = self.dual_acc_stack.current_mut();
-                        hp.apply_deltas(&mut dual_acc.white_pre, &w_deltas);
-                        hp.apply_deltas(&mut dual_acc.black_pre, &b_deltas);
-                    }
+                    net.update(bb, &new_bb, self.dual_acc_stack.current_mut());
                 }
 
                 let qs_child_maximizing = new_bb.current_player == Player::White;
                 let score = self.quiesce(&new_bb, alpha, beta, qs_child_maximizing, qsdepth + 1);
 
-                if self.halfpail_nnue.is_some() {
+                if self.nnue.is_some() {
                     self.dual_acc_stack.pop();
                 }
 
@@ -1560,25 +1613,16 @@ impl BitBoardEngine {
                 let mut new_bb = *bb;
                 new_bb.make_move(&mv);
 
-                // Oppdater accumulator (halfpail, quantized, or float)
-                if let Some(ref hp) = self.halfpail_nnue {
-                    let (w_deltas, b_deltas, w_recomp, b_recomp) = hp.compute_move_deltas(bb, &mv);
+                // Incremental NNUE accumulator update (generic feature diff)
+                if let Some(ref net) = self.nnue {
                     self.dual_acc_stack.push();
-                    if w_recomp || b_recomp {
-                        let hp = self.halfpail_nnue.as_ref().unwrap();
-                        hp.init_accumulators(&new_bb, self.dual_acc_stack.current_mut());
-                    } else {
-                        let hp = self.halfpail_nnue.as_ref().unwrap();
-                        let dual_acc = self.dual_acc_stack.current_mut();
-                        hp.apply_deltas(&mut dual_acc.white_pre, &w_deltas);
-                        hp.apply_deltas(&mut dual_acc.black_pre, &b_deltas);
-                    }
+                    net.update(bb, &new_bb, self.dual_acc_stack.current_mut());
                 }
 
                 let qs_child_maximizing = new_bb.current_player == Player::White;
                 let score = self.quiesce(&new_bb, alpha, beta, qs_child_maximizing, qsdepth + 1);
 
-                if self.halfpail_nnue.is_some() {
+                if self.nnue.is_some() {
                     self.dual_acc_stack.pop();
                 }
 
@@ -1966,85 +2010,11 @@ impl BitBoardEngine {
             let mut new_bb = *bb;
             let _undo = new_bb.make_move(&mv);
 
-            // Oppdater accumulator inkrementelt (halfpail, quantized, or float)
-            if self.halfpail_nnue.is_some() {
-                let hp = self.halfpail_nnue.as_ref().unwrap();
-                let (w_deltas, b_deltas, w_recompute, b_recompute) = hp.compute_move_deltas(bb, &mv);
+            // Incremental NNUE accumulator update (generic feature diff;
+            // recomputes a perspective only when its bucket changed)
+            if let Some(ref net) = self.nnue {
                 self.dual_acc_stack.push();
-                let dual_acc = self.dual_acc_stack.current_mut();
-                if w_recompute || b_recompute {
-                    // One or both perspectives need full recompute (pail placement)
-                    let hp = self.halfpail_nnue.as_ref().unwrap();
-                    if w_recompute && b_recompute {
-                        hp.init_accumulators(&new_bb, dual_acc);
-                    } else if w_recompute {
-                        // Recompute white, apply deltas to black
-                        let hp = self.halfpail_nnue.as_ref().unwrap();
-                        // Reset white to bias and rebuild
-                        for i in 0..hp.hidden1 {
-                            dual_acc.white_pre[i] = hp.fc1_bias[i];
-                        }
-                        // Re-init white perspective from new_bb
-                        let w_bucket = if new_bb.white_pail != 0 {
-                            new_bb.white_pail.trailing_zeros() as usize
-                        } else { 36 };
-                        let mut barrels = new_bb.white_barrels;
-                        while barrels != 0 {
-                            let sq = barrels.trailing_zeros() as usize;
-                            hp.add_feature(&mut dual_acc.white_pre,
-                                halfpail_feature_index(w_bucket, sq, 0) as usize);
-                            barrels &= barrels - 1;
-                        }
-                        barrels = new_bb.black_barrels;
-                        while barrels != 0 {
-                            let sq = barrels.trailing_zeros() as usize;
-                            hp.add_feature(&mut dual_acc.white_pre,
-                                halfpail_feature_index(w_bucket, sq, 1) as usize);
-                            barrels &= barrels - 1;
-                        }
-                        if new_bb.black_pail != 0 {
-                            let sq = new_bb.black_pail.trailing_zeros() as usize;
-                            hp.add_feature(&mut dual_acc.white_pre,
-                                halfpail_feature_index(w_bucket, sq, 2) as usize);
-                        }
-                        // Apply deltas to black
-                        hp.apply_deltas(&mut dual_acc.black_pre, &b_deltas);
-                    } else {
-                        // b_recompute: recompute black, apply deltas to white
-                        let hp = self.halfpail_nnue.as_ref().unwrap();
-                        for i in 0..hp.hidden1 {
-                            dual_acc.black_pre[i] = hp.fc1_bias[i];
-                        }
-                        let b_bucket = if new_bb.black_pail != 0 {
-                            new_bb.black_pail.trailing_zeros() as usize
-                        } else { 36 };
-                        let mut barrels = new_bb.black_barrels;
-                        while barrels != 0 {
-                            let sq = barrels.trailing_zeros() as usize;
-                            hp.add_feature(&mut dual_acc.black_pre,
-                                halfpail_feature_index(b_bucket, sq, 0) as usize);
-                            barrels &= barrels - 1;
-                        }
-                        barrels = new_bb.white_barrels;
-                        while barrels != 0 {
-                            let sq = barrels.trailing_zeros() as usize;
-                            hp.add_feature(&mut dual_acc.black_pre,
-                                halfpail_feature_index(b_bucket, sq, 1) as usize);
-                            barrels &= barrels - 1;
-                        }
-                        if new_bb.white_pail != 0 {
-                            let sq = new_bb.white_pail.trailing_zeros() as usize;
-                            hp.add_feature(&mut dual_acc.black_pre,
-                                halfpail_feature_index(b_bucket, sq, 2) as usize);
-                        }
-                        // Apply deltas to white
-                        hp.apply_deltas(&mut dual_acc.white_pre, &w_deltas);
-                    }
-                } else {
-                    let hp = self.halfpail_nnue.as_ref().unwrap();
-                    hp.apply_deltas(&mut dual_acc.white_pre, &w_deltas);
-                    hp.apply_deltas(&mut dual_acc.black_pre, &b_deltas);
-                }
+                net.update(bb, &new_bb, self.dual_acc_stack.current_mut());
             }
 
             let score;
@@ -2113,7 +2083,7 @@ impl BitBoardEngine {
             }
 
             // Pop accumulator
-            if self.halfpail_nnue.is_some() {
+            if self.nnue.is_some() {
                 self.dual_acc_stack.pop();
             }
 

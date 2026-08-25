@@ -245,6 +245,44 @@ Missing / added behind flags — SPRT gate results (2026-08-24):
   aspiration re-searches within one iteration already reuse killers where
   it matters.
 
+**Quiescence was the hidden cost centre (found 2026-08-25).** Profiling a
+d8 midgame search: ~300 main nodes vs ~118,000 quiescence nodes (360x).
+The legacy filter (any move landing within 2 rows of goal, 8 plies deep,
+unordered) is a full-width extension once barrels advance — 99.7% of all
+search effort, while raw speed is fine (~23M nodes/s). `qs_mode` knob:
+1 = scoring + immediate-threat moves, cap 6 (6x faster at d8);
+2 = scoring moves only, cap 4 (36x faster). Scoring moves ordered first.
+Gates @ 50ms: **qs1 +31 [+13,+50] PASS; qs2 +53 [+28,+78] PASS.**
+Slow-TC gate: **qs2 +62 [+35,+91] @ 200ms PASS**; head-to-head qs2 vs
+qs1 +29 [+11,+47] PASS. → **`qs_mode=2` is the default.** Biggest single
+search gain of the project. Lesson: measure WHERE nodes go before touching
+number formats/SIMD.
+
+## NNUE architecture tournament infrastructure (2026-08-25)
+
+- Rust `SparseNNUE` (src/nnue.rs): ONE evaluator generic over a
+  `NnueConfig` — feature set (`halfpail` 3996 / `plain` 144), `mirror_black`
+  (black perspective sees a flipped board so shared weights are orientation-
+  consistent — the legacy net did NOT do this), optional 20 dense features,
+  `output_buckets` 1 or 25 keyed on (white_scored, black_scored).
+  Incremental updates are a generic before/after feature-set diff (no
+  per-move special cases); a perspective is recomputed only when its bucket
+  changed. Loads v2 JSON and legacy HalfPail JSON. Tests: incremental ==
+  scratch along random games for all 8 configs; mirror symmetry; dense-row
+  round trip.
+- Python `nnue_arch.py`: `NnueArch` + `SparseNNUE` model (bucketed heads via
+  wide linear + gather), Rust batch decoder `decode_sparse_batch` (indices
+  from the SAME Rust feature code the engine uses), pre-decode-to-device
+  trainer (MPS/CUDA), `export_sparse_json`, parity helper.
+  CLI: `python -m tonnesjakk.nnue --load-data X.bin --feature-set plain
+  --mirror --output-buckets 25 --no-dense --arch 256 32 --output runs/<tag>`.
+- **Verified**: 3 architectures trained on 200k real positions (~2–3 s per
+  2 epochs on MPS), exported, loaded in Rust: **0 cp Python↔Rust difference**
+  on 400 positions; search runs with NNUE loaded.
+- Tournament plan (equal-TIME gates via match.py `--nnue-a/--nnue-b`, plus
+  each vs heuristic): halfpail vs plain; ±mirror; ±dense; buckets 1 vs 25;
+  width 128/256/512; λ ∈ {0.2, 0.5, 0.8}. Run once gen-1 data is complete.
+
 Backlog (bigger builds): improving flag (needs static-eval stack),
 2-ply continuation history + history pruning, singular extensions +
 multicut (TT-move-based — no captures needed, suits forced race lines),
