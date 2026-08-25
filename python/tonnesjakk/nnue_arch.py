@@ -205,15 +205,15 @@ def dedupe_rows(X, y, verbose: bool = True):
     for c in range(y_arr.shape[1]):
         y_unique[:, c] = np.bincount(inverse, weights=y_arr[:, c], minlength=m) / counts
 
-    order = np.sort(first_idx)  # keep original (game) order for chunked reads
+    # Emit unique positions in original (game) order for contiguous reads.
+    # perm[j] = unique-id whose first occurrence is the j-th smallest row index,
+    # so X_unique[j] = X[first_idx[perm[j]]] and y_unique_out[j] = y_avg[perm[j]].
+    perm = np.argsort(first_idx)
+    order = first_idx[perm]
     X_unique = np.empty((m, X.shape[1]), dtype=np.float32)
     for s in range(0, m, chunk):
-        idx = order[s:s + chunk]
-        X_unique[s:s + chunk] = X[idx]
-    # y_unique is indexed by unique-id; remap to the sorted first_idx order
-    rank = np.empty(m, dtype=np.int64)
-    rank[np.argsort(first_idx)] = np.arange(m)
-    y_unique = y_unique[rank]
+        X_unique[s:s + chunk] = X[order[s:s + chunk]]
+    y_unique = y_unique[perm]
 
     if verbose:
         print(f"  Dedupe: {n:,} rows -> {m:,} unique positions "

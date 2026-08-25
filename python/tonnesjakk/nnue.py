@@ -347,9 +347,12 @@ class DataGenerator:
                     # tanh maps (-inf, +inf) to (-1, +1) smoothly.
                     normalized_score = math.tanh(raw_score / SCORE_SCALING)
 
-                    # Flip score perspective to always be from White's viewpoint
-                    if not is_white:
-                        normalized_score = -normalized_score
+                    # NOTE: the engine's search score is ALREADY from White's
+                    # perspective (white-maximizing minimax), regardless of side
+                    # to move. An earlier version negated it for black-to-move
+                    # positions here, which inverted half of all labels and made
+                    # them uncorrelated with game outcome (r = -0.002); fixed
+                    # 2026-08-25 (r = +0.75 after repair). Do not "flip" it.
 
                     positions.append(PositionData(
                         board=board.to_array(),

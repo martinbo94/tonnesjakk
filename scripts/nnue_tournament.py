@@ -35,6 +35,7 @@ class Candidate:
     buckets: int
     lam: float = 0.8
     dedupe: bool = True
+    loss: str = "wdl-ce"
 
     @property
     def tag(self) -> str:
@@ -44,6 +45,8 @@ class Candidate:
             t += f"_l{self.lam:g}"
         if not self.dedupe:
             t += "_nodedupe"
+        if self.loss != "wdl-ce":
+            t += f"_{self.loss}"
         return t
 
 
@@ -61,6 +64,7 @@ DEFAULT_CANDIDATES = [
     Candidate("plain", True, 0, 256, 32, 1, lam=1.0),
     Candidate("plain", True, 0, 256, 32, 1, lam=0.2),
     Candidate("plain", True, 0, 128, 32, 1, dedupe=False),  # dedupe A/B vs candidate 2
+    Candidate("plain", True, 0, 128, 32, 1, loss="mse"),    # loss A/B vs candidate 2
 ]
 
 
@@ -70,7 +74,8 @@ def train(c: Candidate, data: str, out_dir: Path, epochs: int, lr: float, batch:
     cmd = [PY, "-m", "tonnesjakk.nnue", "--load-data", data, "--output", str(run_dir),
            "--feature-set", c.feature_set, "--arch", str(c.h1), str(c.h2),
            "--output-buckets", str(c.buckets), "--epochs", str(epochs),
-           "--lr", str(lr), "--batch-size", str(batch), "--lambda", str(c.lam)]
+           "--lr", str(lr), "--batch-size", str(batch), "--lambda", str(c.lam),
+           "--loss", c.loss]
     if c.mirror:
         cmd.append("--mirror")
     if c.dense == 0:
@@ -122,7 +127,7 @@ def main():
     ap = argparse.ArgumentParser(description="NNUE architecture tournament")
     ap.add_argument("--data", required=True)
     ap.add_argument("--out", default="runs/gen1")
-    ap.add_argument("--epochs", type=int, default=20)
+    ap.add_argument("--epochs", type=int, default=150)
     ap.add_argument("--lr", type=float, default=0.002)
     ap.add_argument("--batch-size", type=int, default=8192)
     ap.add_argument("--games", type=int, default=400)
