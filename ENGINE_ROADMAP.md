@@ -396,6 +396,22 @@ NPS: heuristic 3.5M; NNUE 128×32 1.5M, 256 0.95M, 512 0.6M ⇒ depth 15 vs
 13/13/12 @100ms. **Round 4 = speed**: smaller nets, dense-feature cost,
 then quantization.
 
+### Round 4 (speed; gated HEAD-TO-HEAD vs net-1 = plain_m_d20_128x32_l0.5, 100ms)
+
+| architecture | Elo vs net-1 | val loss |
+|---|---|---|
+| **plain+m+d20 96×16 λ0.5** | **+36 [+13,+59]** | 0.4615 |
+| plain+m+d20 64×16 | +33 [+9,+58] | 0.4633 |
+| plain+m, no dense, 64×16, 25 buckets | +10 [−15,+36] | 0.4813 |
+| plain+m+d20 128×16 | −3 [−26,+21] | 0.4615 |
+| plain+m+d20 64×32 | −3 [−30,+23] | 0.4624 |
+| plain+m+d20 32×16 | −10 [−35,+14] | 0.4662 |
+
+Speed hypothesis confirmed: hidden2=16 (half the FC2 cost) beats net-1
+despite equal-or-worse loss; 32-wide is too small (eval quality loss wins).
+Dense features still pay (64×16 d20 +33 vs d0+buckets +10) despite their
+~25% throughput cost. Slow-TC gate for 96×16: running.
+
 **Slow-TC gate PASSED:** `plain_m_d20_128x32_l0.5` vs heuristic @ 200ms:
 **+225 Elo [+187, +268]** (225-21-54, 300 games) — larger than at 100ms
 (+207), i.e. the NNUE's edge GROWS with time (eval quality compounds with
