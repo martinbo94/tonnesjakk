@@ -927,7 +927,21 @@ def train_nnue(
     # Step 1: Generate or load data
     if load_data:
         print(f"\n[1/3] Loading training data from {load_data}...")
-        if load_data.endswith('.bin'):
+        if "," in load_data:
+            # Several streaming datasets (e.g. gen-1,gen-1b): concatenate in RAM.
+            # 6.5 GB per 10M rows — fine on this machine; dedupe merges them.
+            parts = [DataGenerator.load_streaming_dataset(p.strip()) for p in load_data.split(",")]
+            X = np.concatenate([np.asarray(p[0]) for p in parts])
+            y = np.concatenate([np.asarray(p[1]) for p in parts])
+            stats = TrainingStats()
+            for p in parts:
+                stats.white_wins += p[2].white_wins
+                stats.black_wins += p[2].black_wins
+                stats.draws += p[2].draws
+            stats.total_positions = len(X)
+            loaded_config = parts[0][3]
+            print(f"  Loaded {len(X):,} positions from {len(parts)} files")
+        elif load_data.endswith('.bin'):
             X, y, stats, loaded_config = DataGenerator.load_streaming_dataset(load_data)
             print(f"  Loaded {len(X):,} positions (memory-mapped, features: {X.shape[1]})")
         else:

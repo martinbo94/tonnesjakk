@@ -341,6 +341,30 @@ worse at this data size (128 > 256 > 512) ⇒ data-limited ⇒ gen-1b (diverse
 data) is the next lever. λ / loss / dedupe ran on the failing no-dense
 family (confounded) → round 2 re-tests them on the winner.
 
+### Round 2 (variants of the winner; same gate)
+
+| architecture | Elo vs heuristic | val loss |
+|---|---|---|
+| plain+m+d20 128×32 **λ=0.5** | +207 [+176,+243] | 0.4874 |
+| … MSE loss | +185 [+153,+221] | (mse) |
+| … 25 output buckets | +183 [+153,+215] | 0.5386 |
+| … no dedupe | +181 [+149,+216] | 0.5588 |
+| … 64×32 | +181 [+150,+214] | 0.5384 |
+| … λ=1.0 | +179 [+149,+213] | 0.5641 |
+| … (winner re-run, identical config) | +176 [+144,+211] | 0.5370 |
+| … 192×32 | +173 [+142,+206] | 0.5372 |
+| … λ=0.65 | +171 [+141,+203] | 0.5136 |
+| … 128×64 | +171 [+139,+205] | 0.5368 |
+
+**Everything within +171..+207 with overlapping CIs.** The identical-config
+re-run (+176 vs +203 in round 1) puts the run-to-run noise floor at ~30 Elo,
+so no round-2 knob is a proven gain; λ=0.5 is suggestive at best. The family
+is saturated on 1.6M unique positions ⇒ confirmed data-limited. Nine of nine
+400-game gates beat the heuristic decisively — the first NNUE wins in the
+project's history. Next levers, in order: gen-1b (diverse data), then
+self-generated data (gen-2 labeled by the best net, gated vs heuristic AND
+previous net), then width.
+
 ## Cleanup (2026-08-25)
 
 Removed: A/B-rejected knobs (`weight_pail_in_hand`, `weight_tempo`,
