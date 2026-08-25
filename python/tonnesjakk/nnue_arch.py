@@ -361,4 +361,5 @@ def torch_eval_positions(model: SparseNNUE, X_rows) -> np.ndarray:
     w_idx, w_off, b_idx, b_off, dense, bucket, _ = decode_chunk(model.arch, X_rows, y_dummy)
     with torch.no_grad():
         out = model_cpu(w_idx, w_off, b_idx, b_off, dense, bucket).squeeze(1).numpy()
-    return (out * 1000.0).astype(np.int32)
+    # Same inverse mapping as the Rust evaluator: label = tanh(cp / 600)
+    return (600.0 * np.arctanh(np.clip(out, -0.999, 0.999))).astype(np.int32)

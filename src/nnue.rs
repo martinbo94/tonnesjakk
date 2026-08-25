@@ -11,6 +11,9 @@ pub const HALFPAIL_DENSE: usize = 20;
 /// Upper bound on simultaneously active sparse features per perspective:
 /// 4 own barrels + 4 enemy barrels + 2 pails.
 pub const MAX_ACTIVE_FEATURES: usize = 12;
+/// Label normalization used by the trainer: label = tanh(score_cp / SCORE_SCALE).
+/// Must match python/tonnesjakk/nnue.py SCORE_SCALING.
+pub const SCORE_SCALE: f32 = 600.0;
 
 // ============================================================================
 // FEATURE SETS
@@ -700,7 +703,11 @@ impl SparseNNUE {
         for i in 0..h2 {
             out += hidden[i] * fc3_w[i];
         }
-        (out.tanh() * 1000.0) as i32
+        // Training labels are tanh(score_cp / SCORE_SCALE); invert so the NNUE
+        // lives on the same centipawn scale as the heuristic eval and every
+        // search margin (futility, razoring, NMP, LMP) keeps its meaning.
+        let v = out.tanh().clamp(-0.999, 0.999);
+        (SCORE_SCALE * v.atanh()) as i32
     }
 
     /// Convenience: evaluate a position from scratch (no incremental state).
