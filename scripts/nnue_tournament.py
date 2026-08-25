@@ -36,6 +36,7 @@ class Candidate:
     lam: float = 0.8
     dedupe: bool = True
     loss: str = "wdl-ce"
+    fraction: float = 1.0
 
     @property
     def tag(self) -> str:
@@ -47,6 +48,8 @@ class Candidate:
             t += "_nodedupe"
         if self.loss != "wdl-ce":
             t += f"_{self.loss}"
+        if self.fraction < 1.0:
+            t += f"_f{self.fraction:g}"
         return t
 
 
@@ -81,7 +84,19 @@ ROUND2_CANDIDATES = [
     Candidate("plain", True, 20, 128, 64, 1),                 # wider second layer
 ]
 
-PRESETS = {"round1": DEFAULT_CANDIDATES, "round2": ROUND2_CANDIDATES}
+# Round 3: gen-1 + gen-1b combined. Data-size curve, width re-test, lambda check.
+ROUND3_CANDIDATES = [
+    Candidate("plain", True, 20, 128, 32, 1, lam=0.5),                 # net-1 config, 100% data
+    Candidate("plain", True, 20, 128, 32, 1, lam=0.5, fraction=0.5),   # data-size curve
+    Candidate("plain", True, 20, 128, 32, 1, lam=0.5, fraction=0.25),
+    Candidate("plain", True, 20, 256, 32, 1, lam=0.5),                 # width re-test on more data
+    Candidate("plain", True, 20, 512, 32, 1, lam=0.5),
+    Candidate("plain", True, 20, 256, 64, 1, lam=0.5),
+    Candidate("plain", True, 20, 128, 32, 1),                          # lambda 0.8 control
+    Candidate("halfpail", True, 20, 256, 32, 1, lam=0.5),              # buckets with more data
+]
+
+PRESETS = {"round1": DEFAULT_CANDIDATES, "round2": ROUND2_CANDIDATES, "round3": ROUND3_CANDIDATES}
 
 
 def train(c: Candidate, data: str, out_dir: Path, epochs: int, lr: float, batch: int, log) -> float:
@@ -91,7 +106,7 @@ def train(c: Candidate, data: str, out_dir: Path, epochs: int, lr: float, batch:
            "--feature-set", c.feature_set, "--arch", str(c.h1), str(c.h2),
            "--output-buckets", str(c.buckets), "--epochs", str(epochs),
            "--lr", str(lr), "--batch-size", str(batch), "--lambda", str(c.lam),
-           "--loss", c.loss]
+           "--loss", c.loss, "--data-fraction", str(c.fraction)]
     if c.mirror:
         cmd.append("--mirror")
     if c.dense == 0:

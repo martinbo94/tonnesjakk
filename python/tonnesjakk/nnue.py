@@ -896,6 +896,7 @@ def train_nnue(
     output_buckets: int = 1,
     dedupe: bool = False,
     noise_prob: float = 0.0,
+    data_fraction: float = 1.0,
 ) -> Optional[nn.Module]:
     """
     Complete NNUE training pipeline (data generation, training, export).
@@ -1011,6 +1012,13 @@ def train_nnue(
             print(f"\n  Loading generated data via memory-map...")
             X, y, stats, _ = DataGenerator.load_streaming_dataset(save_data)
             print(f"  Loaded {len(X):,} positions (memory-mapped)")
+
+    # Data-size curve support: train on a random subset of the rows
+    if data_fraction < 1.0:
+        rng = np.random.default_rng(0)
+        keep = np.sort(rng.choice(len(X), int(len(X) * data_fraction), replace=False))
+        X, y = np.asarray(X)[keep], np.asarray(y)[keep]
+        print(f"  Data fraction {data_fraction:.2f}: using {len(X):,} rows")
 
     # Check balance
     if stats.balance_ratio < 0.5 or stats.balance_ratio > 2.0:
@@ -1134,6 +1142,8 @@ Examples:
                         help="Collapse duplicate positions before training, averaging their labels")
     parser.add_argument("--noise-prob", type=float, default=0.0,
                         help="Data generation: probability of a random move (first 20 plies) for trajectory diversity")
+    parser.add_argument("--data-fraction", type=float, default=1.0,
+                        help="Train on a random fraction of the loaded rows (data-size curves)")
     parser.add_argument("--resume-from", type=str, default=None,
                         help="Resume training from a saved .pt model file")
 
@@ -1165,6 +1175,7 @@ Examples:
         output_buckets=args.output_buckets,
         dedupe=args.dedupe,
         noise_prob=args.noise_prob,
+        data_fraction=args.data_fraction,
     )
 
 
