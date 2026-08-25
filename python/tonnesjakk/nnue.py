@@ -591,7 +591,9 @@ def train_halfpail_model(
         y_flat = y.ravel() if y.ndim > 1 else y
 
     use_rust_batch = _rust_decode_batch is not None
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    # CUDA > MPS (Apple Silicon GPU) > CPU
+    from .utils import get_device
+    device = get_device("auto")
 
     model = HalfPailNNUE(hidden1, hidden2)
     if resume_from:
