@@ -96,7 +96,19 @@ ROUND3_CANDIDATES = [
     Candidate("halfpail", True, 20, 256, 32, 1, lam=0.5),              # buckets with more data
 ]
 
-PRESETS = {"round1": DEFAULT_CANDIDATES, "round2": ROUND2_CANDIDATES, "round3": ROUND3_CANDIDATES}
+# Round 4: SPEED. Eval quality plateaued at fixed time (4x data = +16 Elo, ns;
+# 512-wide = same loss, -55 Elo). Smaller nets search deeper. Gate vs net-1.
+ROUND4_CANDIDATES = [
+    Candidate("plain", True, 20, 64, 32, 1, lam=0.5),
+    Candidate("plain", True, 20, 64, 16, 1, lam=0.5),
+    Candidate("plain", True, 20, 96, 16, 1, lam=0.5),
+    Candidate("plain", True, 20, 128, 16, 1, lam=0.5),
+    Candidate("plain", True, 20, 32, 16, 1, lam=0.5),
+    Candidate("plain", True, 0, 64, 16, 25, lam=0.5),   # no dense compute, buckets carry phase
+]
+
+PRESETS = {"round1": DEFAULT_CANDIDATES, "round2": ROUND2_CANDIDATES,
+           "round3": ROUND3_CANDIDATES, "round4": ROUND4_CANDIDATES}
 
 
 def train(c: Candidate, data: str, out_dir: Path, epochs: int, lr: float, batch: int, log) -> float:
@@ -124,27 +136,35 @@ def train(c: Candidate, data: str, out_dir: Path, epochs: int, lr: float, batch:
     return val
 
 
-def start_match(c: Candidate, out_dir: Path, games: int, time_ms: int, workers: int):
+def start_match(c: Candidate, out_dir: Path, games: int, time_ms: int, workers: int,
+                opponent_nnue: str = ""):
+    """Gate vs the heuristic engine, or vs a reference net (--opponent-nnue):
+    once every candidate beats the heuristic by ~200 Elo, a fixed weaker
+    opponent no longer resolves differences between nets."""
     run_dir = out_dir / c.tag
     cmd = [PY, "scripts/match.py", "--time-a", str(time_ms), "--time-b", str(time_ms),
            "--nnue-a", str(run_dir / "nnue_weights.json"),
-           "--label-a", c.tag, "--label-b", "heuristic",
+           "--label-a", c.tag, "--label-b", "reference" if opponent_nnue else "heuristic",
            "--games", str(games), "--workers", str(workers),
-           "--out", str(run_dir / "match_vs_heuristic.json")]
+           "--out", str(run_dir / "match.json")]
+    if opponent_nnue:
+        cmd += ["--nnue-b", opponent_nnue]
     return subprocess.Popen(cmd, cwd=ROOT, stdout=open(run_dir / "match.log", "w"),
                             stderr=subprocess.STDOUT)
 
 
-def leaderboard(out_dir: Path, candidates, val_losses):
+def leaderboard(out_dir: Path, candidates, val_losses, opponent_label="heuristic"):
     rows = []
     for c in candidates:
-        f = out_dir / c.tag / "match_vs_heuristic.json"
+        f = out_dir / c.tag / "match.json"
+        if not f.exists():
+            f = out_dir / c.tag / "match_vs_heuristic.json"
         if not f.exists():
             continue
         s = json.loads(f.read_text())["summary"]
         rows.append((s["elo_a"], c.tag, s, val_losses.get(c.tag, float("nan"))))
     rows.sort(key=lambda r: -r[0])
-    lines = ["| # | architecture | Elo vs heuristic (95% CI) | W-D-L | val loss |",
+    lines = [f"| # | architecture | Elo vs {opponent_label} (95% CI) | W-D-L | val loss |",
              "|---|---|---|---|---|"]
     for i, (elo, tag, s, val) in enumerate(rows, 1):
         lines.append(f"| {i} | `{tag}` | {elo:+.0f} [{s['elo_ci95'][0]:+.0f}, {s['elo_ci95'][1]:+.0f}] "
@@ -166,9 +186,12 @@ def main():
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--only", type=str, default="", help="comma-separated candidate tags")
     ap.add_argument("--preset", choices=sorted(PRESETS), default="round1")
+    ap.add_argument("--opponent-nnue", type=str, default="",
+                    help="Gate vs this reference net instead of the heuristic engine")
     ap.add_argument("--skip-train", action="store_true")
     ap.add_argument("--skip-match", action="store_true")
     args = ap.parse_args()
+    opp_label = "reference net" if args.opponent_nnue else "heuristic"
 
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -204,8 +227,9 @@ def main():
             pc, proc = pending_match
             proc.wait()
             log(f"  match done {pc.tag}")
-            log("\n" + leaderboard(out_dir, cands, val_losses))
-        pending_match = (c, start_match(c, out_dir, args.games, args.time, args.workers))
+            log("\n" + leaderboard(out_dir, cands, val_losses, opp_label))
+        pending_match = (c, start_match(c, out_dir, args.games, args.time, args.workers,
+                                        args.opponent_nnue))
         log(f"  match started {c.tag}")
 
     if pending_match is not None:
@@ -213,7 +237,7 @@ def main():
         proc.wait()
         log(f"  match done {pc.tag}")
 
-    log("\nFINAL LEADERBOARD\n" + leaderboard(out_dir, cands, val_losses))
+    log("\nFINAL LEADERBOARD\n" + leaderboard(out_dir, cands, val_losses, opp_label))
 
 
 if __name__ == "__main__":

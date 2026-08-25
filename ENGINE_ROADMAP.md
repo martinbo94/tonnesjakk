@@ -365,6 +365,37 @@ project's history. Next levers, in order: gen-1b (diverse data), then
 self-generated data (gen-2 labeled by the best net, gated vs heuristic AND
 previous net), then width.
 
+### Round 3 (gen-1 + gen-1b = 16.3M rows → 10.5M unique; 100 epochs)
+
+Gen-1b (300k games, random-moves 10, noise 0.15) cut duplicates from 74% to
+35% and moved the loss for the first time: net-1 config 0.4874 → **0.4607**.
+
+| architecture | Elo vs heuristic @100ms | val loss |
+|---|---|---|
+| plain+m+d20 128×32 λ0.5, 100% data | +201 [+170,+236] | 0.4607 |
+| … 50% data | +201 [+170,+237] | 0.4648 |
+| … 256×32 | +198 [+167,+232] | 0.4603 |
+| … λ0.8 control | +192 [+160,+227] | 0.4833 |
+| … 25% data | +187 [+157,+221] | 0.4705 |
+| halfpail+m+d20 256×32 λ0.5 | +181 [+150,+214] | 0.4679 |
+| … 256×64 | +177 [+146,+211] | 0.4608 |
+| … 512×32 | **+146** [+116,+178] | 0.4614 |
+
+**Loss and strength have decoupled.** Elo vs heuristic is flat ~+200 across
+25%→100% data and 128→256 width while loss improves; 512-wide has the SAME
+loss as 128 but −55 Elo — the wider net is slower per node, so at fixed time
+it searches less. ⇒ The bottleneck is now the NNUE engine's SEARCH side
+(speed; margins/LMP/qsearch tuned for the heuristic; no race term), not the
+eval's fit. Levers: SPSA-retune search with the net loaded, eval speed
+(quantization now earns its keep), head-to-head net gates (a fixed weaker
+opponent has lost resolution), deeper labels / gen-2.
+Head-to-head 100%-data vs 25%-data net (same arch/speed): **+16.5 [−7,+40]**
+over 400 games — 4x data ≈ nothing at fixed time. Draws 17% in net-vs-net
+(vs ~7% vs heuristic): similar evals → balanced games.
+NPS: heuristic 3.5M; NNUE 128×32 1.5M, 256 0.95M, 512 0.6M ⇒ depth 15 vs
+13/13/12 @100ms. **Round 4 = speed**: smaller nets, dense-feature cost,
+then quantization.
+
 **Slow-TC gate PASSED:** `plain_m_d20_128x32_l0.5` vs heuristic @ 200ms:
 **+225 Elo [+187, +268]** (225-21-54, 300 games) — larger than at 100ms
 (+207), i.e. the NNUE's edge GROWS with time (eval quality compounds with
