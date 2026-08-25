@@ -279,7 +279,8 @@ class DataGenerator:
         self,
         depth: int = 6,
         random_opening_moves: int = 4,
-        max_moves: int = 100
+        max_moves: int = 100,
+        noise_prob: float = 0.0,
     ) -> GameResult:
         """
         Play a single self-play game.
@@ -288,6 +289,11 @@ class DataGenerator:
             depth: Search depth for the engine
             random_opening_moves: Number of random moves at start (2-6 recommended)
             max_moves: Maximum moves before declaring draw
+            noise_prob: Probability of playing a random barrel move instead of
+                the engine's choice during the first 20 plies. Positions are
+                still labeled with the engine's search score; only the game
+                trajectory is diversified (a deterministic engine funnels
+                games into the same lines: gen-1 was 74% duplicate positions).
 
         Returns:
             GameResult with positions and outcome
@@ -362,7 +368,12 @@ class DataGenerator:
                         current_player=current_player
                     ))
 
-            board.make_move(result.best_move)
+            chosen = result.best_move
+            if noise_prob > 0 and move_count < 20 and random.random() < noise_prob:
+                alternatives = [m for m in board.generate_moves() if not m.is_pail_only]
+                if alternatives:
+                    chosen = random.choice(alternatives)
+            board.make_move(chosen)
             move_count += 1
 
             h = board.get_hash()
@@ -395,7 +406,8 @@ class DataGenerator:
         save_path: Optional[str] = None,
         config: Optional[Dict] = None,
         workers: int = 1,
-        lambda_blend: Optional[float] = None
+        lambda_blend: Optional[float] = None,
+        noise_prob: float = 0.0,
     ) -> Tuple[torch.Tensor, torch.Tensor, TrainingStats]:
         """
         Generate training dataset from self-play games.
@@ -466,7 +478,8 @@ class DataGenerator:
                 verbose=verbose, save_every=save_every, save_path=save_path,
                 config=config, workers=workers, nnue_path=nnue_path,
                 chunks_X=chunks_X, chunks_y=chunks_y, stats=stats,
-                start_time=start_time, lambda_blend=lambda_blend
+                start_time=start_time, lambda_blend=lambda_blend,
+                noise_prob=noise_prob,
             )
         else:
             self._generate_sequential(
@@ -475,7 +488,8 @@ class DataGenerator:
                 use_search_scores=use_search_scores, augment=augment,
                 verbose=verbose, save_every=save_every, save_path=save_path,
                 config=config, chunks_X=chunks_X, chunks_y=chunks_y,
-                stats=stats, start_time=start_time, lambda_blend=lambda_blend
+                stats=stats, start_time=start_time, lambda_blend=lambda_blend,
+                noise_prob=noise_prob,
             )
 
         if verbose:
@@ -515,7 +529,7 @@ class DataGenerator:
     def _generate_sequential(
         self, num_games, depth, random_opening_moves, use_search_scores,
         augment, verbose, save_every, save_path, config,
-        chunks_X, chunks_y, stats, start_time, lambda_blend=None
+        chunks_X, chunks_y, stats, start_time, lambda_blend=None, noise_prob=0.0
     ):
         """Sequential game generation (single process)."""
         pending_X: List[torch.Tensor] = []
@@ -529,7 +543,7 @@ class DataGenerator:
                 pending_y.clear()
 
         for game_num in range(num_games):
-            result = self.play_game(depth, random_opening_moves)
+            result = self.play_game(depth, random_opening_moves, noise_prob=noise_prob)
 
             if result.outcome > 0.5:
                 stats.white_wins += 1
@@ -594,7 +608,7 @@ class DataGenerator:
     def _generate_parallel(
         self, num_games, depth, random_opening_moves, use_search_scores,
         augment, verbose, save_every, save_path, config, workers, nnue_path,
-        chunks_X, chunks_y, stats, start_time, lambda_blend=None
+        chunks_X, chunks_y, stats, start_time, lambda_blend=None, noise_prob=0.0
     ):
         """Parallel game generation using multiprocessing.Pool.
 
@@ -629,7 +643,7 @@ class DataGenerator:
                     worker_args.append((
                         n, depth, random_opening_moves,
                         use_search_scores, augment, nnue_path,
-                        lambda_blend
+                        lambda_blend, noise_prob
                     ))
 
             # Run batch in parallel
@@ -796,7 +810,7 @@ def _generate_games_worker(args):
     Each worker creates its own DataGenerator with its own Engine instance.
     Returns numpy arrays to avoid torch tensor pickling issues.
     """
-    num_games, depth, random_moves, use_search_scores, augment, nnue_path, lambda_blend = args
+    num_games, depth, random_moves, use_search_scores, augment, nnue_path, lambda_blend, noise_prob = args
 
     gen = DataGenerator(nnue_path=nnue_path)
 
@@ -805,7 +819,7 @@ def _generate_games_worker(args):
     white_wins = black_wins = draws = 0
 
     for _ in range(num_games):
-        result = gen.play_game(depth, random_moves)
+        result = gen.play_game(depth, random_moves, noise_prob=noise_prob)
 
         if result.outcome > 0.5:
             white_wins += 1
@@ -881,6 +895,7 @@ def train_nnue(
     dense_size: int = 20,
     output_buckets: int = 1,
     dedupe: bool = False,
+    noise_prob: float = 0.0,
 ) -> Optional[nn.Module]:
     """
     Complete NNUE training pipeline (data generation, training, export).
@@ -956,6 +971,7 @@ def train_nnue(
             "input_size": INPUT_SIZE,
             "score_scaling": SCORE_SCALING,
             "lambda_blend": lambda_blend,
+            "noise_prob": noise_prob,
         }
         X, y, stats = generator.generate_dataset(
             num_games=num_games,
@@ -967,7 +983,8 @@ def train_nnue(
             save_path=save_data,
             config=config,
             workers=workers,
-            lambda_blend=lambda_blend
+            lambda_blend=lambda_blend,
+            noise_prob=noise_prob,
         )
 
         if generate_only:
@@ -1101,6 +1118,8 @@ Examples:
                         help="Output heads: 1, or 25 keyed on (white_scored, black_scored)")
     parser.add_argument("--dedupe", action="store_true",
                         help="Collapse duplicate positions before training, averaging their labels")
+    parser.add_argument("--noise-prob", type=float, default=0.0,
+                        help="Data generation: probability of a random move (first 20 plies) for trajectory diversity")
     parser.add_argument("--resume-from", type=str, default=None,
                         help="Resume training from a saved .pt model file")
 
@@ -1131,6 +1150,7 @@ Examples:
         dense_size=0 if args.no_dense else 20,
         output_buckets=args.output_buckets,
         dedupe=args.dedupe,
+        noise_prob=args.noise_prob,
     )
 
 

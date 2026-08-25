@@ -294,6 +294,53 @@ time management (bestmove stability) when we play timed matches.
 Not applicable (capture-dependent): SEE, ProbCut, MVV-LVA, capture history.
 Simplification candidates to test: razoring; killers once conthist is 2-ply.
 
+## THE NNUE ROOT CAUSE — inverted labels (found 2026-08-25)
+
+Gen-1 diagnostics before any architecture work: stored search-score labels
+had **r = −0.002 with game outcome** and r = −0.025 with the score
+differential — impossible for real d8 scores; their only correlate was side
+to move (r = +0.21). Cause: `play_game` negated the engine's score for
+black-to-move positions "to convert to White's perspective", but the
+minimax score is ALREADY White-perspective. Half of all labels were sign-
+inverted. **This bug predates this work and plausibly explains every
+earlier NNUE failure** (the old "val loss floor 0.5867", −115..−230 Elo).
+Fix: generator corrected; gen-1 repaired in place (3.1M labels un-negated;
+`*_y.bin.preflip_backup` kept). After repair: r = +0.75 with outcome; a
+linear model on the 20 dense features gets R² = 0.45 (was 0.06).
+
+Two more fixes on the way to the first result:
+- `dedupe_rows` permuted labels by the inverse of the row permutation
+  (val loss pinned at ln 2 = 0.693 for every candidate — the tell).
+- Rust evaluator returned tanh·1000 instead of 600·atanh (labels are
+  tanh(cp/600)), a compressed scale that broke every search margin.
+
+**First NNUE win:** `halfpail_m_d20_256x32` (mirror, dense), 60 epochs
+(39 s on MPS) on deduped gen-1 (1.61M unique positions, 74% dups removed):
+val 0.5453 (entropy floor ≈ 0.54) → **+165 Elo [+107, +233] vs heuristic
+at equal 100 ms** (84-5-31), despite reaching depth 8 vs 9 (NNUE 1.3 Mnps vs
+3.6). Plain features without dense/side-to-move: val 0.6287, −585 Elo —
+architecture matters enormously here.
+
+### Architecture tournament, round 1 (gen-1 repaired, 150 epochs, 400 games @ 100ms vs heuristic)
+
+| # | architecture | Elo vs heuristic | val loss |
+|---|---|---|---|
+| 1 | **plain + mirror + dense 20, 128×32** | **+203 [+168,+241]** | 0.5367 |
+| 2 | halfpail + mirror + dense, 128×32 | +177 [+146,+211] | 0.5458 |
+| 3 | halfpail + dense, 128×32 (legacy incumbent) | +171 [+141,+203] | 0.5480 |
+| 4 | plain + mirror, no dense, 256×32, 25 buckets | +163 [+132,+197] | 0.5580 |
+| 5 | halfpail + mirror + dense, 256×32, 25 buckets | +154 [+125,+186] | 0.5446 |
+| 6 | plain + mirror, no dense, 512×32, 25 buckets | +118 [+88,+150] | 0.5584 |
+| 7–13 | plain, no dense, no buckets (any width/λ/loss/dedupe) | −436 … −619 | 0.58–0.64 |
+
+Readings: the net MUST see game phase + side to move (dense features or
+scored-count buckets) — without either it is hopeless; with dense features
+the simple plain piece-square encoding beats HalfPail buckets (3996-feature
+embedding is too data-hungry for 1.6M unique positions); bigger nets are
+worse at this data size (128 > 256 > 512) ⇒ data-limited ⇒ gen-1b (diverse
+data) is the next lever. λ / loss / dedupe ran on the failing no-dense
+family (confounded) → round 2 re-tests them on the winner.
+
 ## Cleanup (2026-08-25)
 
 Removed: A/B-rejected knobs (`weight_pail_in_hand`, `weight_tempo`,

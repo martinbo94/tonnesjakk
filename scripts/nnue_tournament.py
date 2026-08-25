@@ -67,6 +67,22 @@ DEFAULT_CANDIDATES = [
     Candidate("plain", True, 0, 128, 32, 1, loss="mse"),    # loss A/B vs candidate 2
 ]
 
+# Round 2: variations of the round-1 winner (plain + mirror + dense, 128x32).
+ROUND2_CANDIDATES = [
+    Candidate("plain", True, 20, 128, 32, 1),                 # winner (re-run = noise floor)
+    Candidate("plain", True, 20, 128, 32, 25),                # + scored-count buckets
+    Candidate("plain", True, 20, 128, 32, 1, lam=0.5),        # label blend sweep
+    Candidate("plain", True, 20, 128, 32, 1, lam=1.0),
+    Candidate("plain", True, 20, 128, 32, 1, lam=0.65),
+    Candidate("plain", True, 20, 128, 32, 1, loss="mse"),     # classic NNUE loss
+    Candidate("plain", True, 20, 128, 32, 1, dedupe=False),   # dedupe A/B
+    Candidate("plain", True, 20, 64, 32, 1),                  # smaller
+    Candidate("plain", True, 20, 192, 32, 1),                 # slightly wider
+    Candidate("plain", True, 20, 128, 64, 1),                 # wider second layer
+]
+
+PRESETS = {"round1": DEFAULT_CANDIDATES, "round2": ROUND2_CANDIDATES}
+
 
 def train(c: Candidate, data: str, out_dir: Path, epochs: int, lr: float, batch: int, log) -> float:
     run_dir = out_dir / c.tag
@@ -134,13 +150,14 @@ def main():
     ap.add_argument("--time", type=int, default=100, help="ms per move for the equal-time gate")
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--only", type=str, default="", help="comma-separated candidate tags")
+    ap.add_argument("--preset", choices=sorted(PRESETS), default="round1")
     ap.add_argument("--skip-train", action="store_true")
     ap.add_argument("--skip-match", action="store_true")
     args = ap.parse_args()
 
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
-    cands = DEFAULT_CANDIDATES
+    cands = PRESETS[args.preset]
     if args.only:
         wanted = set(args.only.split(","))
         cands = [c for c in cands if c.tag in wanted]
