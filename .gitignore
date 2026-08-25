@@ -62,3 +62,6 @@ plan_*.md
 
 # Windows artifacts
 nul
+
+# Training runs (models, match logs); leaderboards are summarized in ENGINE_ROADMAP.md
+runs/

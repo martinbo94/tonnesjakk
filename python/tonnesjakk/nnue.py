@@ -877,6 +877,7 @@ def train_nnue(
     mirror_black: bool = False,
     dense_size: int = 20,
     output_buckets: int = 1,
+    dedupe: bool = False,
 ) -> Optional[nn.Module]:
     """
     Complete NNUE training pipeline (data generation, training, export).
@@ -992,6 +993,7 @@ def train_nnue(
         loss_fn=loss_fn,
         resume_from=resume_from,
         lambda_blend=lambda_blend,
+        dedupe=dedupe,
     )
 
     # Step 3: Export
@@ -1094,6 +1096,8 @@ Examples:
                         help="Drop the 20 dense relational features")
     parser.add_argument("--output-buckets", type=int, default=1, choices=[1, 25],
                         help="Output heads: 1, or 25 keyed on (white_scored, black_scored)")
+    parser.add_argument("--dedupe", action="store_true",
+                        help="Collapse duplicate positions before training, averaging their labels")
     parser.add_argument("--resume-from", type=str, default=None,
                         help="Resume training from a saved .pt model file")
 
@@ -1123,6 +1127,7 @@ Examples:
         mirror_black=args.mirror,
         dense_size=0 if args.no_dense else 20,
         output_buckets=args.output_buckets,
+        dedupe=args.dedupe,
     )
 
 

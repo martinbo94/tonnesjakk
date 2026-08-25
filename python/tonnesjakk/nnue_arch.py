@@ -172,6 +172,55 @@ def predecode_to_device(arch: NnueArch, X, y, start, count, batch_size, device,
     return batches
 
 
+# ─── deduplication ───────────────────────────────────────────────────────────
+
+def dedupe_rows(X, y, verbose: bool = True):
+    """Collapse identical positions, averaging their labels.
+
+    A deterministic engine with short random openings funnels games into the
+    same lines: measured 58% duplicate rows in gen-1. Averaging the labels of
+    duplicates denoises the target and stops funnel lines from dominating
+    training. Position identity = 144 piece planes + scored counts + pails +
+    side to move (features 144+8..144+13); the remaining relational features
+    are functions of those.
+    """
+    n = len(X)
+    keys = np.empty((n, 23), dtype=np.uint8)
+    chunk = 250_000
+    for s in range(0, n, chunk):
+        e = min(s + chunk, n)
+        xb = np.asarray(X[s:e], dtype=np.float32)
+        keys[s:e, :18] = np.packbits(xb[:, :144] > 0.5, axis=1)
+        keys[s:e, 18:] = np.round(xb[:, 152:157] * 4).astype(np.int8).view(np.uint8)
+    flat = np.ascontiguousarray(keys).view(np.dtype((np.void, 23))).ravel()
+    _, first_idx, inverse = np.unique(flat, return_index=True, return_inverse=True)
+    inverse = inverse.ravel()
+    m = len(first_idx)
+
+    y_arr = np.asarray(y, dtype=np.float32)
+    if y_arr.ndim == 1:
+        y_arr = y_arr[:, None]
+    counts = np.bincount(inverse, minlength=m).astype(np.float32)
+    y_unique = np.zeros((m, y_arr.shape[1]), dtype=np.float32)
+    for c in range(y_arr.shape[1]):
+        y_unique[:, c] = np.bincount(inverse, weights=y_arr[:, c], minlength=m) / counts
+
+    order = np.sort(first_idx)  # keep original (game) order for chunked reads
+    X_unique = np.empty((m, X.shape[1]), dtype=np.float32)
+    for s in range(0, m, chunk):
+        idx = order[s:s + chunk]
+        X_unique[s:s + chunk] = X[idx]
+    # y_unique is indexed by unique-id; remap to the sorted first_idx order
+    rank = np.empty(m, dtype=np.int64)
+    rank[np.argsort(first_idx)] = np.arange(m)
+    y_unique = y_unique[rank]
+
+    if verbose:
+        print(f"  Dedupe: {n:,} rows -> {m:,} unique positions "
+              f"({100 * (1 - m / n):.1f}% duplicates removed, labels averaged)")
+    return X_unique, y_unique
+
+
 # ─── training ────────────────────────────────────────────────────────────────
 
 def wdl_cross_entropy(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
@@ -191,13 +240,17 @@ def train_sparse_model(
     lambda_blend: Optional[float] = None,
     resume_from: Optional[str] = None,
     device: Optional[torch.device] = None,
+    dedupe: bool = False,
     verbose: bool = True,
 ):
     """Train a SparseNNUE. `y` may be (N,), (N,1) or (N,2)=[search_score, outcome]
-    (blended with lambda_blend: label = λ·score + (1−λ)·outcome, default λ=1)."""
+    (blended with lambda_blend: label = λ·score + (1−λ)·outcome, default λ=1).
+    With dedupe=True identical positions are collapsed and their labels averaged."""
     from .utils import get_device
     device = device or get_device("auto")
 
+    if dedupe:
+        X, y = dedupe_rows(X, y, verbose=verbose)
     n = len(X)
     split = int((1 - validation_split) * n)
     if y.ndim == 2 and y.shape[1] == 2:
