@@ -365,6 +365,12 @@ project's history. Next levers, in order: gen-1b (diverse data), then
 self-generated data (gen-2 labeled by the best net, gated vs heuristic AND
 previous net), then width.
 
+**Slow-TC gate PASSED:** `plain_m_d20_128x32_l0.5` vs heuristic @ 200ms:
+**+225 Elo [+187, +268]** (225-21-54, 300 games) — larger than at 100ms
+(+207), i.e. the NNUE's edge GROWS with time (eval quality compounds with
+depth; the per-node speed deficit matters less). Both gates cleared: this is
+**net-1 candidate** pending training on gen-1 + gen-1b.
+
 ## Cleanup (2026-08-25)
 
 Removed: A/B-rejected knobs (`weight_pail_in_hand`, `weight_tempo`,
