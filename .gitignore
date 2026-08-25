@@ -65,3 +65,6 @@ nul
 
 # Training runs (models, match logs); leaderboards are summarized in ENGINE_ROADMAP.md
 runs/
+
+# Label-file backups from in-place repairs
+*.preflip_backup
