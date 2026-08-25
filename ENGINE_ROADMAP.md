@@ -410,7 +410,22 @@ then quantization.
 Speed hypothesis confirmed: hidden2=16 (half the FC2 cost) beats net-1
 despite equal-or-worse loss; 32-wide is too small (eval quality loss wins).
 Dense features still pay (64×16 d20 +33 vs d0+buckets +10) despite their
-~25% throughput cost. Slow-TC gate for 96×16: running.
+~25% throughput cost. NPS: net-1 1.46M, 96×16 2.18M, 64×16 2.38M.
+**Slow-TC gate PASSED: 96×16 vs net-1 @200ms +43 [+21,+65].**
+
+## net-1b = `models/net1b_plain_m_d20_96x16_l05.json` (2026-08-25)
+
+plain piece-square features, mirrored black perspective, 20 dense features,
+96×16, single head, λ=0.5, trained 100 epochs on gen-1+gen-1b deduped
+(10.5M unique positions). Chain of evidence: ≈+200 Elo vs heuristic @100ms
+(family), +225 @200ms (128×32 sibling), +36/+43 vs net-1 @100/200ms. Web
+UI's heuristic engine now loads it by default when present.
+
+**Gen-2 running**: 300k games @ d8 labeled BY net-1b (--use-nnue), random-
+moves 10, noise 0.15, 10 workers → `training_gen2_d8.bin`. First turn of the
+self-improvement loop. Gate for net-2: vs net-1b AND vs heuristic, 100+200ms.
+Next speed lever after that: quantized inference (int16 accumulator / int8
+FC2) — FC2 and dense features dominate NNUE node cost.
 
 **Slow-TC gate PASSED:** `plain_m_d20_128x32_l0.5` vs heuristic @ 200ms:
 **+225 Elo [+187, +268]** (225-21-54, 300 games) — larger than at 100ms
