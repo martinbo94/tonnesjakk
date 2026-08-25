@@ -482,26 +482,6 @@ impl Engine {
     }
 
     #[getter]
-    fn weight_pail_in_hand(&self) -> i32 {
-        self.inner.weight_pail_in_hand
-    }
-
-    #[setter]
-    fn set_weight_pail_in_hand(&mut self, value: i32) {
-        self.inner.weight_pail_in_hand = value;
-    }
-
-    #[getter]
-    fn weight_tempo(&self) -> i32 {
-        self.inner.weight_tempo
-    }
-
-    #[setter]
-    fn set_weight_tempo(&mut self, value: i32) {
-        self.inner.weight_tempo = value;
-    }
-
-    #[getter]
     fn weight_race(&self) -> i32 {
         self.inner.weight_race
     }
@@ -509,28 +489,6 @@ impl Engine {
     #[setter]
     fn set_weight_race(&mut self, value: i32) {
         self.inner.weight_race = value;
-    }
-
-    #[getter]
-    fn weight_straggler(&self) -> i32 {
-        self.inner.weight_straggler
-    }
-
-    #[setter]
-    fn set_weight_straggler(&mut self, value: i32) {
-        self.inner.weight_straggler = value;
-    }
-
-    /// Pail relevance filter (0/1): search considers only pail placements
-    /// within 2 steps of any barrel.
-    #[getter]
-    fn pail_filter(&self) -> i32 {
-        self.inner.pail_filter as i32
-    }
-
-    #[setter]
-    fn set_pail_filter(&mut self, value: i32) {
-        self.inner.pail_filter = value != 0;
     }
 
     #[getter]
@@ -551,26 +509,6 @@ impl Engine {
     #[setter]
     fn set_lmp_base(&mut self, value: i32) {
         self.inner.lmp_base = value;
-    }
-
-    #[getter]
-    fn keep_killers(&self) -> i32 {
-        self.inner.keep_killers
-    }
-
-    #[setter]
-    fn set_keep_killers(&mut self, value: i32) {
-        self.inner.keep_killers = value;
-    }
-
-    #[getter]
-    fn asp_mode(&self) -> i32 {
-        self.inner.asp_mode
-    }
-
-    #[setter]
-    fn set_asp_mode(&mut self, value: i32) {
-        self.inner.asp_mode = value;
     }
 
     #[getter]
@@ -791,30 +729,16 @@ pub struct BitBoardEngine {
     pub weight_score_accel: i32,   // Non-linear scoring: extra reward for 2+ scored barrels
     pub weight_eg_threat: i32,     // Endgame threat amplification (scaled by game phase)
     pub weight_jump: i32,          // Bonus per barrel with forward jump available
-    pub weight_pail_in_hand: i32,  // Option value of an unplaced pail (can still be spent optimally)
-    pub weight_tempo: i32,         // Side-to-move bonus (this game is a race; tempo matters)
     pub weight_race: i32,          // Single-agent race distance difference (Roschke & Sturtevant)
-    pub weight_straggler: i32,     // Move-ORDERING bonus for advancing the hindmost barrel
 
-    // Search-space filter: only consider pail placements near barrels
-    // (Quoridor-style relevance pruning). Toggleable for A/B testing.
-    pub pail_filter: bool,
-
-    // ═══ Search features under test (0 = off, so A/B-able via match.py) ═══
-    // Reverse futility pruning: static eval beats beta by margin*depth → cutoff.
+    // ═══ Search knobs (A/B-able via match.py --set) ═══
+    // Reverse futility pruning: static eval beats beta by margin*depth → cutoff
+    // (0 = off; inconclusive at 120, retries pending).
     pub rfp_margin: i32,
     // Late move pruning: skip quiets after lmp_base + depth² ordered moves.
     pub lmp_base: i32,
-    // Keep killer moves across iterative-deepening iterations (1 = keep).
-    pub keep_killers: i32,
-    // Aspiration mode: 0 = fixed ±50 + full-window re-search (legacy),
-    // 1 = geometric one-sided widening starting at ±30.
-    // Default 1: SPRT PASS at 50ms (+42 [+20,+64]) AND 200ms (+31 [+13,+50]).
-    pub asp_mode: i32,
-    // Quiescence mode. 0 = legacy: any move landing within 2 rows of goal,
-    // 8 plies deep (measured ~360x main-node count in midgame — a full-width
-    // extension, not a quiescence search). 1 = scoring moves + moves to the
-    // row before goal, capped at 6 plies. 2 = scoring moves only, capped at 4.
+    // Quiescence: 1 = scoring moves + moves to the row before goal, cap 6;
+    // 2 = scoring moves only, cap 4 (default; beat mode 1 by +29 Elo).
     pub qs_mode: i32,
 }
 
@@ -876,23 +800,13 @@ impl BitBoardEngine {
             weight_score_accel: -3,
             weight_eg_threat: -1,
             weight_jump: 63,
-            // NOTE: pail placement is currently FORCED as the game's first
-            // sub-move (generate_moves phase 1), so pail_in_hand can never
-            // fire asymmetrically — A/B confirmed zero effect. Revisit if the
-            // rules are changed to allow delaying the pail.
-            weight_pail_in_hand: 0,
-            weight_tempo: 0, // A/B tested: -12 Elo at 20, no value
             // Validated 2026-08-24: +36 Elo @ d5 [+6,+67], +34 @ 50ms [+2,+66],
             // +63 @ d7 [+24,+104] vs 0. Sweep: 40 +13(ns), 120 +5(ns) → 80.
             weight_race: 80,
-            weight_straggler: 0, // A/B: -20 Elo at 6, no value
-            pail_filter: false,  // A/B: -2 Elo, no measurable speed win
             rfp_margin: 0,   // SPRT inconclusive at 120 (+2, 1000 games)
             // LMP: SPRT PASS @ 50ms (+27 [+10,+45]); @ 200ms accepted on CI
             // (+14 [+3,+26] over 1600 games; two independent LTC runs +16/+14).
             lmp_base: 6,
-            keep_killers: 0, // SPRT null (+1 in 2000 games) — archived
-            asp_mode: 1,     // PASSED both gates (see field comment)
             // qs_mode 2 PASSED both gates: +53 [+28,+78] @ 50ms, +62 [+35,+91]
             // @ 200ms vs legacy; beats qs_mode 1 head-to-head +29 [+11,+47].
             qs_mode: 2,
@@ -1204,25 +1118,6 @@ impl BitBoardEngine {
             score -= blocking_bonus;
         }
 
-        // Pail-in-hand option value: an unplaced pail can still be spent on
-        // the optimal square later; a placed pail is a sunk decision.
-        if self.weight_pail_in_hand != 0 {
-            if !bb.white_pail_placed {
-                score += self.weight_pail_in_hand;
-            }
-            if !bb.black_pail_placed {
-                score -= self.weight_pail_in_hand;
-            }
-        }
-
-        // Tempo: in a race game the side to move has an edge.
-        if self.weight_tempo != 0 {
-            match bb.current_player {
-                Player::White => score += self.weight_tempo,
-                Player::Black => score -= self.weight_tempo,
-            }
-        }
-
         // Single-agent race distance: exact min-plies for each side alone to
         // score all remaining barrels (jump chains over own barrels included).
         // The difference is the strongest known race-eval term in this game
@@ -1331,16 +1226,6 @@ impl BitBoardEngine {
                     Player::Black => to_row as i32 - from_row as i32,
                 };
                 score += forward * 100;
-
-                // Straggler tie-break (Chinese checkers heuristic): among
-                // otherwise-equal moves, prefer advancing the hindmost barrel.
-                if self.weight_straggler != 0 {
-                    let from_dist = match player {
-                        Player::White => from_row as i32,
-                        Player::Black => (BOARD_SIZE - 1) as i32 - from_row as i32,
-                    };
-                    score += from_dist * self.weight_straggler;
-                }
             }
 
             // Hopp-bonus
@@ -1401,14 +1286,11 @@ impl BitBoardEngine {
             self.tt.new_search();
         }
 
-        // Nullstill killer moves. With keep_killers=1 they persist across
-        // iterative-deepening iterations (standard in top engines) and are
-        // only cleared at the start of a fresh search.
-        if self.keep_killers == 0 || prev_score.is_none() {
-            for km in &mut self.killer_moves {
-                km[0] = None;
-                km[1] = None;
-            }
+        // Nullstill killer moves per iteration. (Persisting them across
+        // iterations was SPRT-null here: +1 Elo in 2000 games.)
+        for km in &mut self.killer_moves {
+            km[0] = None;
+            km[1] = None;
         }
 
         // Age history (don't clear - accumulated knowledge is valuable)
@@ -1429,20 +1311,20 @@ impl BitBoardEngine {
         // ═══════════════════════════════════════════════════════════════
         // ASPIRATION WINDOWS
         // ═══════════════════════════════════════════════════════════════
-        // asp_mode 0 (legacy): fixed ±50, full-window re-search on fail.
-        // asp_mode 1: start ±30, widen ONLY the failed side geometrically
-        // (standard in top engines — a fail-low says nothing about beta).
-        const ASPIRATION_WINDOW: i32 = 50;
+        // Start ±30 around the previous score; on a fail, widen ONLY the
+        // failed side geometrically (a fail-low says nothing about beta).
+        // SPRT-passed vs fixed ±50 + full-window re-search: +42 @ 50ms,
+        // +31 @ 200ms.
+        const ASPIRATION_DELTA: i32 = 30;
 
         let (mut alpha, mut beta) = match prev_score {
-            Some(score) if self.asp_mode == 1 => (score - 30, score + 30),
-            Some(score) => (score - ASPIRATION_WINDOW, score + ASPIRATION_WINDOW),
+            Some(score) => (score - ASPIRATION_DELTA, score + ASPIRATION_DELTA),
             None => (i32::MIN + 1, i32::MAX - 1),
         };
 
         let mut best_move;
         let mut score;
-        let mut delta: i32 = 30;
+        let mut delta: i32 = ASPIRATION_DELTA;
 
         loop {
             let (s, mv) = self.minimax(bb, depth, alpha, beta, maximizing);
@@ -1451,20 +1333,12 @@ impl BitBoardEngine {
 
             if score <= alpha {
                 // Fail low - utvid nedre grense
-                if self.asp_mode == 1 {
-                    delta *= 2;
-                    alpha = if delta > 1000 { i32::MIN + 1 } else { score - delta };
-                } else {
-                    alpha = i32::MIN + 1;
-                }
+                delta *= 2;
+                alpha = if delta > 1000 { i32::MIN + 1 } else { score - delta };
             } else if score >= beta {
                 // Fail high - utvid øvre grense
-                if self.asp_mode == 1 {
-                    delta *= 2;
-                    beta = if delta > 1000 { i32::MAX - 1 } else { score + delta };
-                } else {
-                    beta = i32::MAX - 1;
-                }
+                delta *= 2;
+                beta = if delta > 1000 { i32::MAX - 1 } else { score + delta };
             } else {
                 // Score innenfor vinduet - ferdig
                 break;
@@ -1483,11 +1357,7 @@ impl BitBoardEngine {
     /// Søker kun "spennende" trekk: tønner som når/nærmer seg mål
     /// qsdepth: current quiescence depth (starts at 0, max MAX_QSEARCH_DEPTH)
     fn quiesce(&mut self, bb: &BitBoard, mut alpha: i32, beta: i32, maximizing: bool, qsdepth: u8) -> i32 {
-        let max_qsearch_depth: u8 = match self.qs_mode {
-            0 => 8,
-            1 => 6,
-            _ => 4,
-        };
+        let max_qsearch_depth: u8 = if self.qs_mode == 1 { 6 } else { 4 };
 
         self.quiesce_nodes += 1;
 
@@ -1545,30 +1415,10 @@ impl BitBoardEngine {
                 if dist_to_goal == 0 {
                     return Some((0u8, mv));
                 }
-                // Mode 2: scoring moves only
-                if qs_mode >= 2 {
-                    return None;
-                }
-                // Move to the row before goal (immediate scoring threat)
-                if dist_to_goal == 1 {
+                // Mode 1 also takes moves to the row before goal (immediate
+                // scoring threat); mode 2 (default) is scoring moves only.
+                if qs_mode == 1 && dist_to_goal == 1 {
                     return Some((1u8, mv));
-                }
-                // Mode 1 stops here; legacy mode also takes forward moves to dist 2
-                if qs_mode == 1 {
-                    return None;
-                }
-                if dist_to_goal == 2 {
-                    if let Some(from_sq) = mv.barrel_from() {
-                        let (from_row, _) = sq_to_coords(from_sq as usize);
-                        let from_dist = if player == Player::White {
-                            from_row
-                        } else {
-                            BOARD_SIZE - 1 - from_row
-                        };
-                        if from_dist > dist_to_goal {
-                            return Some((2u8, mv));
-                        }
-                    }
                 }
                 None
             })
@@ -1932,35 +1782,9 @@ impl BitBoardEngine {
             };
 
         // Generate and order moves
-        let mut moves = bb.generate_moves();
+        let moves = bb.generate_moves();
         if moves.is_empty() {
             return (static_eval, None);
-        }
-
-        // Pail relevance filter (Quoridor-style): a useful pail placement is
-        // near the action. Keep only placements within 2 king-steps of any
-        // barrel; barrel moves are never filtered. Search-only heuristic —
-        // move legality is unchanged.
-        if self.pail_filter && moves.iter().any(|m| m.is_pail_placement()) {
-            let mut zone = bb.all_barrels();
-            for _ in 0..2 {
-                let mut grown = zone;
-                let mut z = zone;
-                while z != 0 {
-                    let sq = z.trailing_zeros() as usize;
-                    grown |= ADJACENT[sq];
-                    z &= z - 1;
-                }
-                zone = grown;
-            }
-            let filtered: Vec<BitMove> = moves
-                .iter()
-                .copied()
-                .filter(|m| !m.is_pail_placement() || zone & (1u64 << m.barrel_to()) != 0)
-                .collect();
-            if !filtered.is_empty() {
-                moves = filtered;
-            }
         }
 
         let sorted_moves = self.order_moves(moves, bb.current_player, depth as usize, tt_move.as_ref());

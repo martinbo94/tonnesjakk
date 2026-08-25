@@ -46,10 +46,7 @@ PARAMS = {
     "weight_score_accel":  (-3,  20, -200, 600),
     "weight_eg_threat":    (-1,  10, -100, 300),
     "weight_jump":         (63,   8, -50, 200),
-    "weight_pail_in_hand": (0,    8, -100, 200),
-    "weight_tempo":        (0,    6, -100, 100),
     "weight_race":         (80,  10, -50, 400),
-    "weight_straggler":    (0,    3, -30, 30),
 }
 
 _state = {}

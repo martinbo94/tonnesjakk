@@ -215,7 +215,7 @@ python -m tonnesjakk.alphazero --evaluate alphazero_resnet/best_model.pt --games
 │                                                      │
 │  board.rs    Board, BitBoard, moves, Zobrist hashing │
 │  nnue.rs     IncrementalNNUE, QuantizedNNUE,         │
-│              HalfPailNNUE, EvalCache                 │
+│              SparseNNUE (generic), EvalCache         │
 │  search.rs   BitBoardEngine, TT, Engine (Python API) │
 │  mcts.rs     MCTSEngine with batched NN eval         │
 │  lib.rs      Module glue, re-exports, pymodule       │
@@ -278,7 +278,7 @@ from tonnesjakk import Board, Engine
 
 board = Board()
 engine = Engine()
-engine.load_nnue("nnue_halfpail/nnue_weights.json")
+engine.load_nnue("runs/best/nnue_weights.json")  # optional; heuristic eval otherwise
 
 result = engine.search(board, depth=7)
 print(f"Best move: {result.best_move}, Score: {result.score}")
@@ -287,69 +287,83 @@ board.make_move(result.best_move)
 
 ### Train a New NNUE
 
+One dataset serves every architecture: positions are stored as full board
+state (144 one-hot piece planes + 20 relational features) with two labels
+(search score, game outcome), and each architecture derives its own sparse
+features at training time via the Rust decoder — the same code the engine
+evaluates with.
+
 ```bash
-# Generate self-play data (streaming mode, 8 parallel workers)
-python -m tonnesjakk.nnue --games 250000 --depth 7 --lambda 1.0 --workers 8 --save-data training_d7.bin --save-every 5000
+# Generate self-play data (checkpointed every 1000 games, resumable — rerun the same command)
+python -m tonnesjakk.nnue --generate-only --games 150000 --depth 8 --random-moves 6 --workers 4 \
+    --save-data training_gen1_d8.bin --save-every 1000
 
-# Train HalfPail NNUE on existing data
-python -m tonnesjakk.nnue --load-data training_consolidator_d9.bin --epochs 50 --halfpail
+# Train an architecture on existing data (runs on Apple Silicon GPU via MPS, or CUDA)
+python -m tonnesjakk.nnue --load-data training_gen1_d8.bin --feature-set plain --mirror \
+    --output-buckets 25 --arch 256 32 --epochs 50 --lambda 0.8 --output runs/plain_m_256
 
-# Compare NNUE vs heuristic (time-limited, more realistic)
-python scripts/test_model.py nnue_halfpail/nnue_weights.json --time-ms 200 --games 50
-
-# Compare at fixed depth
-python -m tonnesjakk.nnue --compare nnue_halfpail/nnue_weights.json heuristic --compare-games 50 --depth 5
+# Measure strength — always at equal TIME, with the match harness
+python scripts/match.py --time-a 100 --time-b 100 --nnue-a runs/plain_m_256/nnue_weights.json \
+    --games 400 --sprt 0 10
 ```
 
-## Performance
+Architecture knobs: `--feature-set halfpail|plain`, `--mirror` (black perspective
+sees a flipped board), `--no-dense`, `--output-buckets 1|25` (heads keyed on
+scored counts), `--arch H1 H2`, `--lambda` (search-score vs outcome blend).
 
-On a modern CPU (single-threaded):
+### Measuring changes
 
-| Metric | Heuristic eval | HalfPail NNUE |
-|--------|---------------|---------------|
-| Nodes/sec | ~500K | ~54K (undertrained) |
-| Typical depth in 1s | 10-12 | 5-7 |
-
-The HalfPail NNUE is currently undertrained (5 epochs). Poor eval quality causes inefficient pruning, which reduces effective NPS. Extended training should improve both eval quality and search efficiency simultaneously.
+Every engine change is gated by `scripts/match.py`: paired random openings
+played with both colors, real draw rules, fixed time or depth, Elo with 95% CI
+over pairs, and an SPRT stop rule (`--sprt 0 10` gainer, `--sprt -5 0`
+simplification). Pruning/search changes must also pass at a slower time
+control. Eval weights are tuned with `scripts/spsa_tune.py`. Rationale, the
+measurement log, and the roadmap live in `ENGINE_ROADMAP.md`.
 
 ## Project Structure
 
 ```
 tonnesjakk/
 ├── src/
-│   ├── board.rs                  # Board, BitBoard, moves, Zobrist (~1600 lines)
-│   ├── nnue.rs                   # NNUE variants + EvalCache (~1860 lines)
-│   ├── search.rs                 # Alpha-beta engine + TT (~1700 lines)
-│   ├── mcts.rs                   # MCTS with batched NN eval (~1550 lines)
-│   └── lib.rs                    # Module glue, re-exports, pymodule (~490 lines)
+│   ├── board.rs                  # Board, BitBoard, moves, draw clock, Zobrist
+│   ├── race.rs                   # Single-agent race distance table (eval term)
+│   ├── nnue.rs                   # Generic SparseNNUE evaluator + EvalCache
+│   ├── search.rs                 # Alpha-beta engine, TT, draw rules, Python Engine API
+│   ├── mcts.rs                   # MCTS with batched NN eval (AlphaZero line)
+│   └── lib.rs                    # pymodule, training-data decoder, tests
 ├── python/tonnesjakk/
-│   ├── nnue.py                   # Supervised NNUE training pipeline
+│   ├── nnue.py                   # Self-play data generation + training CLI
+│   ├── nnue_arch.py              # NnueArch, SparseNNUE model, trainer, JSON export
 │   ├── alphazero.py              # AlphaZero self-play training
-│   ├── mcts.py                   # Python MCTS (reference impl)
-│   ├── utils.py                  # Shared helpers (ELO, device, etc.)
+│   ├── utils.py                  # Shared helpers (device detection, etc.)
 │   └── __init__.py               # Python package init
 ├── web/
 │   ├── server.py                 # FastAPI web backend + post-game analysis API
 │   └── index.html                # Game UI with post-game engine analysis overlay
 ├── scripts/
-│   ├── train_alphazero.py        # Chunked AlphaZero training runner
-│   ├── test_model.py             # Time-based model comparison
+│   ├── match.py                  # Match harness: paired openings, Elo CI, SPRT
+│   ├── spsa_tune.py              # SPSA tuning of eval weights
+│   ├── run_spsa.sh               # Tune + validate recipe
 │   ├── bench_engine.py           # Engine speed benchmarks
-│   └── diagnose_wdl.py           # Per-move NNUE diagnostic tool
-├── nnue_halfpail/
-│   ├── nnue_weights.json         # Trained HalfPail NNUE weights
-│   └── nnue_model.pt             # PyTorch model checkpoint
-├── ENGINE_IMPROVEMENTS.md        # Search optimization roadmap
-├── CLAUDE.md                     # AI assistant project context
+│   ├── train_alphazero.py        # Chunked AlphaZero training runner
+│   ├── inspect_model.py, watch_game.py
+├── ENGINE_ROADMAP.md             # Strategy, measurement log, research, roadmap
+├── ALPHAZERO_RUNS.md             # History of the AlphaZero experiments
 ├── Cargo.toml                    # Rust dependencies
 └── pyproject.toml                # Python/maturin build config
 ```
 
 ## Heuristic Tuning: What Worked and What Didn't
 
-The heuristic evaluation weights are tuned via round-robin tournaments (`scripts/tune_heuristic.py`), where candidate configurations play hundreds of games against each other at depth 7 with randomized openings.
+The heuristic evaluation weights are tuned with SPSA (`scripts/spsa_tune.py`) and
+validated with `scripts/match.py`; the current defaults live in
+`BitBoardEngine::new` (`src/search.rs`) with their validation results, and the
+full log is in `ENGINE_ROADMAP.md`. The largest single eval term is the
+single-agent **race distance table** (`src/race.rs`, `weight_race`): exact
+min-moves for a lone side to score all remaining barrels, jump chains
+included — +36 Elo at depth 5 and +63 at depth 7 over the previous eval.
 
-**Current best configuration** (the "consolidator" profile):
+**Historical hand-tuned configuration** (2026-02, before SPSA and the race term):
 
 | Weight | Value | Description |
 |--------|-------|-------------|
@@ -369,8 +383,13 @@ The heuristic evaluation weights are tuned via round-robin tournaments (`scripts
 |---------|-------------|--------|---------------|
 | **Scoring threat extension** (`ext_threat`) | +1 ply search extension when a barrel reaches dist==1 from goal (analogous to check extension in chess) | 50.6% over 500 games vs baseline — no measurable benefit | The engine already handles threats well at depth 7. The existing threat/threat2 eval terms and good move ordering (goal-reaching moves scored high) make the extra search depth redundant. |
 | **Jump-to-score eval** (`weight_jump_score`) | Bonus per barrel that can chain-jump to the goal row in one turn, using DFS over the jump tables | Harmful at all values tested: 50% at weight=100, down to 35% at weight=120 | The DFS doesn't account for the barrel vacating its start square during the chain (reports false positives). The existing `jump` weight (single forward jump) already captures most tactical value with less noise. |
+| **Tempo bonus** (side to move) | Flat bonus for the side to move | −12 Elo [−38, +13] at 20 | Search parity already accounts for tempo. |
+| **Pail-in-hand scalar** | Static option-value bonus for an unplaced pail | +4 / +1 Elo at 30 / 80 (null) | Search prices the option within its horizon (matches the Quoridor literature); belongs in NNUE features, not a scalar. |
+| **Straggler ordering** | Prefer advancing the hindmost barrel among near-equal moves | −20 Elo [−47, +8] | Existing ordering (forward distance, history) already dominates. |
+| **Pail placement filter** | Only search pail squares within 2 steps of a barrel | −2 Elo [−32, +27] at fixed time | Pail moves were already ordered late and LMR-reduced; no speed to recover. |
+| **Killer persistence across iterations** | Keep killers between iterative-deepening depths | +1 Elo in 2000 games | Aspiration re-searches within an iteration already reuse them where it matters. |
 
-These features are not included in the engine. The code was implemented, A/B tested across 1500+ games, and removed.
+These features are not included in the engine. Each was implemented behind a flag, tested with the match harness, and removed.
 
 ## Technologies
 

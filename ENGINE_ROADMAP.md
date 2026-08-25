@@ -110,9 +110,12 @@ dimension the rules fix unlocked.
 2. ~~SPSA-tune eval weights, validate at d5/d7/d9~~ ✅ (+24/+25 Elo, applied)
 3. **NNUE, the proven recipe** (all local, M4 Pro):
    - ➤ RUNNING: `training_gen1_d8.bin` — 150k games @ d8, tuned engine,
-     random-moves 6, 10 workers (~3.8 games/s ⇒ ~11h; checkpoints every
-     2000 games, auto-resumes). Expect ~5M augmented positions, 2-label
-     format (search score + outcome).
+     random-moves 6, 4 nice'd workers, checkpoints every 1000 games,
+     auto-resumes. First 25k games were generated on the pre-qs2 binary at
+     3.1 games/s; after the quiescence fix the SAME 4 workers run at
+     **~46 games/s** (~15x) — the whole run now takes ~1h. 2-label format
+     (search score + outcome). Data from both engine versions is mixed
+     (labels are d8 search scores either way).
    - Train value-only net (PyTorch, MPS), export, load in Rust.
    - Gate at **equal time** via match.py. Iterate generations: once
      NNUE-engine > heuristic-engine, regenerate data with it.
@@ -290,6 +293,20 @@ more aggressive NMP (game is near-zugzwang-free), TT static-eval storage,
 time management (bestmove stability) when we play timed matches.
 Not applicable (capture-dependent): SEE, ProbCut, MVV-LVA, capture history.
 Simplification candidates to test: razoring; killers once conthist is 2-ply.
+
+## Cleanup (2026-08-25)
+
+Removed: A/B-rejected knobs (`weight_pail_in_hand`, `weight_tempo`,
+`weight_straggler`, `pail_filter`, `keep_killers`) and the legacy code paths
+behind `asp_mode=0` / `qs_mode=0`; the Python-side HalfPail feature functions
+and `decode_halfpail*` Rust exports (superseded by `decode_sparse_batch`);
+`nnue.py`'s 50-game no-draw-rules `--compare*` tooling and training-history
+tracking (measurement belongs to `match.py`); `--halfpail`, `--num-workers`,
+`--test-halfpail`; superseded scripts (`depth_tournament`, `tune_heuristic`,
+`bench_depth`, `benchmark_depths`, `test_model`, `diagnose_*`,
+`test_submove_matches`, one-off suite runners) and `NNUE_NEXT_STEPS.md` /
+`nnue_history.json`. Kept: AlphaZero core (documented research line),
+`bench_engine.py`, `watch_game.py`, `inspect_model.py`.
 
 ## Facts to remember
 

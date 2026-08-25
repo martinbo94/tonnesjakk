@@ -12,9 +12,9 @@ Key features:
 - Balanced dataset validation
 
 Usage:
-    python -m tonnesjakk.nnue --load-data data.bin --epochs 50  # Train on data
-    python -m tonnesjakk.nnue --games 10000 --save-data data.bin  # Generate data
-    python -m tonnesjakk.nnue --compare a.json heuristic --depth 6  # Compare
+    python -m tonnesjakk.nnue --generate-only --games 150000 --depth 8 --workers 4 --save-data data.bin
+    python -m tonnesjakk.nnue --load-data data.bin --feature-set plain --mirror --epochs 50 --output runs/x
+    (strength testing: scripts/match.py --nnue-a runs/x/nnue_weights.json --time-a 100 --time-b 100)
 """
 
 import json
@@ -64,270 +64,6 @@ INPUT_SIZE = BASE_FEATURES + RELATIONAL_FEATURES  # 164
 # This prevents information loss for extreme scores.
 # 600 means: +600cp → tanh(1) ≈ 0.76, +1200cp → 0.96, +3000cp → 1.00
 SCORE_SCALING = 600.0
-
-# HalfPail feature architecture constants
-# Inspired by Stockfish's HalfKP: piece positions contextualized by pail position.
-# Each perspective sees: bucket (pail position) × square × piece_type_reduced
-HALFPAIL_BUCKETS = 37       # 36 pail squares + 1 for "no pail placed"
-HALFPAIL_PIECE_TYPES = 3    # 0=friendly barrel, 1=enemy barrel, 2=enemy pail
-NUM_SQUARES = BOARD_SIZE * BOARD_SIZE  # 36
-HALFPAIL_FEATURES_PER_BUCKET = NUM_SQUARES * HALFPAIL_PIECE_TYPES  # 36 * 3 = 108
-HALFPAIL_FEATURES = HALFPAIL_BUCKETS * HALFPAIL_FEATURES_PER_BUCKET  # 37 * 108 = 3996
-HALFPAIL_DENSE = 20         # Dense features: all 20 relational features from training data
-
-
-# =============================================================================
-# HalfPail Feature Computation
-# =============================================================================
-
-def decode_board_from_dense164(row: np.ndarray) -> dict:
-    """Decode piece positions and game state from a 164-feature dense row.
-
-    The first 144 features are one-hot piece positions (36 squares × 4 piece types).
-    The remaining 20 are relational features from which we extract scored counts,
-    pail placement flags, current player, and barrels on board.
-
-    Returns:
-        dict with keys: white_barrels (list of sq), black_barrels, white_pail (sq or None),
-        black_pail (sq or None), white_scored, black_scored, current_player (+1/-1),
-        white_barrels_on_board, black_barrels_on_board
-    """
-    base = row[:144].reshape(36, 4)
-
-    white_barrels = []
-    black_barrels = []
-    white_pail = None
-    black_pail = None
-
-    for sq in range(36):
-        if base[sq, 0] > 0.5:
-            white_barrels.append(sq)
-        if base[sq, 1] > 0.5:
-            black_barrels.append(sq)
-        if base[sq, 2] > 0.5:
-            white_pail = sq
-        if base[sq, 3] > 0.5:
-            black_pail = sq
-
-    # Extract from relational features (indices 144+)
-    rel = row[144:]
-    white_scored = round(rel[8] * 4.0)   # feature[8] = white_scored / 4
-    black_scored = round(rel[9] * 4.0)   # feature[9] = black_scored / 4
-    current_player = 1.0 if rel[12] > 0 else -1.0  # feature[12] = +1 or -1
-
-    return {
-        'white_barrels': white_barrels,
-        'black_barrels': black_barrels,
-        'white_pail': white_pail,
-        'black_pail': black_pail,
-        'white_scored': int(white_scored),
-        'black_scored': int(black_scored),
-        'current_player': current_player,
-        'white_barrels_on_board': len(white_barrels),
-        'black_barrels_on_board': len(black_barrels),
-        'rel': rel,  # all 20 relational features for HalfPail dense input
-    }
-
-
-def halfpail_feature_index(bucket: int, sq: int, piece_type: int) -> int:
-    """Compute HalfPail sparse feature index.
-
-    Args:
-        bucket: pail square (0-35) or 36 if no pail placed
-        sq: piece square (0-35)
-        piece_type: 0=friendly barrel, 1=enemy barrel, 2=enemy pail
-
-    Returns:
-        Index in range [0, 3996)
-    """
-    return bucket * HALFPAIL_FEATURES_PER_BUCKET + sq * HALFPAIL_PIECE_TYPES + piece_type
-
-
-def board_to_halfpail_indices(board_dict: dict) -> tuple:
-    """Compute HalfPail sparse feature indices for both perspectives.
-
-    For each perspective (white/black):
-    - bucket = own pail square (or 36 if not placed)
-    - Encode all pieces EXCEPT own pail:
-        Type 0: own barrels ("friendly")
-        Type 1: opponent's barrels ("enemy")
-        Type 2: opponent's pail ("enemy pail")
-
-    Also returns the 20 dense relational features.
-
-    Returns:
-        (white_indices, black_indices, dense_6)
-        where indices are lists of ints in [0, 3996)
-        and dense_6 is a list of 6 floats
-    """
-    wb = board_dict['white_barrels']
-    bb = board_dict['black_barrels']
-    wp = board_dict['white_pail']
-    bp = board_dict['black_pail']
-    ws = board_dict['white_scored']
-    bs = board_dict['black_scored']
-
-    # White perspective: bucket = white pail position
-    w_bucket = wp if wp is not None else 36
-    white_indices = []
-    for sq in wb:
-        white_indices.append(halfpail_feature_index(w_bucket, sq, 0))  # friendly barrel
-    for sq in bb:
-        white_indices.append(halfpail_feature_index(w_bucket, sq, 1))  # enemy barrel
-    if bp is not None:
-        white_indices.append(halfpail_feature_index(w_bucket, bp, 2))  # enemy pail
-
-    # Black perspective: bucket = black pail position
-    b_bucket = bp if bp is not None else 36
-    black_indices = []
-    for sq in bb:
-        black_indices.append(halfpail_feature_index(b_bucket, sq, 0))  # friendly barrel
-    for sq in wb:
-        black_indices.append(halfpail_feature_index(b_bucket, sq, 1))  # enemy barrel
-    if wp is not None:
-        black_indices.append(halfpail_feature_index(b_bucket, wp, 2))  # enemy pail
-
-    # Dense features: all 20 relational features from the 164-dim row
-    if 'rel' in board_dict:
-        dense = board_dict['rel'].tolist() if hasattr(board_dict['rel'], 'tolist') else list(board_dict['rel'])
-    else:
-        # Fallback: compute the 6 basic features, pad to 20
-        dense = [0.0] * HALFPAIL_DENSE
-        dense[0] = 1.0 - min(wb[0], 5) / 5.0 if wb else 0.0  # approximate barrel distances
-        dense[4] = 1.0 - min(bb[0], 5) / 5.0 if bb else 0.0
-        dense[8] = ws / 4.0
-        dense[9] = bs / 4.0
-        dense[10] = 1.0 if wp is not None else 0.0
-        dense[11] = 1.0 if bp is not None else 0.0
-        dense[12] = board_dict['current_player']
-        dense[15] = (ws - bs) / 4.0
-        dense[16] = board_dict['white_barrels_on_board'] / 4.0
-        dense[17] = board_dict['black_barrels_on_board'] / 4.0
-
-    return white_indices, black_indices, dense
-
-
-def test_halfpail_decoding(n_positions: int = 100):
-    """Round-trip test: generate positions → encode 164 → decode → compute HalfPail indices.
-
-    Verifies that board decoding and index computation work correctly.
-    """
-    from tonnesjakk import Board, Engine
-    import random
-
-    print(f"Testing HalfPail decoding on {n_positions} positions...")
-    engine = Engine()
-    errors = 0
-
-    for i in range(n_positions):
-        board = Board()
-        # Play random moves to get diverse positions
-        for _ in range(random.randint(0, 20)):
-            moves = board.generate_moves()
-            if not moves or board.check_winner():
-                break
-            board.make_move(random.choice(moves))
-
-        if board.check_winner():
-            continue
-
-        # Encode to 164-dim tensor
-        board_array = board.to_array()
-        is_white = "White" in repr(board.current_player)
-        current_player = 1 if is_white else -1
-        tensor = board_to_tensor(
-            board_array,
-            white_scored=board.white_scored,
-            black_scored=board.black_scored,
-            current_player=current_player
-        )
-        row = tensor.numpy()
-
-        # Decode back
-        decoded = decode_board_from_dense164(row)
-
-        # Verify piece positions match
-        expected_wb = []
-        expected_bb_list = []
-        expected_wp = None
-        expected_bp = None
-        for r in range(6):
-            for c in range(6):
-                sq = r * 6 + c
-                val = board_array[r][c]
-                if val == 1:
-                    expected_wb.append(sq)
-                elif val == -1:
-                    expected_bb_list.append(sq)
-                elif val == 2:
-                    expected_wp = sq
-                elif val == -2:
-                    expected_bp = sq
-
-        if sorted(decoded['white_barrels']) != sorted(expected_wb):
-            print(f"  ERROR at pos {i}: white barrels mismatch")
-            errors += 1
-            continue
-        if sorted(decoded['black_barrels']) != sorted(expected_bb_list):
-            print(f"  ERROR at pos {i}: black barrels mismatch")
-            errors += 1
-            continue
-        if decoded['white_pail'] != expected_wp:
-            print(f"  ERROR at pos {i}: white pail mismatch")
-            errors += 1
-            continue
-        if decoded['black_pail'] != expected_bp:
-            print(f"  ERROR at pos {i}: black pail mismatch")
-            errors += 1
-            continue
-
-        # Compute HalfPail indices
-        w_idx, b_idx, dense = board_to_halfpail_indices(decoded)
-
-        # Verify index ranges
-        for idx in w_idx + b_idx:
-            if idx < 0 or idx >= HALFPAIL_FEATURES:
-                print(f"  ERROR at pos {i}: index {idx} out of range [0, {HALFPAIL_FEATURES})")
-                errors += 1
-                break
-
-        # Verify dense features
-        if len(dense) != HALFPAIL_DENSE:
-            print(f"  ERROR at pos {i}: dense has {len(dense)} features, expected {HALFPAIL_DENSE}")
-            errors += 1
-
-        # Verify active feature count is reasonable (barrels + pails on board)
-        n_pieces = len(decoded['white_barrels']) + len(decoded['black_barrels'])
-        if decoded['white_pail'] is not None:
-            n_pieces += 1
-        if decoded['black_pail'] is not None:
-            n_pieces += 1
-        # Each perspective encodes all pieces except own pail
-        # White perspective: own barrels + enemy barrels + enemy pail (if placed)
-        expected_w = len(decoded['white_barrels']) + len(decoded['black_barrels'])
-        if decoded['black_pail'] is not None:
-            expected_w += 1
-        if len(w_idx) != expected_w:
-            print(f"  ERROR at pos {i}: white has {len(w_idx)} indices, expected {expected_w}")
-            errors += 1
-
-    if errors == 0:
-        print(f"  All {n_positions} positions passed!")
-    else:
-        print(f"  {errors} errors found!")
-    return errors == 0
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 
@@ -1110,23 +846,6 @@ def _generate_games_worker(args):
 # Training
 # =============================================================================
 
-def wdl_cross_entropy(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-    """
-    Cross-entropy loss in Win-Draw-Loss probability space.
-
-    Converts tanh-space values [-1, 1] to WDL probabilities [0, 1]
-    and applies binary cross-entropy. This penalizes confident wrong
-    predictions much harder than MSE, forcing the network to learn
-    correct position ordering rather than outputting safe near-zero values.
-
-    Inspired by Stockfish NNUE training (nnue-pytorch).
-    """
-    eps = 1e-7
-    # Convert from tanh space [-1, 1] to WDL probability space [0, 1]
-    p = torch.clamp((pred + 1) / 2, eps, 1 - eps)
-    t = torch.clamp((target + 1) / 2, eps, 1 - eps)
-    # Binary cross-entropy
-    return -torch.mean(t * torch.log(p) + (1 - t) * torch.log(1 - p))
 
 
 # =============================================================================
@@ -1144,9 +863,6 @@ def train_nnue(
     use_nnue: Optional[str] = None,
     use_search_scores: bool = True,
     augment: bool = True,
-    compare: bool = True,
-    compare_games: int = 50,
-    track_history: bool = True,
     save_data: Optional[str] = None,
     load_data: Optional[str] = None,
     save_every: int = 0,
@@ -1156,7 +872,6 @@ def train_nnue(
     lambda_blend: Optional[float] = None,
     loss_fn: str = "wdl-ce",
     learning_rate: float = 0.001,
-    num_workers: int = 0,
     resume_from: Optional[str] = None,
     feature_set: str = "halfpail",
     mirror_black: bool = False,
@@ -1306,266 +1021,13 @@ def train_nnue(
     export_sparse_json(model, str(json_path))
     print(f"  JSON weights: {json_path}")
 
-    # Step 4: Compare with heuristic baseline (and optionally previous version)
-    comparison = None
-    if compare:
-        compare_depth = min(depth, 5)  # Use depth 5 max for faster comparison
-
-        # Always compare against heuristic baseline
-        print(f"\n[4/4] Comparing NNUE vs Heuristic ({compare_games} games, depth {compare_depth})...")
-        comparison = compare_nnue(
-            str(json_path),
-            "heuristic",
-            num_games=compare_games,
-            depth=compare_depth,
-            verbose=True
-        )
-        print(f"\n  NNUE vs Heuristic: NNUE={comparison['wins_a']} Heur={comparison['wins_b']} Draws={comparison['draws']}")
-        print(f"  NNUE win rate: {comparison['win_rate_a']*100:.1f}%")
-        print(f"  Estimated ELO diff: {comparison['elo_diff']:+d}")
-
-        if comparison['elo_diff'] > 50:
-            print("  [+] NNUE is significantly STRONGER than heuristic!")
-        elif comparison['elo_diff'] > 0:
-            print("  [+] NNUE is slightly stronger than heuristic")
-        elif comparison['elo_diff'] > -50:
-            print("  [=] NNUE is roughly equal to heuristic")
-        else:
-            print("  [!] NNUE is WEAKER than heuristic - needs more training")
-
-        # Optionally also compare against previous NNUE version
-        if old_weights_path:
-            print(f"\n  Also comparing vs previous NNUE...")
-            old_comparison = compare_nnue(
-                str(json_path),
-                str(old_weights_path),
-                num_games=compare_games,
-                depth=compare_depth,
-                verbose=False
-            )
-            print(f"  New vs Old NNUE: New={old_comparison['wins_a']} Old={old_comparison['wins_b']} Draws={old_comparison['draws']}")
-            print(f"  ELO diff vs old: {old_comparison['elo_diff']:+d}")
-
-    # Track history
-    if track_history:
-        history_path = output_path / "nnue_history.json"
-        history = load_training_history(str(history_path))
-        generation = len(history) + 1
-
-        config = {
-            "games": num_games,
-            "depth": depth,
-            "random_moves": random_moves,
-            "arch": arch.tag(),
-            "epochs": epochs,
-            "used_nnue": use_nnue is not None,
-            "search_scores": use_search_scores,
-            "augment": augment,
-            "loss_fn": loss_fn,
-        }
-        add_training_result(generation, config, comparison, str(history_path))
-        print(f"\n  Training history saved (generation {generation})")
-
     print("\n" + "=" * 60)
     print("TRAINING COMPLETE")
     print("=" * 60)
-
-    # Show history summary
-    if track_history:
-        print_training_history(str(output_path / "nnue_history.json"))
+    print("Measure strength with the match harness (equal time is the honest test):")
+    print(f"  python scripts/match.py --time-a 100 --time-b 100 --nnue-a {json_path} --games 400 --sprt 0 10")
 
     return model
-
-
-# =============================================================================
-# NNUE Comparison and History
-# =============================================================================
-
-def compare_nnue(
-    nnue_a: str,
-    nnue_b: str,
-    num_games: int = 100,
-    depth: int = 6,
-    time_ms: int = 0,
-    verbose: bool = True
-) -> Dict:
-    """
-    Play matches between two NNUE versions to compare strength.
-
-    Args:
-        nnue_a: Path to first NNUE weights (or "heuristic" for no NNUE)
-        nnue_b: Path to second NNUE weights (or "heuristic" for no NNUE)
-        num_games: Number of games to play
-        depth: Search depth (used when time_ms=0)
-        time_ms: Time per move in milliseconds (0 = use fixed depth instead)
-
-    Returns:
-        Dict with results: wins_a, wins_b, draws, win_rate_a, elo_diff
-    """
-    from tonnesjakk import Board, Engine
-
-    engine_a = Engine()
-    engine_b = Engine()
-
-    if nnue_a != "heuristic":
-        engine_a.load_nnue(nnue_a)
-    if nnue_b != "heuristic":
-        engine_b.load_nnue(nnue_b)
-
-    mode_str = f"{time_ms}ms/move" if time_ms > 0 else f"depth {depth}"
-    if verbose:
-        print(f"  Mode: {mode_str}")
-
-    wins_a = 0
-    wins_b = 0
-    draws = 0
-
-    for game_idx in range(num_games):
-        # Alternate colors
-        white_is_a = (game_idx % 2 == 0)
-
-        board = Board()
-        engine_a.full_reset()
-        engine_b.full_reset()
-
-        # Random opening for variety
-        for _ in range(random.randint(2, 4)):
-            moves = board.generate_moves()
-            if not moves or board.check_winner():
-                break
-            board.make_move(random.choice(moves))
-
-        # Play game
-        game_start = time.time()
-        move_count = 0
-        while board.check_winner() is None and move_count < 50:
-            # Per-game time limit: 60 seconds
-            if time.time() - game_start > 60.0:
-                break
-
-            # Determine which engine plays
-            is_white_turn = "White" in repr(board.current_player)
-            current_engine = engine_a if (is_white_turn == white_is_a) else engine_b
-
-            if time_ms > 0:
-                result = current_engine.search_timed(board, time_ms)
-            else:
-                result = current_engine.search(board, depth)
-            if result.best_move is None:
-                break
-            board.make_move(result.best_move)
-            move_count += 1
-
-        game_time = time.time() - game_start
-
-        # Score result
-        winner = board.check_winner()
-        if winner is None:
-            draws += 1
-        elif "White" in repr(winner):
-            if white_is_a:
-                wins_a += 1
-            else:
-                wins_b += 1
-        else:
-            if white_is_a:
-                wins_b += 1
-            else:
-                wins_a += 1
-
-        if verbose:
-            w = "draw" if winner is None else ("A" if (("White" in repr(winner)) == white_is_a) else "B")
-            print(f"  Game {game_idx + 1}/{num_games}: {w} ({move_count} moves, {game_time:.1f}s) | A={wins_a} B={wins_b} D={draws}", flush=True)
-
-    # Calculate stats
-    total = wins_a + wins_b + draws
-    win_rate_a = (wins_a + 0.5 * draws) / total if total > 0 else 0.5
-
-    # Approximate ELO difference (using logistic model)
-    # ELO diff = 400 * log10(win_rate / (1 - win_rate))
-    import math
-    if win_rate_a > 0.01 and win_rate_a < 0.99:
-        elo_diff = 400 * math.log10(win_rate_a / (1 - win_rate_a))
-    else:
-        elo_diff = 400 if win_rate_a > 0.5 else -400
-
-    return {
-        "wins_a": wins_a,
-        "wins_b": wins_b,
-        "draws": draws,
-        "win_rate_a": win_rate_a,
-        "elo_diff": round(elo_diff),
-        "games": total
-    }
-
-
-def load_training_history(path: str = "nnue_history.json") -> List[Dict]:
-    """Load training history from JSON file."""
-    if Path(path).exists():
-        with open(path, 'r') as f:
-            return json.load(f)
-    return []
-
-
-def save_training_history(history: List[Dict], path: str = "nnue_history.json"):
-    """Save training history to JSON file."""
-    with open(path, 'w') as f:
-        json.dump(history, f, indent=2)
-
-
-def add_training_result(
-    generation: int,
-    config: Dict,
-    comparison: Optional[Dict] = None,
-    history_path: str = "nnue_history.json"
-):
-    """Add a training result to the history."""
-    history = load_training_history(history_path)
-
-    entry = {
-        "generation": generation,
-        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "config": config,
-        "comparison": comparison
-    }
-    history.append(entry)
-
-    save_training_history(history, history_path)
-    return entry
-
-
-def print_training_history(history_path: str = "nnue_history.json"):
-    """Print training history summary."""
-    history = load_training_history(history_path)
-
-    if not history:
-        print("No training history found.")
-        return
-
-    print("\n" + "=" * 60)
-    print("TRAINING HISTORY")
-    print("=" * 60)
-    print(f"{'Gen':>4} {'Date':>12} {'Games':>7} {'Depth':>5} {'vs Prev':>10} {'ELO Diff':>10}")
-    print("-" * 60)
-
-    for entry in history:
-        gen = entry.get("generation", "?")
-        date = entry.get("timestamp", "?")[:10]
-        config = entry.get("config", {})
-        games = config.get("games", "?")
-        depth = config.get("depth", "?")
-
-        comp = entry.get("comparison")
-        if comp:
-            win_rate = f"{comp['win_rate_a']*100:.0f}%"
-            elo = f"{comp['elo_diff']:+d}"
-        else:
-            win_rate = "-"
-            elo = "-"
-
-        print(f"{gen:>4} {date:>12} {games:>7} {depth:>5} {win_rate:>10} {elo:>10}")
-
-    print("=" * 60)
 
 
 # =============================================================================
@@ -1574,15 +1036,18 @@ def print_training_history(history_path: str = "nnue_history.json"):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Train HalfPail NNUE for Tonnesjakk",
+        description="Generate self-play data and train NNUE evaluators for Tonnesjakk",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python -m tonnesjakk.nnue --load-data data.bin --epochs 50   # Train on existing data
-  python -m tonnesjakk.nnue --games 10000 --save-data data.bin  # Generate training data
-  python -m tonnesjakk.nnue --use-nnue nnue_weights.json  # Self-improvement loop
-  python -m tonnesjakk.nnue --compare a.json b.json --depth 6  # Equal-depth comparison
-  python -m tonnesjakk.nnue --compare-timed 500 a.json b.json  # Equal-time comparison (500ms/move)
+  # Generate training data (checkpointed, resumable)
+  python -m tonnesjakk.nnue --generate-only --games 150000 --depth 8 --workers 4 --save-data data.bin
+  # Train an architecture on existing data
+  python -m tonnesjakk.nnue --load-data data.bin --feature-set plain --mirror --output-buckets 25 \\
+      --arch 256 32 --epochs 50 --lambda 0.8 --output runs/plain_m_256
+  # Self-improvement loop: generate with an NNUE engine
+  python -m tonnesjakk.nnue --generate-only --use-nnue runs/best/nnue_weights.json --save-data gen2.bin
+  # Measure strength (equal time): scripts/match.py --nnue-a runs/x/nnue_weights.json --time-a 100 --time-b 100
         """
     )
 
@@ -1613,28 +1078,14 @@ Examples:
                         help="Load positions from file instead of generating")
     parser.add_argument("--no-augment", action="store_true",
                         help="Disable horizontal flip data augmentation")
-    parser.add_argument("--no-compare", action="store_true",
-                        help="Skip comparison with previous version")
-    parser.add_argument("--compare-games", type=int, default=50,
-                        help="Number of games for comparison (default: 50)")
-    parser.add_argument("--no-history", action="store_true",
-                        help="Don't track training history")
     parser.add_argument("--save-every", type=int, default=500,
                         help="Save checkpoint every N games during generation (default: 500)")
     parser.add_argument("--generate-only", action="store_true",
                         help="Only generate data (no training). Use with --save-data")
     parser.add_argument("--workers", type=int, default=1,
                         help="Number of parallel worker processes (default: 1)")
-    parser.add_argument("--history", action="store_true",
-                        help="Show training history and exit")
     parser.add_argument("--lambda", type=float, default=None, dest="lambda_blend",
                         help="Lambda blend: mix search scores and game outcomes (0.85 = 85%% eval + 15%% outcome)")
-    parser.add_argument("--compare", type=str, nargs=2, metavar=("NNUE_A", "NNUE_B"),
-                        help="Compare two NNUE versions (use 'heuristic' for no NNUE)")
-    parser.add_argument("--compare-timed", type=str, nargs=3, metavar=("MS", "NNUE_A", "NNUE_B"),
-                        help="Equal-time comparison: MS per move (use 'heuristic' for no NNUE)")
-    parser.add_argument("--halfpail", action="store_true",
-                        help="Use HalfPail architecture (default, kept for backward compatibility)")
     parser.add_argument("--feature-set", type=str, default="halfpail", choices=["halfpail", "plain"],
                         help="Sparse feature set: halfpail (pail-square buckets) or plain (default: halfpail)")
     parser.add_argument("--mirror", action="store_true",
@@ -1645,71 +1096,34 @@ Examples:
                         help="Output heads: 1, or 25 keyed on (white_scored, black_scored)")
     parser.add_argument("--resume-from", type=str, default=None,
                         help="Resume training from a saved .pt model file")
-    parser.add_argument("--num-workers", type=int, default=0,
-                        help="DataLoader workers for training (0=main process, 4+ recommended)")
-    parser.add_argument("--test-halfpail", action="store_true",
-                        help="Run HalfPail decoding round-trip test")
 
     args = parser.parse_args()
 
-    if args.test_halfpail:
-        test_halfpail_decoding(1000)
-    elif args.history:
-        print_training_history(str(Path(args.output) / "nnue_history.json"))
-    elif args.compare_timed:
-        ms, nnue_a, nnue_b = int(args.compare_timed[0]), args.compare_timed[1], args.compare_timed[2]
-        print(f"Comparing {nnue_a} vs {nnue_b} ({ms}ms/move, {args.compare_games} games)...")
-        result = compare_nnue(
-            nnue_a, nnue_b,
-            num_games=args.compare_games,
-            time_ms=ms,
-            verbose=True
-        )
-        print(f"\nFinal: A={result['wins_a']} B={result['wins_b']} D={result['draws']}")
-        print(f"Win rate A: {result['win_rate_a']*100:.1f}%")
-        print(f"ELO difference: {result['elo_diff']:+d} (A vs B)")
-    elif args.compare:
-        print(f"Comparing {args.compare[0]} vs {args.compare[1]} (depth {args.depth})...")
-        result = compare_nnue(
-            args.compare[0],
-            args.compare[1],
-            num_games=args.compare_games,
-            depth=args.depth,
-            verbose=True
-        )
-        print(f"\nFinal: A={result['wins_a']} B={result['wins_b']} D={result['draws']}")
-        print(f"Win rate A: {result['win_rate_a']*100:.1f}%")
-        print(f"ELO difference: {result['elo_diff']:+d} (A vs B)")
-    else:
-        train_nnue(
-            num_games=args.games,
-            depth=args.depth,
-            random_moves=args.random_moves,
-            hidden1=args.arch[0],
-            hidden2=args.arch[1],
-            epochs=args.epochs,
-            output_dir=args.output,
-            use_nnue=args.use_nnue,
-            augment=not args.no_augment,
-            compare=not args.no_compare,
-            compare_games=args.compare_games,
-            track_history=not args.no_history,
-            save_data=args.save_data,
-            load_data=args.load_data,
-            save_every=args.save_every,
-            generate_only=args.generate_only,
-            workers=args.workers,
-            batch_size=args.batch_size,
-            lambda_blend=args.lambda_blend,
-            loss_fn=args.loss,
-            learning_rate=args.lr,
-            num_workers=args.num_workers,
-            resume_from=args.resume_from,
-            feature_set=args.feature_set,
-            mirror_black=args.mirror,
-            dense_size=0 if args.no_dense else 20,
-            output_buckets=args.output_buckets,
-        )
+    train_nnue(
+        num_games=args.games,
+        depth=args.depth,
+        random_moves=args.random_moves,
+        hidden1=args.arch[0],
+        hidden2=args.arch[1],
+        epochs=args.epochs,
+        output_dir=args.output,
+        use_nnue=args.use_nnue,
+        augment=not args.no_augment,
+        save_data=args.save_data,
+        load_data=args.load_data,
+        save_every=args.save_every,
+        generate_only=args.generate_only,
+        workers=args.workers,
+        batch_size=args.batch_size,
+        lambda_blend=args.lambda_blend,
+        loss_fn=args.loss,
+        learning_rate=args.lr,
+        resume_from=args.resume_from,
+        feature_set=args.feature_set,
+        mirror_black=args.mirror,
+        dense_size=0 if args.no_dense else 20,
+        output_buckets=args.output_buckets,
+    )
 
 
 if __name__ == "__main__":
