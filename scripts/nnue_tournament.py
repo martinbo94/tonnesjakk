@@ -118,9 +118,19 @@ ROUND5_CANDIDATES = [
     Candidate("plain", True, 20, 96, 16, 25, lam=0.5),   # buckets with 3x data
 ]
 
+# Round 6: net-3 candidates on gen-1..3 (gen-3 labeled by net-2 + tablebases).
+# Gate vs net-2 (--opponent-nnue models/net2_*.json), then the full ladder.
+ROUND6_CANDIDATES = [
+    Candidate("plain", True, 20, 96, 16, 25, lam=0.5),    # net-2 config, more data
+    Candidate("plain", True, 20, 128, 16, 25, lam=0.5),
+    Candidate("plain", True, 20, 64, 16, 25, lam=0.5),
+    Candidate("plain", True, 20, 96, 16, 25, lam=0.65),
+    Candidate("plain", True, 20, 128, 32, 25, lam=0.5),   # wider FC2 now that data is 3x
+]
+
 PRESETS = {"round1": DEFAULT_CANDIDATES, "round2": ROUND2_CANDIDATES,
            "round3": ROUND3_CANDIDATES, "round4": ROUND4_CANDIDATES,
-           "round5": ROUND5_CANDIDATES}
+           "round5": ROUND5_CANDIDATES, "round6": ROUND6_CANDIDATES}
 
 
 def train(c: Candidate, data: str, out_dir: Path, epochs: int, lr: float, batch: int, log) -> float:
