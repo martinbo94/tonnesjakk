@@ -89,9 +89,9 @@ fn solve_tablebase(py: Python, dir: &str, wr: usize, br: usize, verbose: bool) -
     let stats = py.allow_threads(|| {
         let phase = tb.solve(wr, br, verbose);
         let n = phase.num_states();
-        let w = phase.values.iter().filter(|&&v| tablebase::is_white_win(v)).count();
-        let b = phase.values.iter().filter(|&&v| tablebase::is_black_win(v)).count();
-        let d = phase.values.iter().filter(|&&v| v == tablebase::V_DRAW).count();
+        let w = phase.vals().iter().filter(|&&v| tablebase::is_white_win(v)).count();
+        let b = phase.vals().iter().filter(|&&v| tablebase::is_black_win(v)).count();
+        let d = phase.vals().iter().filter(|&&v| v == tablebase::V_DRAW).count();
         phase.save(path).map(|_| (n, w, b, d))
     }).map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("save tablebase: {}", e)))?;
     Ok(stats)

@@ -122,13 +122,19 @@ impl ConfigSpace {
     }
 }
 
-/// One solved (or being solved) phase.
+/// One solved (or being solved) phase. Values live either in an owned Vec
+/// (while solving) or in a read-only memory map of the phase file (when
+/// loaded by engines): the OS page cache then shares one copy across all
+/// worker processes, so ten data-gen workers loading 2v2 cost 1.2 GB total,
+/// not 12.
 pub struct Phase {
     pub wr: usize,
     pub br: usize,
     wcfg: ConfigSpace,
     bcfg: ConfigSpace,
     pub values: Vec<u8>,
+    mapped: Option<memmap2::Mmap>,
+    num_states: usize,
 }
 
 impl Phase {
@@ -136,10 +142,19 @@ impl Phase {
         let wcfg = ConfigSpace::new(Player::White, wr);
         let bcfg = ConfigSpace::new(Player::Black, br);
         let n = (wcfg.count * bcfg.count) as usize * PAIL_STATES * PAIL_STATES * 4;
-        Phase { wr, br, wcfg, bcfg, values: vec![V_UNKNOWN; n] }
+        Phase { wr, br, wcfg, bcfg, values: vec![V_UNKNOWN; n], mapped: None, num_states: n }
     }
 
-    pub fn num_states(&self) -> usize { self.values.len() }
+    pub fn num_states(&self) -> usize { self.num_states }
+
+    /// Read access to values regardless of storage.
+    #[inline]
+    pub fn vals(&self) -> &[u8] {
+        match &self.mapped {
+            Some(m) => &m[..],
+            None => &self.values,
+        }
+    }
 
     #[inline]
     fn pail_index(pail: u64) -> usize {
@@ -206,17 +221,20 @@ impl Phase {
 
     pub fn save(&self, dir: &Path) -> std::io::Result<()> {
         std::fs::create_dir_all(dir)?;
-        std::fs::write(dir.join(format!("tb_{}v{}.bin", self.wr, self.br)), &self.values)
+        std::fs::write(dir.join(format!("tb_{}v{}.bin", self.wr, self.br)), self.vals())
     }
 
+    /// Memory-map a solved phase file (read-only, shared across processes).
     pub fn load(dir: &Path, wr: usize, br: usize) -> std::io::Result<Self> {
-        let mut p = Phase::new(wr, br);
-        let bytes = std::fs::read(dir.join(format!("tb_{}v{}.bin", wr, br)))?;
-        if bytes.len() != p.values.len() {
+        let wcfg = ConfigSpace::new(Player::White, wr);
+        let bcfg = ConfigSpace::new(Player::Black, br);
+        let n = (wcfg.count * bcfg.count) as usize * PAIL_STATES * PAIL_STATES * 4;
+        let file = std::fs::File::open(dir.join(format!("tb_{}v{}.bin", wr, br)))?;
+        let mmap = unsafe { memmap2::Mmap::map(&file)? };
+        if mmap.len() != n {
             return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "tablebase size mismatch"));
         }
-        p.values = bytes;
-        Ok(p)
+        Ok(Phase { wr, br, wcfg, bcfg, values: Vec::new(), mapped: Some(mmap), num_states: n })
     }
 }
 
@@ -251,7 +269,7 @@ impl Tablebase {
         let br = 4 - bb.black_scored as usize;
         let phase = self.get(wr, br)?;
         let idx = phase.index(bb)?;
-        let v = phase.values[idx];
+        let v = phase.vals()[idx];
         if v == V_INVALID || v == V_UNKNOWN { None } else { Some(v) }
     }
 
@@ -491,9 +509,9 @@ mod tests {
     fn test_solve_1v1_matches_search() {
         let mut tb = Tablebase::new();
         let phase = tb.solve(1, 1, false);
-        let n_draw = phase.values.iter().filter(|&&v| v == V_DRAW).count();
-        let n_w = phase.values.iter().filter(|&&v| is_white_win(v)).count();
-        let n_b = phase.values.iter().filter(|&&v| is_black_win(v)).count();
+        let n_draw = phase.vals().iter().filter(|&&v| v == V_DRAW).count();
+        let n_w = phase.vals().iter().filter(|&&v| is_white_win(v)).count();
+        let n_b = phase.vals().iter().filter(|&&v| is_black_win(v)).count();
         assert!(n_w > 0 && n_b > 0, "both sides should have wins in 1v1 ({} / {} / {} draws)", n_w, n_b, n_draw);
 
         // Position: white barrel one step from goal, white to move, black barrel far: white wins in 1
