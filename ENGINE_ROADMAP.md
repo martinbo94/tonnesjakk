@@ -227,6 +227,24 @@ trivially inflates both while possibly discarding decisive lines).
   --candidate …`), not just its parent. Strength is not transitive; a net
   trained on its parent's games can exploit the parent specifically.
   Periodic `--round-robin` over the rungs checks the ladder stays monotone.
+
+  First round-robin (2026-08-26, 100ms, 200 games/pair, under datagen
+  contention):
+
+  | row vs col | heuristic | net-1 | net-1a | net-1b |
+  |---|---|---|---|---|
+  | heuristic | — | −186 | −220 | −249 |
+  | net-1 (gen-1, 128×32) | +186 | — | −23 | −10 |
+  | net-1a (gen-1+1b, 128×32) | +220 | +23 | — | +12 |
+  | net-1b (gen-1+1b, 96×16) | +249 | +10 | −12 | — |
+
+  Monotone vs the heuristic (186 < 220 < 249). Net-vs-net gaps are within
+  noise at 200 games (CI ≈ ±36): net-1a vs net-1b +12 [−24,+49] here vs
+  net-1b's earlier +36 [+13,+59] (400 games) and +43 [+21,+65] @200ms.
+  Combined evidence still favors net-1b ≥ net-1a, but the honest reading is
+  that the three nets are within ~10–40 Elo of each other — consistent with
+  the loss plateau. Rerun net-1a vs net-1b with 800+ games on an idle
+  machine to settle it; net-vs-net gates need ≥600 games to resolve 30 Elo.
 - Debug tool: a build with all pruning disabled must reproduce plain
   alpha-beta results at equal depth (validates implementation; SPRT
   validates the policy).
