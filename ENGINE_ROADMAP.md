@@ -531,6 +531,16 @@ gen-1+1b+2). Added to the ladder; web UI default. First closed turn of the
 self-improvement loop: heuristic → net-1b (+225) → net-2 (+251 vs heuristic,
 +46 over its own teacher).
 
+## Gen-3 (2026-08-26): labeled by net-2 WITH tablebases
+
+`--tb tablebases`: workers' engines probe the solved phases (≤5 barrels
+remaining) in search; solved positions get exact +1/−1/0 labels that bypass
+the "decided" filter. Smoke (200 games): 22% of positions tablebase-exact,
+corr(score, outcome) 0.82 (was ~0.7). Running: 300k games, d8, noise 0.15,
+random-moves 10, 10 workers → `training_gen3_d8.bin` (~3–4 h; NNUE labeler
++ TB probes). Next: round 6 (net-3 candidates on gen-1..3, ladder incl.
+net-2), then 4v1 tablebase, then the 3v3 compaction project.
+
 ## Endgame tablebases (2026-08-26, `src/tablebase.rs`)
 
 Phase = (white remaining, black remaining) barrels; scoring is irreversible
