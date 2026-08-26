@@ -36,7 +36,7 @@ struct TTEntry {
     score: i32,       // Resultatet
     flag: TTFlag,     // Type score
     generation: u8,   // Søke-generasjon (for aging)
-    best_move: Option<Move>,  // Beste trekk (for move ordering)
+    best_move: Option<BitMove>,  // Beste trekk (for move ordering); Copy, no heap
 }
 
 /// ═══════════════════════════════════════════════════════════════
@@ -95,7 +95,7 @@ impl TranspositionTable {
         None
     }
 
-    fn store(&mut self, hash: u64, depth: u8, score: i32, flag: TTFlag, best_move: Option<Move>) {
+    fn store(&mut self, hash: u64, depth: u8, score: i32, flag: TTFlag, best_move: Option<BitMove>) {
         let idx = self.index(hash);
         let cluster = &mut self.clusters[idx];
 
@@ -1584,19 +1584,14 @@ impl BitBoardEngine {
         let node_ply = self.ply();
         let tt_result = if let Some(entry) = self.tt.probe(hash) {
             self.tt_hits += 1;
-            // Clone the move so we can use it after the borrow ends
-            let mv_clone = entry.best_move.clone();
             // Convert node-relative win scores back to root-relative
-            Some((entry.depth, Self::value_from_tt(entry.score, node_ply), entry.flag, mv_clone))
+            Some((entry.depth, Self::value_from_tt(entry.score, node_ply), entry.flag, entry.best_move))
         } else {
             None
         };
 
-        if let Some((tt_depth, tt_score, tt_flag, ref tt_mv_opt)) = tt_result {
-            // Now convert the move outside the borrow
-            if let Some(ref mv) = tt_mv_opt {
-                tt_move = Some(Self::move_to_bitmove_static(mv));
-            }
+        if let Some((tt_depth, tt_score, tt_flag, tt_mv_opt)) = tt_result {
+            tt_move = tt_mv_opt;
 
             if tt_depth >= depth {
                 match tt_flag {
@@ -1983,34 +1978,9 @@ impl BitBoardEngine {
             TTFlag::Exact
         };
 
-        let tt_best_move = best_move.map(|m| m.to_move());
-        self.tt.store(hash, depth, Self::value_to_tt(best_score, node_ply), flag, tt_best_move);
+        self.tt.store(hash, depth, Self::value_to_tt(best_score, node_ply), flag, best_move);
 
         (best_score, best_move)
-    }
-
-    /// Konverter Move til BitMove (statisk versjon)
-    fn move_to_bitmove_static(mv: &Move) -> BitMove {
-        if mv.is_pail_only {
-            let pail = mv.place_pail.unwrap();
-            let pail_sq = sq(pail.row as usize, pail.col as usize) as u8;
-            return BitMove::new_pail_placement(pail_sq);
-        }
-
-        let barrel_to = sq(mv.barrel_to.row as usize, mv.barrel_to.col as usize) as u8;
-        let pail_pos = mv.place_pail.map(|p| sq(p.row as usize, p.col as usize) as u8);
-
-        if mv.is_barrel_placement {
-            BitMove::new_placement(barrel_to, pail_pos)
-        } else {
-            let from = mv.barrel_from.unwrap();
-            let barrel_from = sq(from.row as usize, from.col as usize) as u8;
-            let path: Vec<u8> = mv.barrel_path
-                .iter()
-                .map(|p| sq(p.row as usize, p.col as usize) as u8)
-                .collect();
-            BitMove::new_move(barrel_from, barrel_to, &path, pail_pos)
-        }
     }
 
     // ═══════════════════════════════════════════════════════════════
