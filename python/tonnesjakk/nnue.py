@@ -251,13 +251,16 @@ class DataGenerator:
     - Filters out near-terminal positions
     """
 
-    def __init__(self, nnue_path: Optional[str] = None):
+    def __init__(self, nnue_path: Optional[str] = None, tb_dir: Optional[str] = None):
         """
         Initialize the data generator.
 
         Args:
             nnue_path: Path to NNUE weights JSON file. If provided, uses NNUE
                       for evaluation during self-play. Otherwise uses heuristics.
+            tb_dir: Directory of solved tablebase phases. If provided, the
+                    engine probes them in search and solved positions get
+                    exact win/loss/draw labels.
         """
         from tonnesjakk import Board, Engine
         self.Board = Board
@@ -266,6 +269,8 @@ class DataGenerator:
         self._engine = Engine()
         self._using_nnue = False
         self._nnue_path = nnue_path
+        self._tb_dir = tb_dir
+        self._using_tb = False
 
         if nnue_path is not None:
             try:
@@ -274,6 +279,13 @@ class DataGenerator:
                 print(f"  Loaded NNUE weights from: {nnue_path}")
             except Exception as e:
                 print(f"  Warning: Failed to load NNUE ({e}), using heuristics")
+        if tb_dir is not None:
+            try:
+                phases = self._engine.load_tablebases(tb_dir)
+                self._using_tb = len(phases) > 0
+                print(f"  Loaded tablebases from {tb_dir}: {phases}")
+            except Exception as e:
+                print(f"  Warning: Failed to load tablebases ({e})")
 
     def play_game(
         self,
@@ -343,8 +355,21 @@ class DataGenerator:
             if move_count >= 4:
                 raw_score = result.score
 
+                # Tablebase-solved position: exact label (+1 white wins, -1 black
+                # wins, 0 draw). These must NOT be dropped by the "decided" filter
+                # below — they are exactly the endgame knowledge the net should learn.
+                tb = self._engine.tablebase_probe(board) if self._using_tb else None
+                if tb is not None:
+                    is_white = "White" in repr(board.current_player)
+                    positions.append(PositionData(
+                        board=board.to_array(),
+                        search_score={"white": 1.0, "black": -1.0, "draw": 0.0}[tb[0]],
+                        white_scored=board.white_scored,
+                        black_scored=board.black_scored,
+                        current_player=1 if is_white else -1
+                    ))
                 # Skip noisy/decided positions
-                if abs(raw_score) <= 3000:
+                elif abs(raw_score) <= 3000:
                     is_white = "White" in repr(board.current_player)
                     current_player = 1 if is_white else -1
 
@@ -467,6 +492,7 @@ class DataGenerator:
         nnue_path = None
         if self._using_nnue:
             nnue_path = getattr(self, '_nnue_path', None)
+        tb_dir = self._tb_dir if self._using_tb else None
 
         start_time = time.time()
 
@@ -479,7 +505,7 @@ class DataGenerator:
                 config=config, workers=workers, nnue_path=nnue_path,
                 chunks_X=chunks_X, chunks_y=chunks_y, stats=stats,
                 start_time=start_time, lambda_blend=lambda_blend,
-                noise_prob=noise_prob,
+                noise_prob=noise_prob, tb_dir=tb_dir,
             )
         else:
             self._generate_sequential(
@@ -608,7 +634,8 @@ class DataGenerator:
     def _generate_parallel(
         self, num_games, depth, random_opening_moves, use_search_scores,
         augment, verbose, save_every, save_path, config, workers, nnue_path,
-        chunks_X, chunks_y, stats, start_time, lambda_blend=None, noise_prob=0.0
+        chunks_X, chunks_y, stats, start_time, lambda_blend=None, noise_prob=0.0,
+        tb_dir=None
     ):
         """Parallel game generation using multiprocessing.Pool.
 
@@ -643,7 +670,7 @@ class DataGenerator:
                     worker_args.append((
                         n, depth, random_opening_moves,
                         use_search_scores, augment, nnue_path,
-                        lambda_blend, noise_prob
+                        lambda_blend, noise_prob, tb_dir
                     ))
 
             # Run batch in parallel
@@ -810,9 +837,9 @@ def _generate_games_worker(args):
     Each worker creates its own DataGenerator with its own Engine instance.
     Returns numpy arrays to avoid torch tensor pickling issues.
     """
-    num_games, depth, random_moves, use_search_scores, augment, nnue_path, lambda_blend, noise_prob = args
+    num_games, depth, random_moves, use_search_scores, augment, nnue_path, lambda_blend, noise_prob, tb_dir = args
 
-    gen = DataGenerator(nnue_path=nnue_path)
+    gen = DataGenerator(nnue_path=nnue_path, tb_dir=tb_dir)
 
     all_X = []
     all_y = []  # Each entry is [search_score, outcome] — 2 floats per position
@@ -897,6 +924,7 @@ def train_nnue(
     dedupe: bool = False,
     noise_prob: float = 0.0,
     data_fraction: float = 1.0,
+    tb_dir: Optional[str] = None,
 ) -> Optional[nn.Module]:
     """
     Complete NNUE training pipeline (data generation, training, export).
@@ -975,7 +1003,7 @@ def train_nnue(
 
         step_label = "Generating" if generate_only else "[1/3] Generating"
         print(f"\n{step_label} training data...")
-        generator = DataGenerator(nnue_path=use_nnue)
+        generator = DataGenerator(nnue_path=use_nnue, tb_dir=tb_dir)
         config = {
             "games": num_games,
             "depth": depth,
@@ -1144,6 +1172,8 @@ Examples:
                         help="Data generation: probability of a random move (first 20 plies) for trajectory diversity")
     parser.add_argument("--data-fraction", type=float, default=1.0,
                         help="Train on a random fraction of the loaded rows (data-size curves)")
+    parser.add_argument("--tb", type=str, default=None,
+                        help="Data generation: tablebase directory (engine probes it; solved positions get exact labels)")
     parser.add_argument("--resume-from", type=str, default=None,
                         help="Resume training from a saved .pt model file")
 
@@ -1176,6 +1206,7 @@ Examples:
         dedupe=args.dedupe,
         noise_prob=args.noise_prob,
         data_fraction=args.data_fraction,
+        tb_dir=args.tb,
     )
 
 
