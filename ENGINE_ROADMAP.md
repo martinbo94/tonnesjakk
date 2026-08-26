@@ -427,6 +427,19 @@ self-improvement loop. Gate for net-2: vs net-1b AND vs heuristic, 100+200ms.
 Next speed lever after that: quantized inference (int16 accumulator / int8
 FC2) — FC2 and dense features dominate NNUE node cost.
 
+## Engine speed work (2026-08-26, while gen-2 generates)
+
+- **TT stores BitMove** (was the heap-allocating Python `Move` + conversion on
+  probe): tree bit-identical (bench signature 88680/123548), ~+10% nps both
+  engines.
+- **Dense features**: integer sorts, single pass; 0/3000 evals differ.
+- **Quantized inference**: i16 accumulators (scale 128), i16 FC2 weights
+  (scale 1024, |w|≤3), `i16x16::dot` → i32 (16 MACs/op vs 8 for f32).
+  net-1b: mean 3.6 cp / p95 10 cp / max 32 cp vs f32 reference, corr
+  0.99996; incremental updates now bit-exact. NNUE nps 2.1–2.3 → 2.68
+  (heuristic/NNUE ratio 0.55 → 0.77). hidden1 must be a multiple of 16.
+  Sanity gate vs heuristic @100ms: running.
+
 **Slow-TC gate PASSED:** `plain_m_d20_128x32_l0.5` vs heuristic @ 200ms:
 **+225 Elo [+187, +268]** (225-21-54, 300 games) — larger than at 100ms
 (+207), i.e. the NNUE's edge GROWS with time (eval quality compounds with
