@@ -547,7 +547,8 @@ W3/B2 says "white wins in 1", search returns 99999 with 561 TB hits).
 | 2v1 / 1v2 | 79M (61M) | 75 s | **0 draws**; side with fewer barrels left wins 80% of positions |
 | 2v2 | 1.19B (822M) | 302 s (14 threads, ~100M states/s per pass) | **draws 0.35%** (2.85M mutual-blockade positions); 49.83/49.83; longest forced win 35 plies |
 | 3v1 / 1v3 | 0.77B (545M) | 146 s / 180 s | draws 0.003%; side with 1 barrel left wins 95.3% |
-| 3v2 / 2v3 | 11.5B (7.1B valid) each, 11.5 GB RAM | ~6–7 min/pass ⇒ ~4–5 h each | running (not checkpointed: a kill loses the phase in progress) |
+| 3v2 | 11.5B (7.1B valid), 11.5 GB | 63 min (40 passes) | draws 0.27%; side with 2 left wins 79.0% |
+| 2v3 | — | derived by colour/board symmetry from 3v2 | (solve stopped mid-way; not needed) |
 | 4v1, 4v2 | 5.4B / 81B | 30 min / needs disk | later |
 | 3v3 | 110B | disk-backed | later |
 

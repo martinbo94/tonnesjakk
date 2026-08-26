@@ -238,6 +238,31 @@ impl Phase {
     }
 }
 
+/// The colour-swapped, vertically flipped position: White's pieces become
+/// Black's on mirrored rows and vice versa, side to move swaps. The value of
+/// the mirrored position is the negation of the original's.
+pub fn color_mirror(bb: &BitBoard) -> BitBoard {
+    let m = crate::race::mirror_rows;
+    let mut out = BitBoard::new();
+    out.white_barrels = m(bb.black_barrels);
+    out.black_barrels = m(bb.white_barrels);
+    out.white_pail = m(bb.black_pail);
+    out.black_pail = m(bb.white_pail);
+    out.white_pail_placed = bb.black_pail_placed;
+    out.black_pail_placed = bb.white_pail_placed;
+    out.occupied = out.white_barrels | out.black_barrels | out.white_pail | out.black_pail;
+    out.white_scored = bb.black_scored;
+    out.black_scored = bb.white_scored;
+    out.white_barrels_off_board = bb.black_barrels_off_board;
+    out.black_barrels_off_board = bb.white_barrels_off_board;
+    out.current_player = match bb.current_player {
+        Player::White => Player::Black,
+        Player::Black => Player::White,
+    };
+    out.awaiting_barrel = bb.awaiting_barrel;
+    out
+}
+
 /// Collection of solved phases, indexed by (wr, br).
 #[derive(Default)]
 pub struct Tablebase {
@@ -262,15 +287,32 @@ impl Tablebase {
 
     /// Value of a position from White's perspective, if its phase is solved.
     /// Terminal positions (a side scored everything) are answered directly.
+    /// Phase (a, b) can also be answered from (b, a) by the game's colour
+    /// symmetry: swap colours, flip the board vertically, swap side to move,
+    /// negate the value — so only one of each mirrored pair needs solving.
     pub fn value(&self, bb: &BitBoard) -> Option<u8> {
         if bb.white_scored == 4 { return Some(v_white_win(0)); }
         if bb.black_scored == 4 { return Some(v_black_win(0)); }
         let wr = 4 - bb.white_scored as usize;
         let br = 4 - bb.black_scored as usize;
-        let phase = self.get(wr, br)?;
-        let idx = phase.index(bb)?;
-        let v = phase.vals()[idx];
-        if v == V_INVALID || v == V_UNKNOWN { None } else { Some(v) }
+        if let Some(phase) = self.get(wr, br) {
+            let idx = phase.index(bb)?;
+            let v = phase.vals()[idx];
+            return if v == V_INVALID || v == V_UNKNOWN { None } else { Some(v) };
+        }
+        let mirror_phase = self.get(br, wr)?;
+        let m = color_mirror(bb);
+        let idx = mirror_phase.index(&m)?;
+        let v = mirror_phase.vals()[idx];
+        if v == V_INVALID || v == V_UNKNOWN {
+            None
+        } else if is_white_win(v) {
+            Some(v_black_win(win_dist(v)))
+        } else if is_black_win(v) {
+            Some(v_white_win(win_dist(v)))
+        } else {
+            Some(v)
+        }
     }
 
     /// Load every phase file present in `dir`.
@@ -502,6 +544,30 @@ mod tests {
             }
         }
         assert!(seen > 1_000_000);
+    }
+
+    /// Colour symmetry: the value of 1v2 states read through the 2v1 table via
+    /// the mirror must equal the directly solved 1v2 table.
+    #[test]
+    fn test_mirror_symmetry_matches_direct_solve() {
+        let mut tb = Tablebase::new();
+        tb.solve(1, 1, false);
+        tb.solve(2, 1, false);
+        let mut direct = Tablebase::new();
+        direct.solve(1, 1, false);
+        direct.solve(1, 2, false);
+        let phase12 = direct.get(1, 2).unwrap();
+        let mut checked = 0;
+        for idx in (0..phase12.num_states()).step_by(9973) {
+            if let Some(bb) = phase12.decode(idx) {
+                let d = phase12.vals()[idx];
+                if d == V_INVALID { continue; }
+                let via_mirror = tb.value(&bb).expect("mirror lookup");
+                assert_eq!(via_mirror, d, "mirror mismatch at idx {}", idx);
+                checked += 1;
+            }
+        }
+        assert!(checked > 1000);
     }
 
     /// 1v1: solve, then spot-check against exhaustive search on a few states.
