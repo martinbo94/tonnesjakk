@@ -221,61 +221,61 @@ pub fn bitboard_from_dense164(row: &[f32]) -> BitBoard {
 pub fn compute_relational_features(bb: &BitBoard) -> [f32; HALFPAIL_DENSE] {
     let mut features = [0.0f32; 20];
 
-    // White barrel distances to goal (row 0 is goal, distance = row)
-    let mut white_dists = [0.0f32; 4];
-    let mut white_rows = [0usize; 4];
+    // Sort ≤4 small integers in place (insertion sort; branch-light).
+    #[inline(always)]
+    fn sort4(v: &mut [u8; 4], n: usize) {
+        for i in 1..n {
+            let mut j = i;
+            while j > 0 && v[j - 1] > v[j] {
+                v.swap(j - 1, j);
+                j -= 1;
+            }
+        }
+    }
+
+    // White barrels: rows/cols, threats (row 1 = one step from goal row 0)
+    let mut white_rows = [0u8; 4];
+    let mut white_cols = [0u8; 4];
     let mut n_white = 0usize;
     let mut white_threats = 0u32;
     let mut barrels = bb.white_barrels;
     while barrels != 0 && n_white < 4 {
         let sq = barrels.trailing_zeros() as usize;
-        let row = sq / 6;
-        white_dists[n_white] = row as f32 / 5.0;
-        white_rows[n_white] = row;
-        if row == 1 { white_threats += 1; }
+        white_rows[n_white] = (sq / 6) as u8;
+        white_cols[n_white] = (sq % 6) as u8;
+        if white_rows[n_white] == 1 { white_threats += 1; }
         n_white += 1;
         barrels &= barrels - 1;
     }
-    white_dists[..n_white].sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
+    // Distances (row/5) sorted ascending == rows sorted ascending; identical
+    // arithmetic to the original float formulation.
+    let mut wr = white_rows;
+    sort4(&mut wr, n_white);
     for i in 0..n_white {
-        features[i] = 1.0 - white_dists[i];
+        features[i] = 1.0 - (wr[i] as f32 / 5.0);
     }
 
-    // Black barrel distances to goal (row 5 is goal, distance = 5 - row)
-    let mut black_dists = [0.0f32; 4];
-    let mut black_rows = [0usize; 4];
-    let mut black_cols = [0usize; 4];
+    // Black barrels: distance = 5 - row; sorted ascending == rows descending
+    let mut black_rows = [0u8; 4];
+    let mut black_cols = [0u8; 4];
     let mut n_black = 0usize;
     let mut black_threats = 0u32;
     barrels = bb.black_barrels;
     while barrels != 0 && n_black < 4 {
         let sq = barrels.trailing_zeros() as usize;
-        let row = sq / 6;
-        let col = sq % 6;
-        black_dists[n_black] = (5 - row) as f32 / 5.0;
-        black_rows[n_black] = row;
-        black_cols[n_black] = col;
-        if row == 4 { black_threats += 1; }
+        black_rows[n_black] = (sq / 6) as u8;
+        black_cols[n_black] = (sq % 6) as u8;
+        if black_rows[n_black] == 4 { black_threats += 1; }
         n_black += 1;
         barrels &= barrels - 1;
     }
-    black_dists[..n_black].sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
+    let mut bd = [0u8; 4];
     for i in 0..n_black {
-        features[4 + i] = 1.0 - black_dists[i];
+        bd[i] = 5 - black_rows[i];
     }
-
-    // White barrel columns for blocking computation
-    let mut white_cols = [0usize; 4];
-    {
-        let mut i = 0usize;
-        let mut b = bb.white_barrels;
-        while b != 0 && i < 4 {
-            let sq = b.trailing_zeros() as usize;
-            white_rows[i] = sq / 6;
-            white_cols[i] = sq % 6;
-            i += 1;
-            b &= b - 1;
-        }
+    sort4(&mut bd, n_black);
+    for i in 0..n_black {
+        features[4 + i] = 1.0 - (bd[i] as f32 / 5.0);
     }
 
     // Scored barrels (normalized by 4)
@@ -310,7 +310,7 @@ pub fn compute_relational_features(bb: &BitBoard) -> [f32; HALFPAIL_DENSE] {
         let pail_row = pail_sq / 6;
         let pail_col = pail_sq % 6;
         for i in 0..n_black {
-            if pail_col == black_cols[i] && pail_row > black_rows[i] {
+            if pail_col == black_cols[i] as usize && pail_row > black_rows[i] as usize {
                 white_pail_blocks += 1;
             }
         }
@@ -323,7 +323,7 @@ pub fn compute_relational_features(bb: &BitBoard) -> [f32; HALFPAIL_DENSE] {
         let pail_row = pail_sq / 6;
         let pail_col = pail_sq % 6;
         for i in 0..n_white {
-            if pail_col == white_cols[i] && pail_row < white_rows[i] {
+            if pail_col == white_cols[i] as usize && pail_row < white_rows[i] as usize {
                 black_pail_blocks += 1;
             }
         }
