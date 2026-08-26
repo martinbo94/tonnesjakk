@@ -53,9 +53,10 @@ class NnueArch:
             raise ValueError("dense_size must be 0 or 20")
         if self.output_buckets not in (1, 25):
             raise ValueError("output_buckets must be 1 or 25")
-        for h in (self.hidden1, self.hidden2):
-            if h % 8 != 0 or h <= 0:
-                raise ValueError("hidden sizes must be positive multiples of 8")
+        if self.hidden1 % 16 != 0 or self.hidden1 <= 0:
+            raise ValueError("hidden1 must be a positive multiple of 16 (i16x16 accumulator lanes)")
+        if self.hidden2 % 8 != 0 or self.hidden2 <= 0:
+            raise ValueError("hidden2 must be a positive multiple of 8")
 
     @property
     def num_features(self) -> int:

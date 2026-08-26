@@ -1,5 +1,5 @@
 use serde::Deserialize;
-use wide::f32x8;
+use wide::{i16x16, i32x8};
 
 use crate::board::*;
 
@@ -14,6 +14,19 @@ pub const MAX_ACTIVE_FEATURES: usize = 12;
 /// Label normalization used by the trainer: label = tanh(score_cp / SCORE_SCALE).
 /// Must match python/tonnesjakk/nnue.py SCORE_SCALING.
 pub const SCORE_SCALE: f32 = 600.0;
+
+// ─── Quantized inference ───
+// First layer (embedding + bias) and the accumulators are i16 at scale Q_ACC;
+// second-layer weights are i16 at scale Q_W2; the FC2 dot product runs as
+// i16x16 widening multiply-adds into i32 (16 MACs per SIMD op vs 8 for f32).
+// Bounds chosen so the i32 accumulation cannot overflow:
+//   |input| <= IN_CLIP (=23.4 in float units), |w2| <= W2_CLIP (=3.0):
+//   3000 * 3072 * 256 inputs ≈ 2.4e9 < i32::MAX (inputs are padded to ≤ 256).
+pub const Q_ACC: f32 = 128.0;
+pub const Q_W2: f32 = 1024.0;
+const IN_CLIP: i16 = 3000;
+const W2_CLIP: f32 = 3.0;
+const FC2_PAD: usize = 16;
 
 // ============================================================================
 // FEATURE SETS
@@ -337,18 +350,19 @@ pub fn compute_relational_features(bb: &BitBoard) -> [f32; HALFPAIL_DENSE] {
 // DUAL ACCUMULATOR - Stack-based caching for search tree
 // ============================================================================
 
-/// Dual-perspective accumulator (pre-activation first-layer sums)
+/// Dual-perspective accumulator: pre-activation first-layer sums, i16 at
+/// scale Q_ACC (exactly reproducible: incremental == from-scratch bit for bit).
 #[derive(Clone)]
 pub struct DualAccumulator {
-    pub white_pre: [f32; MAX_HIDDEN1],
-    pub black_pre: [f32; MAX_HIDDEN1],
+    pub white_pre: [i16; MAX_HIDDEN1],
+    pub black_pre: [i16; MAX_HIDDEN1],
 }
 
 impl Default for DualAccumulator {
     fn default() -> Self {
         DualAccumulator {
-            white_pre: [0.0; MAX_HIDDEN1],
-            black_pre: [0.0; MAX_HIDDEN1],
+            white_pre: [0; MAX_HIDDEN1],
+            black_pre: [0; MAX_HIDDEN1],
         }
     }
 }
@@ -429,6 +443,7 @@ impl DualAccumulatorStack {
 ///   concat(acc_white, acc_black[, dense]) -> FC2[bucket] -> ReLU -> FC3[bucket] -> tanh
 pub struct SparseNNUE {
     pub config: NnueConfig,
+    // ── f32 reference weights (loading, tests, parity) ──
     /// [num_features * hidden1]
     fc1_weight_t: Vec<f32>,
     /// [hidden1]
@@ -441,6 +456,15 @@ pub struct SparseNNUE {
     fc3_weight: Vec<f32>,
     /// [buckets]
     fc3_bias: Vec<f32>,
+    // ── quantized inference weights ──
+    /// [num_features * hidden1], scale Q_ACC
+    fc1_weight_q: Vec<i16>,
+    /// [hidden1], scale Q_ACC
+    fc1_bias_q: Vec<i16>,
+    /// [buckets * hidden2 * fc2_in_pad], scale Q_W2, zero-padded rows
+    fc2_weight_q: Vec<i16>,
+    /// fc2 input length rounded up to a multiple of FC2_PAD
+    fc2_in_pad: usize,
 }
 
 // ─── JSON formats ───
@@ -526,15 +550,15 @@ impl SparseNNUE {
             ).into());
         }
         let fc1_weight_t = transpose_embedding(&j.weights.fc1_weight, config.hidden1);
-        Ok(Self {
+        Ok(Self::finish(
             config,
             fc1_weight_t,
-            fc1_bias: j.weights.fc1_bias,
-            fc2_weight: j.weights.fc2_weight.into_iter().flatten().flatten().collect(),
-            fc2_bias: j.weights.fc2_bias.into_iter().flatten().collect(),
-            fc3_weight: j.weights.fc3_weight.into_iter().flatten().collect(),
-            fc3_bias: j.weights.fc3_bias,
-        })
+            j.weights.fc1_bias,
+            j.weights.fc2_weight.into_iter().flatten().flatten().collect(),
+            j.weights.fc2_bias.into_iter().flatten().collect(),
+            j.weights.fc3_weight.into_iter().flatten().collect(),
+            j.weights.fc3_bias,
+        ))
     }
 
     fn from_legacy(j: LegacyHalfPailJson) -> Result<Self, Box<dyn std::error::Error>> {
@@ -548,20 +572,62 @@ impl SparseNNUE {
         };
         Self::validate(&config)?;
         let fc1_weight_t = transpose_embedding(&j.weights.fc1_weight, config.hidden1);
-        Ok(Self {
+        Ok(Self::finish(
             config,
             fc1_weight_t,
-            fc1_bias: j.weights.fc1_bias,
-            fc2_weight: j.weights.fc2_weight.into_iter().flatten().collect(),
-            fc2_bias: j.weights.fc2_bias,
-            fc3_weight: j.weights.fc3_weight.into_iter().flatten().collect(),
-            fc3_bias: j.weights.fc3_bias,
-        })
+            j.weights.fc1_bias,
+            j.weights.fc2_weight.into_iter().flatten().collect(),
+            j.weights.fc2_bias,
+            j.weights.fc3_weight.into_iter().flatten().collect(),
+            j.weights.fc3_bias,
+        ))
+    }
+
+    /// Build the quantized inference weights from the f32 weights.
+    fn finish(
+        config: NnueConfig,
+        fc1_weight_t: Vec<f32>,
+        fc1_bias: Vec<f32>,
+        fc2_weight: Vec<f32>,
+        fc2_bias: Vec<f32>,
+        fc3_weight: Vec<f32>,
+        fc3_bias: Vec<f32>,
+    ) -> Self {
+        let q16 = |v: f32, scale: f32| -> i16 {
+            (v * scale).round().clamp(i16::MIN as f32, i16::MAX as f32) as i16
+        };
+        let fc1_weight_q: Vec<i16> = fc1_weight_t.iter().map(|&w| q16(w, Q_ACC)).collect();
+        let fc1_bias_q: Vec<i16> = fc1_bias.iter().map(|&b| q16(b, Q_ACC)).collect();
+
+        let fc2_in = 2 * config.hidden1 + config.dense_size;
+        let fc2_in_pad = (fc2_in + FC2_PAD - 1) / FC2_PAD * FC2_PAD;
+        let rows = config.output_buckets * config.hidden2;
+        let mut fc2_weight_q = vec![0i16; rows * fc2_in_pad];
+        for r in 0..rows {
+            for k in 0..fc2_in {
+                let w = fc2_weight[r * fc2_in + k].clamp(-W2_CLIP, W2_CLIP);
+                fc2_weight_q[r * fc2_in_pad + k] = q16(w, Q_W2);
+            }
+        }
+
+        Self {
+            config,
+            fc1_weight_t,
+            fc1_bias,
+            fc2_weight,
+            fc2_bias,
+            fc3_weight,
+            fc3_bias,
+            fc1_weight_q,
+            fc1_bias_q,
+            fc2_weight_q,
+            fc2_in_pad,
+        }
     }
 
     fn validate(c: &NnueConfig) -> Result<(), Box<dyn std::error::Error>> {
-        if c.hidden1 > MAX_HIDDEN1 || c.hidden1 % 8 != 0 {
-            return Err(format!("hidden1 must be a multiple of 8 and <= {}", MAX_HIDDEN1).into());
+        if c.hidden1 > MAX_HIDDEN1 || c.hidden1 % 16 != 0 {
+            return Err(format!("hidden1 must be a multiple of 16 and <= {}", MAX_HIDDEN1).into());
         }
         if c.hidden2 > MAX_HIDDEN2 || c.hidden2 % 8 != 0 {
             return Err(format!("hidden2 must be a multiple of 8 and <= {}", MAX_HIDDEN2).into());
@@ -587,40 +653,42 @@ impl SparseNNUE {
         let f = config.feature_set.num_features();
         let fc2_in = 2 * config.hidden1 + config.dense_size;
         let b = config.output_buckets;
-        Self {
+        Self::finish(
             config,
-            fc1_weight_t: (0..f * config.hidden1).map(|_| next()).collect(),
-            fc1_bias: (0..config.hidden1).map(|_| next()).collect(),
-            fc2_weight: (0..b * config.hidden2 * fc2_in).map(|_| next()).collect(),
-            fc2_bias: (0..b * config.hidden2).map(|_| next()).collect(),
-            fc3_weight: (0..b * config.hidden2).map(|_| next()).collect(),
-            fc3_bias: (0..b).map(|_| next()).collect(),
-        }
+            (0..f * config.hidden1).map(|_| next()).collect(),
+            (0..config.hidden1).map(|_| next()).collect(),
+            (0..b * config.hidden2 * fc2_in).map(|_| next()).collect(),
+            (0..b * config.hidden2).map(|_| next()).collect(),
+            (0..b * config.hidden2).map(|_| next()).collect(),
+            (0..b).map(|_| next()).collect(),
+        )
     }
 
     #[inline]
-    fn add_feature(&self, acc: &mut [f32; MAX_HIDDEN1], feat: usize) {
+    fn add_feature(&self, acc: &mut [i16; MAX_HIDDEN1], feat: usize) {
         let h = self.config.hidden1;
-        let w = &self.fc1_weight_t[feat * h..(feat + 1) * h];
-        for (a, wc) in acc[..h].chunks_exact_mut(8).zip(w.chunks_exact(8)) {
-            let r = f32x8::from(<[f32; 8]>::try_from(&*a).unwrap()) + f32x8::from(<[f32; 8]>::try_from(wc).unwrap());
+        let w = &self.fc1_weight_q[feat * h..(feat + 1) * h];
+        for (a, wc) in acc[..h].chunks_exact_mut(16).zip(w.chunks_exact(16)) {
+            let r = i16x16::from(<[i16; 16]>::try_from(&*a).unwrap())
+                .saturating_add(i16x16::from(<[i16; 16]>::try_from(wc).unwrap()));
             a.copy_from_slice(&r.to_array());
         }
     }
 
     #[inline]
-    fn remove_feature(&self, acc: &mut [f32; MAX_HIDDEN1], feat: usize) {
+    fn remove_feature(&self, acc: &mut [i16; MAX_HIDDEN1], feat: usize) {
         let h = self.config.hidden1;
-        let w = &self.fc1_weight_t[feat * h..(feat + 1) * h];
-        for (a, wc) in acc[..h].chunks_exact_mut(8).zip(w.chunks_exact(8)) {
-            let r = f32x8::from(<[f32; 8]>::try_from(&*a).unwrap()) - f32x8::from(<[f32; 8]>::try_from(wc).unwrap());
+        let w = &self.fc1_weight_q[feat * h..(feat + 1) * h];
+        for (a, wc) in acc[..h].chunks_exact_mut(16).zip(w.chunks_exact(16)) {
+            let r = i16x16::from(<[i16; 16]>::try_from(&*a).unwrap())
+                .saturating_sub(i16x16::from(<[i16; 16]>::try_from(wc).unwrap()));
             a.copy_from_slice(&r.to_array());
         }
     }
 
-    fn init_perspective(&self, bb: &BitBoard, persp: Player, acc: &mut [f32; MAX_HIDDEN1]) {
+    fn init_perspective(&self, bb: &BitBoard, persp: Player, acc: &mut [i16; MAX_HIDDEN1]) {
         let h = self.config.hidden1;
-        acc[..h].copy_from_slice(&self.fc1_bias[..h]);
+        acc[..h].copy_from_slice(&self.fc1_bias_q[..h]);
         let mut feats = [0u16; MAX_ACTIVE_FEATURES];
         let n = self.config.active_features(bb, persp, &mut feats);
         for &f in &feats[..n] {
@@ -665,52 +733,109 @@ impl SparseNNUE {
         }
     }
 
-    /// Evaluate from accumulator: ReLU, concat(+dense), FC2[bucket], ReLU,
-    /// FC3[bucket], tanh -> centipawns (White perspective).
+    /// Map the FC3 pre-activation to centipawns. Training labels are
+    /// tanh(score_cp / SCORE_SCALE); invert so the NNUE lives on the same
+    /// centipawn scale as the heuristic eval and every search margin keeps
+    /// its meaning.
+    #[inline]
+    fn to_centipawns(out: f32) -> i32 {
+        let v = out.tanh().clamp(-0.999, 0.999);
+        (SCORE_SCALE * v.atanh()) as i32
+    }
+
+    #[inline]
+    fn fc3(&self, bucket: usize, hidden: &[f32; MAX_HIDDEN2]) -> i32 {
+        let h2 = self.config.hidden2;
+        let fc3_w = &self.fc3_weight[bucket * h2..(bucket + 1) * h2];
+        let mut out = self.fc3_bias[bucket];
+        for i in 0..h2 {
+            out += hidden[i] * fc3_w[i];
+        }
+        Self::to_centipawns(out)
+    }
+
+    /// Quantized evaluate: clipped-ReLU on the i16 accumulators, dense
+    /// features quantized to Q_ACC, FC2 as i16x16 widening dot products
+    /// accumulated in i32, then FC3 in f32 -> centipawns (White perspective).
     pub fn evaluate(&self, bb: &BitBoard, acc: &DualAccumulator) -> i32 {
+        let h1 = self.config.hidden1;
+        let h2 = self.config.hidden2;
+        let dense_size = self.config.dense_size;
+        let in_pad = self.fc2_in_pad;
+        let bucket = self.config.output_bucket(bb);
+
+        // Build the padded i16 input vector: relu(white), relu(black), dense
+        let mut input = [0i16; 2 * MAX_HIDDEN1 + 32];
+        for i in 0..h1 {
+            input[i] = acc.white_pre[i].clamp(0, IN_CLIP);
+            input[h1 + i] = acc.black_pre[i].clamp(0, IN_CLIP);
+        }
+        if dense_size > 0 {
+            let dense = compute_relational_features(bb);
+            for k in 0..dense_size {
+                input[2 * h1 + k] = (dense[k] * Q_ACC).round() as i16;
+            }
+        }
+        let input = &input[..in_pad];
+
+        let inv_scale = 1.0 / (Q_ACC * Q_W2);
+        let mut hidden = [0.0f32; MAX_HIDDEN2];
+        let fc2_w = &self.fc2_weight_q[bucket * h2 * in_pad..(bucket + 1) * h2 * in_pad];
+        let fc2_b = &self.fc2_bias[bucket * h2..(bucket + 1) * h2];
+        for neuron in 0..h2 {
+            let w = &fc2_w[neuron * in_pad..(neuron + 1) * in_pad];
+            let mut sum = i32x8::ZERO;
+            for (a, wc) in input.chunks_exact(16).zip(w.chunks_exact(16)) {
+                sum += i16x16::from(<[i16; 16]>::try_from(a).unwrap())
+                    .dot(i16x16::from(<[i16; 16]>::try_from(wc).unwrap()));
+            }
+            let s = sum.reduce_add() as f32 * inv_scale + fc2_b[neuron];
+            hidden[neuron] = s.max(0.0);
+        }
+        self.fc3(bucket, &hidden)
+    }
+
+    /// f32 reference evaluation from scratch (no quantization). Used by tests
+    /// to bound quantization error; not used in search.
+    pub fn evaluate_reference(&self, bb: &BitBoard) -> i32 {
         let h1 = self.config.hidden1;
         let h2 = self.config.hidden2;
         let dense_size = self.config.dense_size;
         let fc2_in = 2 * h1 + dense_size;
         let bucket = self.config.output_bucket(bb);
 
-        let zero = f32x8::ZERO;
+        let mut white = vec![0.0f32; h1];
+        let mut black = vec![0.0f32; h1];
+        white.copy_from_slice(&self.fc1_bias[..h1]);
+        black.copy_from_slice(&self.fc1_bias[..h1]);
+        let mut feats = [0u16; MAX_ACTIVE_FEATURES];
+        for (persp, target) in [(Player::White, &mut white), (Player::Black, &mut black)] {
+            let n = self.config.active_features(bb, persp, &mut feats);
+            for &f in &feats[..n] {
+                let w = &self.fc1_weight_t[f as usize * h1..(f as usize + 1) * h1];
+                for i in 0..h1 {
+                    target[i] += w[i];
+                }
+            }
+        }
         let dense = if dense_size > 0 { compute_relational_features(bb) } else { [0.0f32; HALFPAIL_DENSE] };
-
         let mut hidden = [0.0f32; MAX_HIDDEN2];
         let fc2_w = &self.fc2_weight[bucket * h2 * fc2_in..(bucket + 1) * h2 * fc2_in];
-        let fc2_b = &self.fc2_bias[bucket * h2..(bucket + 1) * h2];
         for neuron in 0..h2 {
             let w = &fc2_w[neuron * fc2_in..(neuron + 1) * fc2_in];
-            let mut sum_vec = f32x8::ZERO;
-            for (a, wc) in acc.white_pre[..h1].chunks_exact(8).zip(w[..h1].chunks_exact(8)) {
-                let av = f32x8::from(<[f32; 8]>::try_from(a).unwrap()).max(zero);
-                sum_vec += av * f32x8::from(<[f32; 8]>::try_from(wc).unwrap());
+            let mut s = self.fc2_bias[bucket * h2 + neuron];
+            for i in 0..h1 {
+                s += white[i].max(0.0) * w[i] + black[i].max(0.0) * w[h1 + i];
             }
-            for (a, wc) in acc.black_pre[..h1].chunks_exact(8).zip(w[h1..2 * h1].chunks_exact(8)) {
-                let av = f32x8::from(<[f32; 8]>::try_from(a).unwrap()).max(zero);
-                sum_vec += av * f32x8::from(<[f32; 8]>::try_from(wc).unwrap());
-            }
-            let mut sum = fc2_b[neuron] + sum_vec.to_array().iter().sum::<f32>();
             for k in 0..dense_size {
-                sum += dense[k] * w[2 * h1 + k];
+                s += dense[k] * w[2 * h1 + k];
             }
-            hidden[neuron] = sum.max(0.0);
+            hidden[neuron] = s.max(0.0);
         }
-
-        let fc3_w = &self.fc3_weight[bucket * h2..(bucket + 1) * h2];
-        let mut out = self.fc3_bias[bucket];
-        for i in 0..h2 {
-            out += hidden[i] * fc3_w[i];
-        }
-        // Training labels are tanh(score_cp / SCORE_SCALE); invert so the NNUE
-        // lives on the same centipawn scale as the heuristic eval and every
-        // search margin (futility, razoring, NMP, LMP) keeps its meaning.
-        let v = out.tanh().clamp(-0.999, 0.999);
-        (SCORE_SCALE * v.atanh()) as i32
+        self.fc3(bucket, &hidden)
     }
 
-    /// Convenience: evaluate a position from scratch (no incremental state).
+    /// Convenience: quantized evaluation from scratch (no incremental state).
     pub fn evaluate_from_scratch(&self, bb: &BitBoard) -> i32 {
         let mut acc = DualAccumulator::default();
         self.init_accumulators(bb, &mut acc);
@@ -843,15 +968,37 @@ mod tests {
                 let mut fresh = DualAccumulator::default();
                 net.init_accumulators(&bb, &mut fresh);
                 let h = config.hidden1;
-                for i in 0..h {
-                    assert!((acc.white_pre[i] - fresh.white_pre[i]).abs() < 1e-3,
-                        "{:?} ply {} white[{}] incremental {} vs scratch {}", config, ply, i, acc.white_pre[i], fresh.white_pre[i]);
-                    assert!((acc.black_pre[i] - fresh.black_pre[i]).abs() < 1e-3,
-                        "{:?} ply {} black[{}]", config, ply, i);
-                }
-                // Evaluations agree too (bucket selection, dense, heads)
+                // Integer accumulators: incremental must equal scratch exactly
+                assert_eq!(&acc.white_pre[..h], &fresh.white_pre[..h], "{:?} ply {} white", config, ply);
+                assert_eq!(&acc.black_pre[..h], &fresh.black_pre[..h], "{:?} ply {} black", config, ply);
                 assert_eq!(net.evaluate(&bb, &acc), net.evaluate(&bb, &fresh));
             }
+        }
+    }
+
+    /// Quantized evaluation must track the f32 reference closely along
+    /// random games (bounded quantization error, no overflow).
+    #[test]
+    fn test_quantized_matches_reference() {
+        for config in all_configs() {
+            let net = SparseNNUE::random(config, 11);
+            let mut state = 777u64;
+            let mut next = || { state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); (state >> 33) as usize };
+            let mut bb = BitBoard::new();
+            let (mut max_diff, mut sum_diff, mut n) = (0i32, 0i64, 0i64);
+            for _ in 0..80 {
+                let moves = bb.generate_moves();
+                if moves.is_empty() || bb.check_winner().is_some() { break; }
+                bb.make_move(&moves[next() % moves.len()]);
+                let q = net.evaluate_from_scratch(&bb);
+                let r = net.evaluate_reference(&bb);
+                let d = (q - r).abs();
+                max_diff = max_diff.max(d);
+                sum_diff += d as i64;
+                n += 1;
+            }
+            assert!(max_diff <= 25, "{:?}: quantized vs reference max diff {} cp", config, max_diff);
+            assert!(sum_diff as f64 / n as f64 <= 6.0, "{:?}: mean diff {:.2} cp", config, sum_diff as f64 / n as f64);
         }
     }
 
