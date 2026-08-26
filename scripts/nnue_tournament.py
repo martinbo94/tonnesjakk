@@ -107,8 +107,20 @@ ROUND4_CANDIDATES = [
     Candidate("plain", True, 0, 64, 16, 25, lam=0.5),   # no dense compute, buckets carry phase
 ]
 
+# Round 5: net-2 candidates on gen-1 + gen-1b + gen-2 (gen-2 labeled by net-1b).
+# Gate vs net-1b (--opponent-nnue models/net1b_*.json); the winner must ALSO
+# beat the heuristic and hold at 200ms before promotion.
+ROUND5_CANDIDATES = [
+    Candidate("plain", True, 20, 96, 16, 1, lam=0.5),    # net-1b config, more data
+    Candidate("plain", True, 20, 64, 16, 1, lam=0.5),
+    Candidate("plain", True, 20, 128, 16, 1, lam=0.5),
+    Candidate("plain", True, 20, 96, 16, 1, lam=0.65),
+    Candidate("plain", True, 20, 96, 16, 25, lam=0.5),   # buckets with 3x data
+]
+
 PRESETS = {"round1": DEFAULT_CANDIDATES, "round2": ROUND2_CANDIDATES,
-           "round3": ROUND3_CANDIDATES, "round4": ROUND4_CANDIDATES}
+           "round3": ROUND3_CANDIDATES, "round4": ROUND4_CANDIDATES,
+           "round5": ROUND5_CANDIDATES}
 
 
 def train(c: Candidate, data: str, out_dir: Path, epochs: int, lr: float, batch: int, log) -> float:
