@@ -438,7 +438,10 @@ FC2) — FC2 and dense features dominate NNUE node cost.
   net-1b: mean 3.6 cp / p95 10 cp / max 32 cp vs f32 reference, corr
   0.99996; incremental updates now bit-exact. NNUE nps 2.1–2.3 → 2.68
   (heuristic/NNUE ratio 0.55 → 0.77). hidden1 must be a multiple of 16.
-  Sanity gate vs heuristic @100ms: running.
+  Sanity gate: quantized net-1b vs heuristic @100ms **+204 [+173,+238]**
+  (286-39-75) under heavy contention (10 datagen + 4 match workers) — no
+  regression. Precise quantization Elo gain needs an idle-machine A/B
+  (expected ~+25 from the speed/Elo relation seen in round 4).
 
 **Slow-TC gate PASSED:** `plain_m_d20_128x32_l0.5` vs heuristic @ 200ms:
 **+225 Elo [+187, +268]** (225-21-54, 300 games) — larger than at 100ms
