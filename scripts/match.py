@@ -48,11 +48,14 @@ class EngineSpec:
     nnue: str = ""            # path to NNUE weights JSON
     contempt: int = 0
     weights: dict = field(default_factory=dict)  # weight_* overrides
+    tablebases: str = ""      # directory of solved tb_*.bin phases (memory-mapped)
 
     def describe(self) -> str:
         parts = [f"time={self.time_ms}ms" if self.time_ms else f"depth={self.depth}"]
         if self.nnue:
             parts.append(f"nnue={Path(self.nnue).name}")
+        if self.tablebases:
+            parts.append(f"tb={self.tablebases}")
         if self.contempt:
             parts.append(f"contempt={self.contempt}")
         parts.extend(f"{k}={v}" for k, v in self.weights.items())
@@ -66,6 +69,8 @@ def make_engine(spec: EngineSpec):
     e.contempt = spec.contempt
     if spec.nnue:
         e.load_nnue(spec.nnue)
+    if spec.tablebases:
+        e.load_tablebases(spec.tablebases)
     for name, value in spec.weights.items():
         setattr(e, name, value)
     return e
@@ -253,6 +258,7 @@ def main():
         ap.add_argument(f"--depth-{side}", type=int, default=0)
         ap.add_argument(f"--time-{side}", type=int, default=0, help="ms per move")
         ap.add_argument(f"--nnue-{side}", type=str, default="")
+        ap.add_argument(f"--tb-{side}", type=str, default="", help="tablebase directory")
         ap.add_argument(f"--contempt-{side}", type=int, default=0)
         ap.add_argument(f"--set-{side}", action="append",
                         help="weight override, e.g. weight_trapped=40 (repeatable)")
@@ -266,6 +272,7 @@ def main():
         specs[side] = EngineSpec(
             label=g("label"), depth=g("depth"), time_ms=g("time"),
             nnue=g("nnue"), contempt=g("contempt"), weights=parse_sets(g("set")),
+            tablebases=g("tb"),
         )
 
     n_pairs = max(args.games // 2, 1)
