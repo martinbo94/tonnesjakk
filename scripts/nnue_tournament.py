@@ -128,9 +128,20 @@ ROUND6_CANDIDATES = [
     Candidate("plain", True, 20, 128, 32, 25, lam=0.5),   # wider FC2 now that data is 3x
 ]
 
+# Round 7: round 6 said "smaller won, data/width flat" — walk the speed curve
+# down and vary what the labels weight. Same gen-1..3 data. Gate vs net-3.
+ROUND7_CANDIDATES = [
+    Candidate("plain", True, 20, 48, 16, 25, lam=0.5),
+    Candidate("plain", True, 20, 32, 16, 25, lam=0.5),
+    Candidate("plain", True, 20, 64, 16, 25, lam=0.35),   # more outcome weight (6% draws, TB labels)
+    Candidate("plain", True, 0, 64, 16, 25, lam=0.5),     # drop the dense 20 (cheaper eval)
+    Candidate("plain", True, 20, 64, 16, 25, lam=0.5),    # net-3 config re-run = seed noise floor
+]
+
 PRESETS = {"round1": DEFAULT_CANDIDATES, "round2": ROUND2_CANDIDATES,
            "round3": ROUND3_CANDIDATES, "round4": ROUND4_CANDIDATES,
-           "round5": ROUND5_CANDIDATES, "round6": ROUND6_CANDIDATES}
+           "round5": ROUND5_CANDIDATES, "round6": ROUND6_CANDIDATES,
+           "round7": ROUND7_CANDIDATES}
 
 
 def train(c: Candidate, data: str, out_dir: Path, epochs: int, lr: float, batch: int, log) -> float:
