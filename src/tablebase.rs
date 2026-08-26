@@ -271,97 +271,188 @@ impl Tablebase {
     /// Solve phase (wr, br). All phases it can score into ((wr-1, br) and
     /// (wr, br-1), unless terminal) must already be present.
     pub fn solve(&mut self, wr: usize, br: usize, verbose: bool) -> &Phase {
-        let mut phase = Phase::new(wr, br);
-        let n = phase.num_states();
-
-        // Mark invalid states; count valid
-        let mut valid = 0usize;
-        for idx in 0..n {
-            if phase.decode(idx).is_none() {
-                phase.values[idx] = V_INVALID;
-            } else {
-                valid += 1;
-            }
-        }
-        if verbose {
-            eprintln!("phase {}v{}: {} states, {} valid", wr, br, n, valid);
-        }
-
-        // Child value lookup: same phase (current array) or lower phases (self)
-        let child_value = |phase: &Phase, child: &BitBoard| -> u8 {
-            if child.white_scored as usize > 4 - wr || child.black_scored as usize > 4 - br {
-                self.value(child).unwrap_or(V_DRAW) // lower phase (must be loaded)
-            } else {
-                phase.values[phase.index(child).expect("child in phase")]
-            }
-        };
-
-        let mut pass: u8 = 1;
-        let mut unknown: Vec<usize> = (0..n).filter(|&i| phase.values[i] == V_UNKNOWN).collect();
-        loop {
-            let mut assigned: Vec<(usize, u8)> = Vec::new();
-            let mut still_unknown = Vec::with_capacity(unknown.len());
-            for &idx in &unknown {
-                let bb = phase.decode(idx).unwrap();
-                let stm_white = bb.current_player == Player::White;
-                let moves = bb.generate_moves();
-                let mut best_win_child: Option<u8> = None;   // min dist among children that are wins for stm
-                let mut all_lose = !moves.is_empty();
-                let mut max_lose_dist: u8 = 0;
-                for mv in &moves {
-                    let mut child = bb;
-                    child.make_move(mv);
-                    let v = child_value(&phase, &child);
-                    let stm_wins = if stm_white { is_white_win(v) } else { is_black_win(v) };
-                    let stm_loses = if stm_white { is_black_win(v) } else { is_white_win(v) };
-                    if stm_wins {
-                        let d = win_dist(v);
-                        best_win_child = Some(best_win_child.map_or(d, |b| b.min(d)));
-                    }
-                    if stm_loses {
-                        max_lose_dist = max_lose_dist.max(win_dist(v));
-                    } else {
-                        all_lose = false;
-                    }
-                }
-                let mut value = V_UNKNOWN;
-                if let Some(d) = best_win_child {
-                    if d + 1 == pass {
-                        value = if stm_white { v_white_win(pass) } else { v_black_win(pass) };
-                    }
-                }
-                if value == V_UNKNOWN && all_lose && max_lose_dist + 1 == pass {
-                    value = if stm_white { v_black_win(pass) } else { v_white_win(pass) };
-                }
-                if value == V_UNKNOWN && moves.is_empty() {
-                    // No legal move: treat as draw (cannot happen with barrels in hand;
-                    // fully boxed-in positions are neither side's win here).
-                    value = V_DRAW;
-                }
-                if value != V_UNKNOWN {
-                    assigned.push((idx, value));
-                } else {
-                    still_unknown.push(idx);
-                }
-            }
-            for &(idx, v) in &assigned {
-                phase.values[idx] = v;
-            }
-            if verbose {
-                eprintln!("  pass {:3}: assigned {:9}, unknown {:10}", pass, assigned.len(), still_unknown.len());
-            }
-            unknown = still_unknown;
-            if assigned.is_empty() || unknown.is_empty() || pass >= MAX_DIST {
-                break;
-            }
-            pass += 1;
-        }
-        for &idx in &unknown {
-            phase.values[idx] = V_DRAW;
-        }
+        let phase = solve_phase(self, wr, br, verbose);
         self.insert(phase);
         self.get(wr, br).unwrap()
     }
+}
+
+/// Result of examining one unknown state at a given pass.
+enum Verdict {
+    /// Determined now.
+    Value(u8),
+    /// Not due yet; would be determined at this (later) pass if nothing changes.
+    Pending(u8),
+    /// No determined children at all (a draw unless children change).
+    Open,
+}
+
+/// Evaluate one unknown state at `pass` (distance being assigned).
+#[inline]
+fn determine(lower: &Tablebase, phase: &Phase, values: &[u8], bb: &BitBoard, pass: u8) -> Verdict {
+    let wr = phase.wr;
+    let br = phase.br;
+    let stm_white = bb.current_player == Player::White;
+    let moves = bb.generate_moves();
+    if moves.is_empty() {
+        // Fully boxed in with nothing in hand: neither side can force a win here.
+        return Verdict::Value(V_DRAW);
+    }
+    let mut best_win_child: Option<u8> = None; // min dist among children that are wins for stm
+    let mut all_lose = true;
+    let mut max_lose_dist: u8 = 0;
+    for mv in &moves {
+        let mut child = *bb;
+        child.make_move(mv);
+        let v = if child.white_scored as usize > 4 - wr || child.black_scored as usize > 4 - br {
+            lower.value(&child).unwrap_or(V_DRAW) // lower phase (must be loaded)
+        } else {
+            values[phase.index(&child).expect("child in phase")]
+        };
+        let stm_wins = if stm_white { is_white_win(v) } else { is_black_win(v) };
+        let stm_loses = if stm_white { is_black_win(v) } else { is_white_win(v) };
+        if stm_wins {
+            let d = win_dist(v);
+            best_win_child = Some(best_win_child.map_or(d, |b| b.min(d)));
+        }
+        if stm_loses {
+            max_lose_dist = max_lose_dist.max(win_dist(v));
+        } else {
+            all_lose = false;
+        }
+    }
+    // Wins are determined at distance (closest winning child + 1); a state
+    // with a winning child is never a loss, so check wins first.
+    if let Some(d) = best_win_child {
+        let due = d.saturating_add(1);
+        return if due <= pass {
+            Verdict::Value(if stm_white { v_white_win(due) } else { v_black_win(due) })
+        } else {
+            Verdict::Pending(due)
+        };
+    }
+    if all_lose {
+        let due = max_lose_dist.saturating_add(1);
+        return if due <= pass {
+            Verdict::Value(if stm_white { v_black_win(due) } else { v_white_win(due) })
+        } else {
+            Verdict::Pending(due)
+        };
+    }
+    Verdict::Open
+}
+
+/// Parallel retrograde solve of one phase. Threads scan contiguous index
+/// ranges (no per-state index list — 3v2 has 1.1e10 states), read the shared
+/// value array, and buffer their assignments; assignments are applied
+/// between passes so every pass sees a consistent snapshot.
+pub fn solve_phase(lower: &Tablebase, wr: usize, br: usize, verbose: bool) -> Phase {
+    let mut phase = Phase::new(wr, br);
+    let n = phase.num_states();
+    let threads = std::thread::available_parallelism().map(|t| t.get()).unwrap_or(4).max(1);
+    let chunk = (n + threads - 1) / threads;
+    let mut values = std::mem::take(&mut phase.values);
+    let t_start = std::time::Instant::now();
+
+    // 1) Mark invalid states (parallel over disjoint chunks of `values`)
+    let valid: usize = std::thread::scope(|s| {
+        let phase = &phase;
+        let handles: Vec<_> = values
+            .chunks_mut(chunk)
+            .enumerate()
+            .map(|(ci, slice)| {
+                s.spawn(move || {
+                    let base = ci * chunk;
+                    let mut valid = 0usize;
+                    for (i, v) in slice.iter_mut().enumerate() {
+                        if phase.decode(base + i).is_none() {
+                            *v = V_INVALID;
+                        } else {
+                            valid += 1;
+                        }
+                    }
+                    valid
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).sum()
+    });
+    if verbose {
+        eprintln!("phase {}v{}: {} states, {} valid, {} threads ({:.1}s)", wr, br, n, valid, threads,
+                  t_start.elapsed().as_secs_f64());
+    }
+
+    // 2) Passes in distance order. A pass assigns every state whose distance
+    //    is due (<= pass). Distances are not contiguous when wins run through
+    //    lower phases (their distances start above 0), so instead of stopping
+    //    on an empty pass we jump to the smallest pending distance; the loop
+    //    ends when no unknown state has any determined child.
+    let mut pass: u8 = 1;
+    let mut unknown_left = valid;
+    loop {
+        let results: Vec<(Vec<(usize, u8)>, Option<u8>)> = std::thread::scope(|s| {
+            let phase = &phase;
+            let values_ref: &[u8] = &values;
+            let handles: Vec<_> = (0..threads)
+                .map(|ci| {
+                    s.spawn(move || {
+                        let lo = ci * chunk;
+                        let hi = ((ci + 1) * chunk).min(n);
+                        let mut out = Vec::new();
+                        let mut min_pending: Option<u8> = None;
+                        for idx in lo..hi {
+                            if values_ref[idx] != V_UNKNOWN {
+                                continue;
+                            }
+                            let bb = phase.decode(idx).unwrap();
+                            match determine(lower, phase, values_ref, &bb, pass) {
+                                Verdict::Value(v) => out.push((idx, v)),
+                                Verdict::Pending(d) => {
+                                    min_pending = Some(min_pending.map_or(d, |m| m.min(d)));
+                                }
+                                Verdict::Open => {}
+                            }
+                        }
+                        (out, min_pending)
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        let n_assigned: usize = results.iter().map(|(a, _)| a.len()).sum();
+        let min_pending = results.iter().filter_map(|(_, m)| *m).min();
+        for (a, _) in &results {
+            for &(idx, v) in a {
+                values[idx] = v;
+            }
+        }
+        unknown_left -= n_assigned;
+        if verbose {
+            eprintln!("  pass {:3}: assigned {:10}, unknown {:11}, next pending {:?} ({:.0}s)",
+                      pass, n_assigned, unknown_left, min_pending, t_start.elapsed().as_secs_f64());
+        }
+        if unknown_left == 0 || pass >= MAX_DIST {
+            break;
+        }
+        if n_assigned > 0 {
+            // New values may create wins at distance pass+1: step, don't jump.
+            pass = (pass + 1).min(MAX_DIST);
+        } else {
+            match min_pending {
+                // Nothing changed this pass, so nothing can become due before
+                // the smallest pending distance: jump straight to it.
+                Some(d) => pass = d.max(pass + 1).min(MAX_DIST),
+                None => break, // nothing determined and nothing pending: the rest are draws
+            }
+        }
+    }
+    for v in values.iter_mut() {
+        if *v == V_UNKNOWN {
+            *v = V_DRAW;
+        }
+    }
+    phase.values = values;
+    phase
 }
 
 #[cfg(test)]
