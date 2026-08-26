@@ -540,8 +540,17 @@ W3/B2 says "white wins in 1", search returns 99999 with 561 TB hits).
 |---|---|---|---|
 | 1v1 | 5.3M (4.4M) | 2.6 s | **0 draws**; 50/50 by symmetry |
 | 2v1 / 1v2 | 79M (61M) | 75 s | **0 draws**; side with fewer barrels left wins 80% of positions |
-| 2v2 | ~1.2B | running (~20–25 min est.) | |
-| 3v2 / 3v3 | ~7B / ~110B | hours / disk-backed | later |
+| 2v2 | 1.19B (822M) | 302 s (14 threads, ~100M states/s per pass) | **draws 0.35%** (2.85M mutual-blockade positions); 49.83/49.83; longest forced win 35 plies |
+| 3v1 / 1v3 | 0.77B | minutes | running |
+| 3v2 / 2v3 | 11.5B each (11.5 GB RAM) | ~1 h each | queued |
+| 4v1, 4v2 | 5.4B / 81B | 30 min / needs disk | later |
+| 3v3 | 110B | disk-backed | later |
+
+Solver bug found & fixed on 2v2: the pass loop stopped at the first empty
+pass, but distances are non-contiguous when wins run through lower phases
+(after scoring one barrel the rest still takes plies) — pass 1 is legitimately
+empty in 2v2. Now passes jump to the smallest pending distance; 1v1/2v1
+reproduce byte-for-byte.
 
 Uses: perfect endgame play; exact labels + a yardstick for the NNUE's
 endgame; the infrastructure for a full solve (4v4 opening phase ~10¹²).
