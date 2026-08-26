@@ -602,6 +602,27 @@ impl Engine {
         self.inner.evaluate_heuristic(&bb)
     }
 
+    /// Single-agent race distances (white, black): exact min-moves for each
+    /// side alone to score all remaining barrels. For play analysis.
+    fn race_distances(&self, board: &Board) -> (u16, u16) {
+        let bb = BitBoard::from_board(board);
+        (
+            crate::race::RACE_TABLE.side_distance(&bb, Player::White),
+            crate::race::RACE_TABLE.side_distance(&bb, Player::Black),
+        )
+    }
+
+    /// Handcrafted heuristic evaluation of raw 164-float rows (N*164 flat),
+    /// for side-by-side comparison with nnue_eval_rows.
+    fn heuristic_eval_rows(&self, rows: Vec<f32>) -> PyResult<Vec<i32>> {
+        if rows.len() % 164 != 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err("rows must be N*164 floats"));
+        }
+        Ok(rows.chunks_exact(164)
+            .map(|r| self.inner.evaluate_heuristic(&bitboard_from_dense164(r)))
+            .collect())
+    }
+
     /// Set the game's position history (Zobrist hashes of positions BEFORE
     /// the current one). The search scores a repetition of any of these as a
     /// draw. Only positions since the last irreversible event (placement,
