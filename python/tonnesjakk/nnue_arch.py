@@ -173,6 +173,65 @@ def predecode_to_device(arch: NnueArch, X, y, start, count, batch_size, device,
     return batches
 
 
+# ─── lazy row views (keep 25 GB datasets memory-mapped, never copied) ────────
+
+class ConcatRows:
+    """Row-wise concatenation of several 2-D arrays/memmaps without copying.
+    Supports len(), .shape, slicing and sorted/unsorted integer-array indexing —
+    everything dedupe_rows and predecode_to_device need."""
+
+    def __init__(self, parts):
+        self.parts = list(parts)
+        self.offsets = np.cumsum([0] + [len(p) for p in self.parts])
+        self.shape = (int(self.offsets[-1]), self.parts[0].shape[1])
+        self.ndim = 2
+        self.dtype = self.parts[0].dtype
+
+    def __len__(self):
+        return self.shape[0]
+
+    def __getitem__(self, key):
+        if isinstance(key, slice):
+            s, e, step = key.indices(len(self))
+            assert step == 1, "ConcatRows supports contiguous slices only"
+            out = []
+            for i, p in enumerate(self.parts):
+                lo, hi = max(s, self.offsets[i]), min(e, self.offsets[i + 1])
+                if lo < hi:
+                    out.append(np.asarray(p[lo - self.offsets[i]:hi - self.offsets[i]]))
+            if not out:
+                return np.empty((0, self.shape[1]), dtype=self.dtype)
+            return out[0] if len(out) == 1 else np.concatenate(out)
+        idx = np.asarray(key)
+        if idx.ndim == 0:
+            i = int(np.searchsorted(self.offsets, idx, side="right") - 1)
+            return self.parts[i][int(idx) - self.offsets[i]]
+        out = np.empty((len(idx), self.shape[1]), dtype=self.dtype)
+        part_of = np.searchsorted(self.offsets, idx, side="right") - 1
+        for i in np.unique(part_of):
+            mask = part_of == i
+            out[mask] = self.parts[i][idx[mask] - self.offsets[i]]
+        return out
+
+
+class RowView:
+    """`base[order]` evaluated lazily, chunk by chunk, so a deduplicated or
+    subsampled dataset stays a view over the memory-mapped file."""
+
+    def __init__(self, base, order):
+        self.base = base
+        self.order = np.asarray(order)
+        self.shape = (len(self.order), base.shape[1])
+        self.ndim = 2
+        self.dtype = base.dtype
+
+    def __len__(self):
+        return self.shape[0]
+
+    def __getitem__(self, key):
+        return self.base[self.order[key]]
+
+
 # ─── deduplication ───────────────────────────────────────────────────────────
 
 def dedupe_rows(X, y, verbose: bool = True):
@@ -211,9 +270,7 @@ def dedupe_rows(X, y, verbose: bool = True):
     # so X_unique[j] = X[first_idx[perm[j]]] and y_unique_out[j] = y_avg[perm[j]].
     perm = np.argsort(first_idx)
     order = first_idx[perm]
-    X_unique = np.empty((m, X.shape[1]), dtype=np.float32)
-    for s in range(0, m, chunk):
-        X_unique[s:s + chunk] = X[order[s:s + chunk]]
+    X_unique = RowView(X, order)   # lazy: rows are gathered per decode chunk
     y_unique = y_unique[perm]
 
     if verbose:

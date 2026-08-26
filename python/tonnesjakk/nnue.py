@@ -957,11 +957,12 @@ def train_nnue(
     if load_data:
         print(f"\n[1/3] Loading training data from {load_data}...")
         if "," in load_data:
-            # Several streaming datasets (e.g. gen-1,gen-1b): concatenate in RAM.
-            # 6.5 GB per 10M rows — fine on this machine; dedupe merges them.
+            # Several streaming datasets: a lazy row-concatenation over the memmaps.
+            # (An eager np.concatenate of gen-1..3 is 25 GB and swaps the machine.)
+            from .nnue_arch import ConcatRows
             parts = [DataGenerator.load_streaming_dataset(p.strip()) for p in load_data.split(",")]
-            X = np.concatenate([np.asarray(p[0]) for p in parts])
-            y = np.concatenate([np.asarray(p[1]) for p in parts])
+            X = ConcatRows([p[0] for p in parts])
+            y = np.concatenate([np.asarray(p[1]) for p in parts])  # labels are small
             stats = TrainingStats()
             for p in parts:
                 stats.white_wins += p[2].white_wins
@@ -1045,7 +1046,8 @@ def train_nnue(
     if data_fraction < 1.0:
         rng = np.random.default_rng(0)
         keep = np.sort(rng.choice(len(X), int(len(X) * data_fraction), replace=False))
-        X, y = np.asarray(X)[keep], np.asarray(y)[keep]
+        from .nnue_arch import RowView
+        X, y = RowView(X, keep), np.asarray(y)[keep]
         print(f"  Data fraction {data_fraction:.2f}: using {len(X):,} rows")
 
     # Check balance
