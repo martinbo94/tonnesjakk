@@ -59,6 +59,58 @@ def classify(move, white_to_move: bool):
     return "jump", direction, hops
 
 
+def board_race_distance(board, white: bool) -> int:
+    """Opponent-aware race distance: sum over the side's on-board barrels of the
+    BFS shortest path (steps to empty squares, jumps over any piece to an
+    empty square, never over the enemy pail) to the goal row on the CURRENT
+    board, plus 1 + 5 per barrel still in hand. Unlike the single-agent race
+    table this changes when the opponent blocks a lane or offers a ladder."""
+    arr = board.to_array()
+    own = 1 if white else -1
+    enemy_pail = -2 if white else 2
+    goal = 0 if white else 5
+    occ = [[arr[r][c] != 0 for c in range(6)] for r in range(6)]
+    dirs = [(dr, dc) for dr in (-1, 0, 1) for dc in (-1, 0, 1) if dr or dc]
+    total = 0
+    for r0 in range(6):
+        for c0 in range(6):
+            if arr[r0][c0] != own:
+                continue
+            dist = {(r0, c0): 0}
+            frontier = [(r0, c0)]
+            found = None
+            while frontier and found is None:
+                nxt = []
+                for (r, c) in frontier:
+                    d = dist[(r, c)]
+                    for dr, dc in dirs:
+                        for hop in (1, 2):
+                            nr, nc = r + dr * hop, c + dc * hop
+                            if not (0 <= nr < 6 and 0 <= nc < 6):
+                                continue
+                            if hop == 2:
+                                mr, mc = r + dr, c + dc
+                                if not occ[mr][mc] or arr[mr][mc] == enemy_pail:
+                                    continue
+                            if occ[nr][nc] and (nr, nc) != (r0, c0):
+                                continue
+                            if (nr, nc) in dist:
+                                continue
+                            dist[(nr, nc)] = d + 1
+                            if nr == goal:
+                                found = d + 1
+                                break
+                            nxt.append((nr, nc))
+                        if found is not None:
+                            break
+                    if found is not None:
+                        break
+                frontier = nxt
+            total += found if found is not None else 12  # fully boxed in
+    in_hand = (board.white_barrels_off_board if white else board.black_barrels_off_board)
+    return total + in_hand * 6
+
+
 def play_instrumented(engine, other, depth, seed, label):
     """Self-play with `engine`; `other` is queried at each position for disagreement."""
     board = Board()
@@ -83,10 +135,9 @@ def play_instrumented(engine, other, depth, seed, label):
         r2 = other.search(board, depth)
         kind, direction, hops = classify(r.best_move, white)
         okind, odir, ohops = classify(r2.best_move, white) if r2.best_move else ("none", "-", 0)
-        w0, b0 = engine.race_distances(board)
+        own0 = board_race_distance(board, white); opp0 = board_race_distance(board, not white)
         board.make_move(r.best_move)
-        w1, b1 = engine.race_distances(board)
-        own0, opp0, own1, opp1 = (w0, b0, w1, b1) if white else (b0, w0, b1, w1)
+        own1 = board_race_distance(board, white); opp1 = board_race_distance(board, not white)
         records.append({
             "engine": label, "ply": plies, "phase": board.white_scored + board.black_scored,
             "kind": kind, "dir": direction, "hops": hops,
