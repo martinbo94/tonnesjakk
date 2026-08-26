@@ -68,3 +68,6 @@ runs/
 
 # Label-file backups from in-place repairs
 *.preflip_backup
+
+# Endgame tablebases (regenerate with solve_tablebase)
+tablebases/

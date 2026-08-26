@@ -602,6 +602,36 @@ impl Engine {
         self.inner.evaluate_heuristic(&bb)
     }
 
+    /// Load all solved tablebase phases from a directory (tb_{w}v{b}.bin files).
+    fn load_tablebases(&mut self, dir: &str) -> PyResult<Vec<(usize, usize)>> {
+        let tb = crate::tablebase::Tablebase::load_dir(std::path::Path::new(dir))
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("load tablebases: {}", e)))?;
+        let phases = tb.loaded_phases();
+        self.inner.tablebase = Some(tb);
+        Ok(phases)
+    }
+
+    /// Exact tablebase value of a position if its phase is solved:
+    /// ("white"|"black"|"draw", distance_to_win) or None.
+    fn tablebase_probe(&self, board: &Board) -> Option<(String, u32)> {
+        let bb = BitBoard::from_board(board);
+        let tb = self.inner.tablebase.as_ref()?;
+        let v = tb.value(&bb)?;
+        use crate::tablebase::{is_black_win, is_white_win, win_dist};
+        Some(if is_white_win(v) {
+            ("white".to_string(), win_dist(v) as u32)
+        } else if is_black_win(v) {
+            ("black".to_string(), win_dist(v) as u32)
+        } else {
+            ("draw".to_string(), 0)
+        })
+    }
+
+    #[getter]
+    fn tb_hits(&self) -> u64 {
+        self.inner.tb_hits
+    }
+
     /// Single-agent race distances (white, black): exact min-moves for each
     /// side alone to score all remaining barrels. For play analysis.
     fn race_distances(&self, board: &Board) -> (u16, u16) {
@@ -693,6 +723,10 @@ pub struct BitBoardEngine {
 
     // NNUE evaluator (generic over feature set; None = handcrafted eval)
     nnue: Option<SparseNNUE>,
+
+    // Endgame tablebases (solved phases); probed at non-root nodes
+    tablebase: Option<crate::tablebase::Tablebase>,
+    pub tb_hits: u64,
 
     // Dual-perspective accumulator stack for incremental NNUE updates
     dual_acc_stack: DualAccumulatorStack,
@@ -793,6 +827,8 @@ impl BitBoardEngine {
             cont_history: [[0i32; NUM_SQUARES]; NUM_SQUARES],
             prev_move: None,
             nnue: None,
+            tablebase: None,
+            tb_hits: 0,
             dual_acc_stack: DualAccumulatorStack::new(),
             deadline: None,
             nodes_since_check: 0,
@@ -1570,6 +1606,22 @@ impl BitBoardEngine {
             // draw: if repeating is best, the position is at best drawn.
             if self.path_hashes.contains(&h) || self.game_history.contains(&h) {
                 return (self.draw_score(), None);
+            }
+            // Tablebase probe: exact value with distance (root-relative)
+            if let Some(ref tb) = self.tablebase {
+                if let Some(v) = tb.value(bb) {
+                    self.tb_hits += 1;
+                    let ply = self.path_hashes.len() as i32;
+                    use crate::tablebase::{is_black_win, is_white_win, win_dist};
+                    let score = if is_white_win(v) {
+                        WIN_SCORE - (ply + win_dist(v) as i32)
+                    } else if is_black_win(v) {
+                        -(WIN_SCORE - (ply + win_dist(v) as i32))
+                    } else {
+                        self.draw_score()
+                    };
+                    return (score, None);
+                }
             }
         }
 

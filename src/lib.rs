@@ -4,6 +4,7 @@ pub mod board;
 pub mod nnue;
 pub mod race;
 pub mod search;
+pub mod tablebase;
 pub mod mcts;
 
 // Re-export everything for backward compatibility
@@ -70,9 +71,36 @@ fn decode_sparse_batch(
     Ok((w_idx, w_off, b_idx, b_off, dense_flat, buckets, labels))
 }
 
+/// Solve tablebase phase (wr, br) — barrels remaining per side — and write
+/// `dir/tb_{wr}v{br}.bin`. Lower phases must already exist in `dir`.
+/// Returns (states, white_wins, black_wins, draws).
+#[pyfunction]
+#[pyo3(signature = (dir, wr, br, verbose=true))]
+fn solve_tablebase(py: Python, dir: &str, wr: usize, br: usize, verbose: bool) -> PyResult<(usize, usize, usize, usize)> {
+    let path = std::path::Path::new(dir);
+    let mut tb = tablebase::Tablebase::load_dir(path)
+        .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("load tablebases: {}", e)))?;
+    for (lw, lb) in [(wr.saturating_sub(1), br), (wr, br.saturating_sub(1))] {
+        if lw >= 1 && lb >= 1 && tb.get(lw, lb).is_none() {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                format!("phase {}v{} must be solved before {}v{}", lw, lb, wr, br)));
+        }
+    }
+    let stats = py.allow_threads(|| {
+        let phase = tb.solve(wr, br, verbose);
+        let n = phase.num_states();
+        let w = phase.values.iter().filter(|&&v| tablebase::is_white_win(v)).count();
+        let b = phase.values.iter().filter(|&&v| tablebase::is_black_win(v)).count();
+        let d = phase.values.iter().filter(|&&v| v == tablebase::V_DRAW).count();
+        phase.save(path).map(|_| (n, w, b, d))
+    }).map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("save tablebase: {}", e)))?;
+    Ok(stats)
+}
+
 /// Python-modul
 #[pymodule]
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(solve_tablebase, m)?)?;
     m.add_class::<Player>()?;
     m.add_class::<Cell>()?;
     m.add_class::<Position>()?;
