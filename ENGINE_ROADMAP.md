@@ -536,10 +536,54 @@ self-improvement loop: heuristic → net-1b (+225) → net-2 (+251 vs heuristic,
 `--tb tablebases`: workers' engines probe the solved phases (≤5 barrels
 remaining) in search; solved positions get exact +1/−1/0 labels that bypass
 the "decided" filter. Smoke (200 games): 22% of positions tablebase-exact,
-corr(score, outcome) 0.82 (was ~0.7). Running: 300k games, d8, noise 0.15,
-random-moves 10, 10 workers → `training_gen3_d8.bin` (~3–4 h; NNUE labeler
-+ TB probes). Next: round 6 (net-3 candidates on gen-1..3, ladder incl.
-net-2), then 4v1 tablebase, then the 3v3 compaction project.
+corr(score, outcome) 0.82 (was ~0.7). Final: 300k games, d8, noise 0.15,
+random-moves 10, 10 workers, 18.9 games/s (4.4 h) → `training_gen3_d8.bin`,
+12.1M rows, W 51.4% / B 42.5% / **D 6.1%** (previous sets 1–2%: net-2 vs
+net-2 under the 60-ply no-progress rule is far more drawish than anything
+involving the heuristic — first dataset with a real draw signal), 39% of
+labels at |score|>0.99 (decisive or TB-exact), corr 0.83.
+
+## Round 6 — net-3 candidates on gen-1 + gen-1b + gen-2 + gen-3 (2026-08-26)
+
+38.6M rows → 27.2M unique (29% dupes; 35% before gen-3). 100 epochs each,
+~10 s/epoch on MPS after pre-decode. Gate: 600 games @ 100ms vs **net-2**.
+
+| architecture (plain+m+d20, 25 buckets) | Elo vs net-2 | W-D-L | val loss |
+|---|---|---|---|
+| **64×16 λ0.5** | **+29 [+10, +48]** | 274-102-224 | 0.2415 |
+| 128×16 λ0.5 | +5 [−15, +24] | 248-112-240 | 0.2386 |
+| 128×32 λ0.5 | +4 [−15, +23] | 242-123-235 | 0.2387 |
+| 96×16 λ0.5 (= net-2 config, 3.8× data) | −4 [−24, +16] | 247-99-254 | 0.2397 |
+| 96×16 λ0.65 | −10 [−29, +10] | 237-109-254 | 0.2359 |
+
+Findings:
+- **More data alone did nothing for the net-2 architecture** (−4): the data
+  ceiling is not the binding constraint at 96×16. Neither is width (128×16,
+  128×32 flat).
+- **The smallest net won, with the worst val loss.** At a fixed 100 ms the
+  cheaper eval buys depth, and depth beats a marginally better eval — the
+  round-4 lesson again, one size further down. Next probe: 48×16 / 32×16 to
+  find where the speed-vs-accuracy curve turns over.
+- Val loss is not comparable to earlier rounds: the split is the last 10% in
+  file order, i.e. mostly the gen-3 tail (exact TB labels → lower CE). Match
+  play is the measure, as always.
+- **16% of net-vs-net games end by threefold repetition** (1–2% vs the
+  heuristic): equal-strength engines shuffle. Draw labels matter from here on.
+- Infra: training on all four files concatenated 25 GB of memmaps into RAM
+  and dedupe copied another 16 GB — 48 GB peak, per candidate. Replaced by
+  lazy `ConcatRows` / `RowView` (memmap stays on disk; only the decoded sparse
+  batches, ~7 GB, live in memory). Verified byte-identical.
+
+**Ladder (600 games/rung @100ms): +227 [+199,+258] vs heuristic, +99 [+76,+123]
+vs net-1, +69 [+46,+92] vs net-1a, +70 [+48,+93] vs net-1b, +14 [−4,+32] vs
+net-2.** The net-2 rung alone is not significant; pooled with the gate (same
+opponent/TC, independent openings, 1200 games): **+21 [+3, +40]** ⇒ passes,
+marginally. **net-3 = `models/net3_plain_m_d20_64x16_b25_l05.json`** (64×16,
+25 buckets, λ0.5, gen-1..3). Ladder rung `net3_gen123_64x16_b25_l05`; web
+default. Second closed loop turn: net-2 → net-3 is +21, vs +46 for
+net-1b → net-2 — the self-labeling loop is flattening at this net family, so
+the next turn should change something other than the data volume (smaller /
+faster nets, feature set, or search-side work with the NNUE loaded).
 
 ## Endgame tablebases (2026-08-26, `src/tablebase.rs`)
 

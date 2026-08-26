@@ -123,7 +123,7 @@ def new_game(req: NewGameRequest):
     board = Board()
     engine = Engine()
     # Strongest available evaluator: the current best NNUE (models/), if present.
-    default_nnue = Path(__file__).resolve().parent.parent / "models" / "net2_plain_m_d20_96x16_b25_l05.json"
+    default_nnue = Path(__file__).resolve().parent.parent / "models" / "net3_plain_m_d20_64x16_b25_l05.json"
     if req.engine_type == "heuristic" and default_nnue.exists():
         try:
             engine.load_nnue(str(default_nnue))
