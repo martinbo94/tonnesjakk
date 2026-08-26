@@ -559,8 +559,10 @@ W3/B2 says "white wins in 1", search returns 99999 with 561 TB hits).
 | 3v1 / 1v3 | 0.77B (545M) | 146 s / 180 s | draws 0.003%; side with 1 barrel left wins 95.3% |
 | 3v2 | 11.5B (7.1B valid), 11.5 GB | 63 min (40 passes) | draws 0.27%; side with 2 left wins 79.0% |
 | 2v3 | — | derived by colour/board symmetry from 3v2 | (solve stopped mid-way; not needed) |
-| 4v1, 4v2 | 5.4B / 81B | 30 min / needs disk | later |
-| 3v3 | 110B | disk-backed | later |
+| 4v1 | 5.4B | ~30–60 min | queued after gen-3 |
+| 3v3 | 112B raw → **14 GB packed** (white-to-move only, 2-bit WDL, no DTW) | est. 7–10 h, resumable | infrastructure ready (`solve_tablebase_packed`); run when the machine is free |
+| 4v2 | 81B raw | needs the same packing generalised to asymmetric phases (~20 GB) | later |
+| 4v3 / 4v4 | 800B / 5.6T | disk / cluster | the full solve |
 
 Solver bug found & fixed on 2v2: the pass loop stopped at the first empty
 pass, but distances are non-contiguous when wins run through lower phases
