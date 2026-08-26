@@ -507,6 +507,27 @@ they genuinely play differently.
   squares ahead in the runner's lane costs ~−200, a pail on the edge or
   back rank is nearly worthless; the heuristic only sees "same column ahead".
 
+## Endgame tablebases (2026-08-26, `src/tablebase.rs`)
+
+Phase = (white remaining, black remaining) barrels; scoring is irreversible
+so phases form a DAG — solve small phases first (like 3→4→5-man chess
+tables). Loopy within a phase → retrograde iteration in distance order
+(exact DTW); unassigned = draw. Pail sub-move kept in the state. 1 byte/state.
+`solve_tablebase(dir, wr, br)`; engine `load_tablebases(dir)` probes at
+non-root nodes and returns exact root-relative scores (verified: probe at
+W3/B2 says "white wins in 1", search returns 99999 with 561 TB hits).
+
+| phase | states (valid) | solve time | result |
+|---|---|---|---|
+| 1v1 | 5.3M (4.4M) | 2.6 s | **0 draws**; 50/50 by symmetry |
+| 2v1 / 1v2 | 79M (61M) | 75 s | **0 draws**; side with fewer barrels left wins 80% of positions |
+| 2v2 | ~1.2B | running (~20–25 min est.) | |
+| 3v2 / 3v3 | ~7B / ~110B | hours / disk-backed | later |
+
+Uses: perfect endgame play; exact labels + a yardstick for the NNUE's
+endgame; the infrastructure for a full solve (4v4 opening phase ~10¹²).
+Files in `tablebases/` (gitignored; regenerate with solve_tablebase).
+
 ## Cleanup (2026-08-25)
 
 Removed: A/B-rejected knobs (`weight_pail_in_hand`, `weight_tempo`,
