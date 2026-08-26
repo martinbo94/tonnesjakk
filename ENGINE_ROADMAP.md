@@ -472,6 +472,41 @@ FC2) — FC2 and dense features dominate NNUE node cost.
 depth; the per-node speed deficit matters less). Both gates cleared: this is
 **net-1 candidate** pending training on gen-1 + gen-1b.
 
+## How the engines play (2026-08-26, `scripts/analyze_play.py`, 100 games each, depth 6)
+
+Both engines queried at every position of the other's games (equal depth ⇒
+differences are evaluation, not speed). Agreement on the move: **44–46%** —
+they genuinely play differently.
+
+| | heuristic | NNUE (net-1b) |
+|---|---|---|
+| move kinds | step 49%, jump 36%, place 15% | step 46%, jump 37%, place 16% |
+| direction | fwd 93%, side 6%, back 2% | fwd 90%, side 8%, back 3% |
+| jump chains 3+/5+ hops | 188 / 4 | 244 / 15 |
+| progress moves (own path shorter) | 89% | 88% |
+| blocking moves (opp path longer) | 14% | 15% |
+| pail timing (move #) | median 7, p90 **9** | median 9, p90 **20** |
+| pail squares | rows 2–3 centre, spills to rows 1/4 | rows 2–3 centre, tighter |
+
+- **It's a race for both**: ~90% of moves shorten the mover's own path;
+  only ~15% lengthen the opponent's (mostly by occupying a lane square),
+  and the mean effect on the opponent is ≈0. Neither engine plays a
+  blocking style; the NNUE didn't discover one — it races better.
+- **The NNUE sets up longer jump chains** (30% more 3+-hop chains, 4x the
+  5+-hop chains) and spends more moves sideways/backwards to arrange them.
+- **The NNUE holds the pail**: the heuristic spends it by move 9 in 90% of
+  games; the NNUE keeps it past move 20 in 10% of games (option value
+  learned from data — the static bonus we A/B'd couldn't express this).
+- Top disagreements: NNUE places a barrel where the heuristic would play
+  the pail (152) or a step where the heuristic jumps (72) and vice versa —
+  tempo/jump-timing judgement calls, not different plans.
+- **Positional probes** (lone barrel per square): the heuristic is column-
+  blind; the NNUE prefers the **central lanes** (+40–60 cp over edges) and
+  values advanced barrels more steeply (row 5: +290 vs +186; row 1: ≈equal).
+  Enemy-pail probe: the NNUE's map of pail damage is far richer — a pail 1–2
+  squares ahead in the runner's lane costs ~−200, a pail on the edge or
+  back rank is nearly worthless; the heuristic only sees "same column ahead".
+
 ## Cleanup (2026-08-25)
 
 Removed: A/B-rejected knobs (`weight_pail_in_hand`, `weight_tempo`,
