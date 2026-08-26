@@ -222,6 +222,11 @@ trivially inflates both while possibly discarding decisive lines).
 - Max ~4 retries per idea, then archive. Every ~10 merged changes, run a
   fixed regression match vs a frozen older build; keep a ladder of frozen
   versions to detect sibling-exploitation (discount self-play Elo ~30%).
+- **NNUE promotion rule (2026-08-26): a new net must beat the heuristic AND
+  every frozen rung in `models/ladder/` at equal time** (`scripts/ladder.py
+  --candidate …`), not just its parent. Strength is not transitive; a net
+  trained on its parent's games can exploit the parent specifically.
+  Periodic `--round-robin` over the rungs checks the ladder stays monotone.
 - Debug tool: a build with all pruning disabled must reproduce plain
   alpha-beta results at equal depth (validates implementation; SPRT
   validates the policy).
