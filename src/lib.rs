@@ -97,10 +97,40 @@ fn solve_tablebase(py: Python, dir: &str, wr: usize, br: usize, verbose: bool) -
     Ok(stats)
 }
 
+/// Solve a SYMMETRIC phase (r v r) into the packed 2-bit WDL format
+/// (`dir/tb_{r}v{r}.p2`): white-to-move states only, no distances — 3v3 fits
+/// in ~14 GB. Checkpoints every `checkpoint_every` passes (resumable).
+/// Returns (states, white_wins, black_wins, draws) over white-to-move states.
+#[pyfunction]
+#[pyo3(signature = (dir, r, checkpoint_every=5, verbose=true))]
+fn solve_tablebase_packed(py: Python, dir: &str, r: usize, checkpoint_every: usize, verbose: bool) -> PyResult<(usize, usize, usize, usize)> {
+    let path = std::path::Path::new(dir);
+    let tb = tablebase::Tablebase::load_dir(path)
+        .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("load tablebases: {}", e)))?;
+    if r >= 2 && tb.get(r, r - 1).is_none() && tb.get(r - 1, r).is_none() {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!("phase {}v{} must be solved first", r, r - 1)));
+    }
+    py.allow_threads(|| {
+        let p = tablebase::solve_packed(&tb, r, path, checkpoint_every, verbose);
+        let n = p.num_states();
+        let (mut w, mut b, mut d) = (0usize, 0usize, 0usize);
+        for idx in 0..n {
+            match p.get(idx) {
+                tablebase::P_WHITE => w += 1,
+                tablebase::P_BLACK => b += 1,
+                tablebase::P_UNKNOWN => d += 1,
+                _ => {}
+            }
+        }
+        p.save(path).map(|_| (n, w, b, d))
+    }).map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("save tablebase: {}", e)))
+}
+
 /// Python-modul
 #[pymodule]
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(solve_tablebase, m)?)?;
+    m.add_function(wrap_pyfunction!(solve_tablebase_packed, m)?)?;
     m.add_class::<Player>()?;
     m.add_class::<Cell>()?;
     m.add_class::<Position>()?;
