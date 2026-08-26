@@ -507,6 +507,25 @@ they genuinely play differently.
   squares ahead in the runner's lane costs ~−200, a pail on the edge or
   back rank is nearly worthless; the heuristic only sees "same column ahead".
 
+## Round 5 — net-2 candidates on gen-1 + gen-1b + gen-2 (2026-08-26)
+
+Gen-2 = 300k games labeled by net-1b (noise 0.15, random-moves 10). Combined
+26.3M rows → ~14M unique. Gate: 600 games @ 100ms vs **net-1b**.
+
+| architecture (all λ0.5 unless noted) | Elo vs net-1b | val loss |
+|---|---|---|
+| **plain+m+d20 96×16, 25 buckets** | **+75 [+55,+94]** | 0.4329 |
+| plain+m+d20 128×16 | +72 [+51,+93] | 0.4315 |
+| plain+m+d20 64×16 | +67 [+47,+89] | 0.4342 |
+| plain+m+d20 96×16 λ0.65 | +64 [+43,+85] | 0.4327 |
+| plain+m+d20 96×16 (= net-1b config) | +44 [+23,+66] | 0.4320 |
+
+Self-labeled data delivered: the net-1b configuration retrained on it gains
++44 over net-1b; the best variant +75. Buckets vs none on identical arch
+(+75 vs +44) is suggestive with 3x the data. Loss 0.4615 → 0.432.
+Promotion of net-2 requires the full ladder (heuristic, net-1, net-1a,
+net-1b) — pending, CPU currently on tablebases per plan.
+
 ## Endgame tablebases (2026-08-26, `src/tablebase.rs`)
 
 Phase = (white remaining, black remaining) barrels; scoring is irreversible
