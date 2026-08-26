@@ -523,8 +523,13 @@ Gen-2 = 300k games labeled by net-1b (noise 0.15, random-moves 10). Combined
 Self-labeled data delivered: the net-1b configuration retrained on it gains
 +44 over net-1b; the best variant +75. Buckets vs none on identical arch
 (+75 vs +44) is suggestive with 3x the data. Loss 0.4615 → 0.432.
-Promotion of net-2 requires the full ladder (heuristic, net-1, net-1a,
-net-1b) — pending, CPU currently on tablebases per plan.
+**Ladder gate PASSED (600 games/rung @100ms): +251 [+223,+283] vs heuristic,
++83 [+64,+103] vs net-1, +76 [+55,+97] vs net-1a, +46 [+26,+66] vs net-1b.**
+Monotone at every rung ⇒ **net-2 = `models/net2_plain_m_d20_96x16_b25_l05.json`**
+(plain+mirror+dense, 96×16, 25 scored-count output heads, λ0.5, trained on
+gen-1+1b+2). Added to the ladder; web UI default. First closed turn of the
+self-improvement loop: heuristic → net-1b (+225) → net-2 (+251 vs heuristic,
++46 over its own teacher).
 
 ## Endgame tablebases (2026-08-26, `src/tablebase.rs`)
 
@@ -541,8 +546,8 @@ W3/B2 says "white wins in 1", search returns 99999 with 561 TB hits).
 | 1v1 | 5.3M (4.4M) | 2.6 s | **0 draws**; 50/50 by symmetry |
 | 2v1 / 1v2 | 79M (61M) | 75 s | **0 draws**; side with fewer barrels left wins 80% of positions |
 | 2v2 | 1.19B (822M) | 302 s (14 threads, ~100M states/s per pass) | **draws 0.35%** (2.85M mutual-blockade positions); 49.83/49.83; longest forced win 35 plies |
-| 3v1 / 1v3 | 0.77B | minutes | running |
-| 3v2 / 2v3 | 11.5B each (11.5 GB RAM) | ~1 h each | queued |
+| 3v1 / 1v3 | 0.77B (545M) | 146 s / 180 s | draws 0.003%; side with 1 barrel left wins 95.3% |
+| 3v2 / 2v3 | 11.5B (7.1B valid) each, 11.5 GB RAM | ~6–7 min/pass ⇒ ~4–5 h each | running (not checkpointed: a kill loses the phase in progress) |
 | 4v1, 4v2 | 5.4B / 81B | 30 min / needs disk | later |
 | 3v3 | 110B | disk-backed | later |
 
