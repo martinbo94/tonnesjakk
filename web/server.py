@@ -130,6 +130,14 @@ def new_game(req: NewGameRequest):
             print(f"# Loaded NNUE: {default_nnue.name}")
         except Exception as e:
             print(f"# NNUE load failed ({e}); using handcrafted eval")
+    # Solved endgame phases (memory-mapped; +15-25 Elo, perfect draw-holding).
+    tb_dir = Path(__file__).resolve().parent.parent / "tablebases"
+    if req.engine_type == "heuristic" and tb_dir.is_dir():
+        try:
+            phases = engine.load_tablebases(str(tb_dir))
+            print(f"# Loaded tablebases: {phases}")
+        except Exception as e:
+            print(f"# Tablebase load failed ({e}); continuing without")
 
     game_data = {
         "board": board,

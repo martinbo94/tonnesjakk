@@ -630,7 +630,14 @@ move is late in the ordering by construction); (2) iterative deepening stops
 early only on a proven **win** for the side to move. After the fix: timed
 search picks a losing move in 0/20 drawn positions (was 5/20); holds 20/20
 drawn positions (was 6/20); escapes 3/40 lost positions.
-A/B v2 (fixed engine) queued; v1 results archived as `tb_ab_v1_*.json`.
+**A/B v2 (fixed engine): +16 [+1, +32] @ 100 ms (600 games, draws 4% → 21%),
++23 [+1, +44] @ 200 ms (400 games).** Tablebases are worth ~+15–25 Elo in
+play — modest, as expected: the solved phases are late and the search already
+finds most forced lines there; the value is perfect draw-holding and never
+entering a lost 5-barrel phase with an alternative available. The 61-point
+swing between v1 and v2 is the bug fix, which also applies to the plain
+engine. v1 results archived as `tb_ab_v1_*.json`. Web UI loads `tablebases/`
+when present; ladder/tournament gates stay TB-off (they compare nets).
 
 RFP ablation for the search re-tune: old constants + `rfp_margin=63` vs old
 constants = **+26 [+7, +45]** @ 100 ms. RFP is about a third of the +60; the
