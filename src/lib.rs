@@ -97,15 +97,28 @@ fn solve_tablebase(py: Python, dir: &str, wr: usize, br: usize, verbose: bool) -
     Ok(stats)
 }
 
+/// Write the 2-bit WDL companion (`tb_{wr}v{br}.wdl`) of a solved full phase.
+#[pyfunction]
+fn repack_tablebase_wdl(py: Python, dir: &str, wr: usize, br: usize) -> PyResult<usize> {
+    let path = std::path::Path::new(dir);
+    let phase = tablebase::Phase::load(path, wr, br)
+        .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("load phase: {}", e)))?;
+    py.allow_threads(|| phase.save_wdl(path))
+        .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("write wdl: {}", e)))?;
+    Ok((phase.num_states() + 3) / 4)
+}
+
 /// Solve a SYMMETRIC phase (r v r) into the packed 2-bit WDL format
 /// (`dir/tb_{r}v{r}.p2`): white-to-move states only, no distances — 3v3 fits
 /// in ~14 GB. Checkpoints every `checkpoint_every` passes (resumable).
+/// `lowmem` loads the lower phases from their `.wdl` companions (see
+/// `repack_tablebase_wdl`) so the 11.5 GB 3v2 table is not resident too.
 /// Returns (states, white_wins, black_wins, draws) over white-to-move states.
 #[pyfunction]
-#[pyo3(signature = (dir, r, checkpoint_every=5, verbose=true))]
-fn solve_tablebase_packed(py: Python, dir: &str, r: usize, checkpoint_every: usize, verbose: bool) -> PyResult<(usize, usize, usize, usize)> {
+#[pyo3(signature = (dir, r, checkpoint_every = 5, verbose = true, lowmem = false))]
+fn solve_tablebase_packed(py: Python, dir: &str, r: usize, checkpoint_every: usize, verbose: bool, lowmem: bool) -> PyResult<(usize, usize, usize, usize)> {
     let path = std::path::Path::new(dir);
-    let tb = tablebase::Tablebase::load_dir(path)
+    let tb = if lowmem { tablebase::Tablebase::load_dir_lowmem(path) } else { tablebase::Tablebase::load_dir(path) }
         .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("load tablebases: {}", e)))?;
     if r >= 2 && tb.get(r, r - 1).is_none() && tb.get(r - 1, r).is_none() {
         return Err(pyo3::exceptions::PyValueError::new_err(format!("phase {}v{} must be solved first", r, r - 1)));
@@ -131,6 +144,7 @@ fn solve_tablebase_packed(py: Python, dir: &str, r: usize, checkpoint_every: usi
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(solve_tablebase, m)?)?;
     m.add_function(wrap_pyfunction!(solve_tablebase_packed, m)?)?;
+    m.add_function(wrap_pyfunction!(repack_tablebase_wdl, m)?)?;
     m.add_class::<Player>()?;
     m.add_class::<Cell>()?;
     m.add_class::<Position>()?;

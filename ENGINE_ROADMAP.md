@@ -724,7 +724,7 @@ W3/B2 says "white wins in 1", search returns 99999 with 561 TB hits).
 | 3v2 | 11.5B (7.1B valid), 11.5 GB | 63 min (40 passes) | draws 0.27%; side with 2 left wins 79.0% |
 | 2v3 | — | derived by colour/board symmetry from 3v2 | (solve stopped mid-way; not needed) |
 | 4v1 / 1v4 | 5.4B (3.5B valid), 5.4 GB | 22 min (31 passes) | side with 1 left wins **98.6%**; draws 0.80% (most drawish phase so far — 4 barrels vs 1 barrel + pail gets locked up) |
-| 3v3 | 56B white-to-move states (30B valid) → **14 GB packed** (2-bit WDL, no DTW) | est. 7–10 h, resumable (checkpoint every 5 passes) | first attempt 2026-08-26 22:18 lost to an unexpected machine shutdown ~1 h in, before the first checkpoint; re-run when the machine is free overnight |
+| 3v3 | 56B white-to-move states (30B valid) → **14 GB packed** (2-bit WDL, no DTW) | est. 7–10 h, resumable (checkpoint every 2 passes, atomic) | attempt 1 (08-26 22:18) lost to a macOS update reboot; attempt 2 (08-27 19:05) **froze the whole machine** — 14 GB array + the full 11.5 GB 3v2 table probed at random (fully resident) + Chrome/Slack/Claude ≈ 48 GB. Fix: 2-bit `.wdl` companions of every solved phase (`repack_tablebase_wdl`; 3v2 11.5 → 2.9 GB, 4v1 5.4 → 1.4 GB) and `solve_tablebase_packed(..., lowmem=True)` loads those instead — solver footprint ≈ 17 GB. Play still uses the full `.bin` tables (distances). Attempt 3 running. |
 | 4v2 | 81B raw | needs the same packing generalised to asymmetric phases (~20 GB) | later |
 | 4v3 / 4v4 | 800B / 5.6T | disk / cluster | the full solve |
 

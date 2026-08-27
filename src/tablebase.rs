@@ -134,26 +134,91 @@ pub struct Phase {
     bcfg: ConfigSpace,
     pub values: Vec<u8>,
     mapped: Option<memmap2::Mmap>,
+    /// 2-bit WDL-only storage (`.wdl` file): a quarter of the `.bin`, no
+    /// distances. Used by the solvers, which only need win/draw/loss of the
+    /// lower phases — the full 3v2 table alone is 11.5 GB of random access.
+    wdl: Option<memmap2::Mmap>,
     num_states: usize,
 }
+
+// 2-bit classes in a `.wdl` file
+const W_INVALID: u8 = 0;
+const W_DRAW: u8 = 1;
+const W_WHITE: u8 = 2;
+const W_BLACK: u8 = 3;
 
 impl Phase {
     pub fn new(wr: usize, br: usize) -> Self {
         let wcfg = ConfigSpace::new(Player::White, wr);
         let bcfg = ConfigSpace::new(Player::Black, br);
         let n = (wcfg.count * bcfg.count) as usize * PAIL_STATES * PAIL_STATES * 4;
-        Phase { wr, br, wcfg, bcfg, values: vec![V_UNKNOWN; n], mapped: None, num_states: n }
+        Phase { wr, br, wcfg, bcfg, values: vec![V_UNKNOWN; n], mapped: None, wdl: None, num_states: n }
     }
 
     pub fn num_states(&self) -> usize { self.num_states }
 
-    /// Read access to values regardless of storage.
+    pub fn is_wdl_only(&self) -> bool { self.wdl.is_some() }
+
+    /// Read access to the full value bytes (not available for WDL-only phases).
     #[inline]
     pub fn vals(&self) -> &[u8] {
         match &self.mapped {
             Some(m) => &m[..],
             None => &self.values,
         }
+    }
+
+    /// Value byte at an index regardless of storage. WDL-only phases report
+    /// wins with distance 0.
+    #[inline]
+    pub fn get(&self, idx: usize) -> u8 {
+        if let Some(w) = &self.wdl {
+            return match (w[idx >> 2] >> ((idx & 3) * 2)) & 3 {
+                W_INVALID => V_INVALID,
+                W_DRAW => V_DRAW,
+                W_WHITE => v_white_win(0),
+                _ => v_black_win(0),
+            };
+        }
+        self.vals()[idx]
+    }
+
+    fn wdl_file_name(wr: usize, br: usize) -> String { format!("tb_{}v{}.wdl", wr, br) }
+
+    /// Write the 2-bit WDL companion of a solved full phase (streamed, so the
+    /// 11.5 GB 3v2 table never needs a second copy in RAM).
+    pub fn save_wdl(&self, dir: &Path) -> std::io::Result<()> {
+        use std::io::Write;
+        let vals = self.vals();
+        let mut out = std::io::BufWriter::with_capacity(1 << 22, std::fs::File::create(dir.join(Self::wdl_file_name(self.wr, self.br)))?);
+        let mut buf = vec![0u8; 1 << 20];
+        for (ci, chunk) in vals.chunks(4 << 20).enumerate() {
+            let _ = ci;
+            let nbytes = (chunk.len() + 3) / 4;
+            for b in buf[..nbytes].iter_mut() { *b = 0; }
+            for (i, &v) in chunk.iter().enumerate() {
+                let c = if v == V_INVALID { W_INVALID }
+                    else if is_white_win(v) { W_WHITE }
+                    else if is_black_win(v) { W_BLACK }
+                    else { W_DRAW }; // V_DRAW, and V_UNKNOWN in a finished phase
+                buf[i >> 2] |= c << ((i & 3) * 2);
+            }
+            out.write_all(&buf[..nbytes])?;
+        }
+        out.flush()
+    }
+
+    /// Memory-map a `.wdl` file as a WDL-only phase.
+    pub fn load_wdl(dir: &Path, wr: usize, br: usize) -> std::io::Result<Self> {
+        let wcfg = ConfigSpace::new(Player::White, wr);
+        let bcfg = ConfigSpace::new(Player::Black, br);
+        let n = (wcfg.count * bcfg.count) as usize * PAIL_STATES * PAIL_STATES * 4;
+        let file = std::fs::File::open(dir.join(Self::wdl_file_name(wr, br)))?;
+        let mmap = unsafe { memmap2::Mmap::map(&file)? };
+        if mmap.len() != (n + 3) / 4 {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "wdl tablebase size mismatch"));
+        }
+        Ok(Phase { wr, br, wcfg, bcfg, values: Vec::new(), mapped: None, wdl: Some(mmap), num_states: n })
     }
 
     #[inline]
@@ -234,7 +299,7 @@ impl Phase {
         if mmap.len() != n {
             return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "tablebase size mismatch"));
         }
-        Ok(Phase { wr, br, wcfg, bcfg, values: Vec::new(), mapped: Some(mmap), num_states: n })
+        Ok(Phase { wr, br, wcfg, bcfg, values: Vec::new(), mapped: Some(mmap), wdl: None, num_states: n })
     }
 }
 
@@ -556,7 +621,7 @@ impl Tablebase {
         let br = 4 - bb.black_scored as usize;
         if let Some(phase) = self.get(wr, br) {
             let idx = phase.index(bb)?;
-            let v = phase.vals()[idx];
+            let v = phase.get(idx);
             return if v == V_INVALID || v == V_UNKNOWN { None } else { Some(v) };
         }
         if wr == br {
@@ -567,7 +632,7 @@ impl Tablebase {
         let mirror_phase = self.get(br, wr)?;
         let m = color_mirror(bb);
         let idx = mirror_phase.index(&m)?;
-        let v = mirror_phase.vals()[idx];
+        let v = mirror_phase.get(idx);
         if v == V_INVALID || v == V_UNKNOWN {
             None
         } else if is_white_win(v) {
@@ -585,6 +650,28 @@ impl Tablebase {
         for wr in 1..=4 {
             for br in 1..=4 {
                 if dir.join(format!("tb_{}v{}.bin", wr, br)).exists() {
+                    tb.insert(Phase::load(dir, wr, br)?);
+                }
+            }
+        }
+        for r in 1..=4 {
+            if dir.join(PackedPhase::file_name(r)).exists() && tb.get(r, r).is_none() {
+                tb.insert_packed(PackedPhase::load(dir, r)?);
+            }
+        }
+        Ok(tb)
+    }
+
+    /// Like `load_dir`, but prefer the 2-bit `.wdl` companions over the full
+    /// `.bin` files: a quarter of the resident memory, no distances. For the
+    /// solvers (which only need WDL of the lower phases), not for play.
+    pub fn load_dir_lowmem(dir: &Path) -> std::io::Result<Self> {
+        let mut tb = Tablebase::new();
+        for wr in 1..=4 {
+            for br in 1..=4 {
+                if dir.join(Phase::wdl_file_name(wr, br)).exists() {
+                    tb.insert(Phase::load_wdl(dir, wr, br)?);
+                } else if dir.join(format!("tb_{}v{}.bin", wr, br)).exists() {
                     tb.insert(Phase::load(dir, wr, br)?);
                 }
             }
@@ -835,6 +922,45 @@ mod tests {
             checked += 1;
         }
         assert!(checked > 10_000);
+    }
+
+    /// The 2-bit `.wdl` companion, loaded through `load_dir_lowmem`, must give
+    /// the same win/draw/loss as the full table for every state — directly
+    /// (2v1) and through the colour mirror (1v2 via 2v1).
+    #[test]
+    fn test_wdl_companion_matches_full() {
+        let dir = std::env::temp_dir().join("tonnesjakk_tb_wdl_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut full = Tablebase::new();
+        full.solve(1, 1, false);
+        full.solve(2, 1, false);
+        for (wr, br) in [(1, 1), (2, 1)] {
+            let p = full.get(wr, br).unwrap();
+            p.save(&dir).unwrap();
+            p.save_wdl(&dir).unwrap();
+        }
+        let low = Tablebase::load_dir_lowmem(&dir).unwrap();
+        assert!(low.get(2, 1).unwrap().is_wdl_only());
+        let same = |v: u8, w: u8| (is_white_win(v) && is_white_win(w)) || (is_black_win(v) && is_black_win(w)) || (v == V_DRAW && w == V_DRAW);
+        let phase21 = full.get(2, 1).unwrap();
+        let mut checked = 0;
+        for idx in (0..phase21.num_states()).step_by(31) {
+            let Some(bb) = phase21.decode(idx) else { continue };
+            let v = phase21.vals()[idx];
+            if v == V_INVALID { continue; }
+            assert_eq!(low.value(&bb).is_some(), full.value(&bb).is_some(), "presence differs at {}", idx);
+            if let Some(w) = low.value(&bb) {
+                assert!(same(v, w), "wdl mismatch at idx {}: full {} wdl {}", idx, v, w);
+                checked += 1;
+            }
+            // mirror: a 1v2 position answered via the 2v1 companion
+            let m = color_mirror(&bb);
+            let fm = full.value(&m).unwrap();
+            let lm = low.value(&m).unwrap();
+            assert!(same(fm, lm), "mirror wdl mismatch at idx {}", idx);
+        }
+        assert!(checked > 100_000);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Colour symmetry: the value of 1v2 states read through the 2v1 table via
