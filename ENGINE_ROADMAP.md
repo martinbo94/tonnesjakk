@@ -601,6 +601,41 @@ search constants must be re-tuned against it — the RFP margin that was
 scale. Ablation (RFP alone vs the full vector) queued; the whole ladder is
 implicitly re-baselined since both sides of every match use the same engine.
 
+## Tablebases in play: first measured, then two search bugs (2026-08-27)
+
+**A/B v1, net-3 with tablebase probing vs net-3 without (same net, same
+search): −45 [−65, −26] @ 100 ms, −67 [−91, −43] @ 200 ms.** Perfect endgame
+knowledge made the engine *weaker*, more so with more time.
+
+Diagnosis (all verified with scripts in the session, not by reasoning alone):
+- The tables are right: 30/30 "win in N" positions converted within N plies
+  against a stronger opponent; one-ply minimax consistency holds on 400
+  random positions (0 violations); probing is cheap even cold.
+- From TB-*drawn* positions the TB engine **lost 14 of 20** games at 100 ms
+  while the plain engine held 20/20. The timed search returned at **depth 1**
+  with a decisive loss score although a drawing move existed: **late-move
+  pruning at depth 1 (lmp_base + 1² = 7 moves) skipped the only drawing move**,
+  the root concluded "all moves lose", and **iterative deepening's
+  `if |score| > 90 000 break` accepted that depth-1 verdict**. Fixed-depth 8
+  never showed it (LMP allows 70 moves there).
+- From TB-*lost* positions the TB engine escaped 1/40 vs 8/40 for the plain
+  engine: the same early break meant zero practical resistance (depth-1 move,
+  ordered by longest theoretical loss).
+Neither bug is tablebase-specific; tablebases just produce decisive scores
+at depth 1 all the time.
+
+Fixes (`search.rs`): (1) no LMP / futility move-skipping at the root, and
+none anywhere while every move searched so far is a proven loss (the saving
+move is late in the ordering by construction); (2) iterative deepening stops
+early only on a proven **win** for the side to move. After the fix: timed
+search picks a losing move in 0/20 drawn positions (was 5/20); holds 20/20
+drawn positions (was 6/20); escapes 3/40 lost positions.
+A/B v2 (fixed engine) queued; v1 results archived as `tb_ab_v1_*.json`.
+
+RFP ablation for the search re-tune: old constants + `rfp_margin=63` vs old
+constants = **+26 [+7, +45]** @ 100 ms. RFP is about a third of the +60; the
+other knobs jointly carry the rest.
+
 ## Gen-3 (2026-08-26): labeled by net-2 WITH tablebases
 
 `--tb tablebases`: workers' engines probe the solved phases (≤5 barrels

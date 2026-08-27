@@ -1959,12 +1959,23 @@ impl BitBoardEngine {
         } else {
             usize::MAX
         };
+        // The wrapper pushed this node's hash before calling us.
+        let is_root = self.path_hashes.len() == 1;
 
         for mv in sorted_moves {
+            // Move-count / futility skips assume the moves already searched
+            // are representative. When every move so far is a proven loss the
+            // one saving move is typically late in the ordering (found via
+            // tablebases: LMP at depth 1 skipped the only drawing move, the
+            // root scored "lost" and iterative deepening stopped there).
+            // Never skip at the root either — the root must pick from all moves.
+            let losing_so_far = if maximizing { best_score <= -WIN_BOUND } else { best_score >= WIN_BOUND };
+            let may_skip = !is_root && !losing_so_far;
+
             // ═══════════════════════════════════════════════════════════════
             // LATE MOVE PRUNING - movecount-based skip of late quiets
             // ═══════════════════════════════════════════════════════════════
-            if moves_searched >= lmp_threshold && !mv.is_pail_placement() {
+            if may_skip && moves_searched >= lmp_threshold && !mv.is_pail_placement() {
                 let (to_row, _) = sq_to_coords(mv.barrel_to() as usize);
                 if to_row != bb.goal_row(bb.current_player) {
                     continue;
@@ -1974,7 +1985,7 @@ impl BitBoardEngine {
             // ═══════════════════════════════════════════════════════════════
             // FUTILITY PRUNING - Skip futile moves
             // ═══════════════════════════════════════════════════════════════
-            if futility_pruning && moves_searched > 0 && !mv.is_pail_placement() {
+            if may_skip && futility_pruning && moves_searched > 0 && !mv.is_pail_placement() {
                 // Don't prune moves that reach goal (high tactical value).
                 // Pail placements are never futility-pruned either: a well-
                 // placed pail can swing far more than the futility margin.
@@ -2228,8 +2239,12 @@ impl BitBoardEngine {
             }
             self.last_completed_depth = depth;
 
-            // Stopp tidlig ved vinnersekvens
-            if score.abs() > 90_000 {
+            // Stop early on a proven WIN for the side to move (the PV line is
+            // real). A proven LOSS is not a reason to stop: it may rest on a
+            // shallow, pruned iteration, and deeper search finds the most
+            // resistant move when the position really is lost.
+            let root_max = bb.current_player == Player::White;
+            if (root_max && score > WIN_BOUND) || (!root_max && score < -WIN_BOUND) {
                 break;
             }
         }
