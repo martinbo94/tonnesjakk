@@ -521,6 +521,56 @@ impl Engine {
         self.inner.qs_mode = value;
     }
 
+    #[getter]
+    fn asp_delta(&self) -> i32 { self.inner.asp_delta }
+    #[setter]
+    fn set_asp_delta(&mut self, value: i32) { self.inner.asp_delta = value; }
+
+    #[getter]
+    fn razor_base(&self) -> i32 { self.inner.razor_base }
+    #[setter]
+    fn set_razor_base(&mut self, value: i32) { self.inner.razor_base = value; }
+
+    #[getter]
+    fn razor_slope(&self) -> i32 { self.inner.razor_slope }
+    #[setter]
+    fn set_razor_slope(&mut self, value: i32) { self.inner.razor_slope = value; }
+
+    #[getter]
+    fn nmp_margin(&self) -> i32 { self.inner.nmp_margin }
+    #[setter]
+    fn set_nmp_margin(&mut self, value: i32) { self.inner.nmp_margin = value; }
+
+    #[getter]
+    fn nmp_boost_margin(&self) -> i32 { self.inner.nmp_boost_margin }
+    #[setter]
+    fn set_nmp_boost_margin(&mut self, value: i32) { self.inner.nmp_boost_margin = value; }
+
+    #[getter]
+    fn fut_scale(&self) -> i32 { self.inner.fut_scale }
+    #[setter]
+    fn set_fut_scale(&mut self, value: i32) { self.inner.fut_scale = value; }
+
+    #[getter]
+    fn lmr_div(&self) -> i32 { self.inner.lmr_div }
+    #[setter]
+    fn set_lmr_div(&mut self, value: i32) { self.inner.set_lmr_div(value); }
+
+    #[getter]
+    fn lmr_hist_good(&self) -> i32 { self.inner.lmr_hist_good }
+    #[setter]
+    fn set_lmr_hist_good(&mut self, value: i32) { self.inner.lmr_hist_good = value; }
+
+    #[getter]
+    fn lmr_hist_bad(&self) -> i32 { self.inner.lmr_hist_bad }
+    #[setter]
+    fn set_lmr_hist_bad(&mut self, value: i32) { self.inner.lmr_hist_bad = value; }
+
+    #[getter]
+    fn iir_depth(&self) -> i32 { self.inner.iir_depth }
+    #[setter]
+    fn set_iir_depth(&mut self, value: i32) { self.inner.iir_depth = value; }
+
     /// Load NNUE weights from JSON file
     /// After loading, the engine will use NNUE for evaluation instead of heuristics
     fn load_nnue(&mut self, path: &str) -> PyResult<()> {
@@ -795,6 +845,31 @@ pub struct BitBoardEngine {
     // Quiescence: 1 = scoring moves + moves to the row before goal, cap 6;
     // 2 = scoring moves only, cap 4 (default; beat mode 1 by +29 Elo).
     pub qs_mode: i32,
+    // The remaining pruning constants, exposed for SPSA with the NNUE loaded
+    // (all were tuned by hand against the heuristic eval).
+    pub asp_delta: i32,        // initial aspiration half-window
+    pub razor_base: i32,       // razoring margin = base + slope * depth
+    pub razor_slope: i32,
+    pub nmp_margin: i32,       // try NMP only if eval >= beta - margin
+    pub nmp_boost_margin: i32, // extra reduction when eval >= beta + this
+    pub fut_scale: i32,        // percent scale applied to the futility margin table
+    pub lmr_div: i32,          // LMR table divisor x100: R = ln(d) ln(m) / (lmr_div/100)
+    pub lmr_hist_good: i32,    // history above this: one less reduction
+    pub lmr_hist_bad: i32,     // history below this: one more reduction
+    pub iir_depth: i32,        // internal iterative reduction from this depth (no TT move)
+}
+
+fn build_lmr_table(div_x100: i32) -> [[u8; 64]; 32] {
+    // R = ln(depth) * ln(move_count) / div. Divisor 1.0 was tuned for the 6x6
+    // board (shallower depths than standard chess).
+    let div = (div_x100.max(1) as f64) / 100.0;
+    let mut t = [[0u8; 64]; 32];
+    for d in 1..32 {
+        for m in 1..64 {
+            t[d][m] = ((d as f64).ln() * (m as f64).ln() / div) as u8;
+        }
+    }
+    t
 }
 
 impl Default for BitBoardEngine {
@@ -805,14 +880,7 @@ impl Default for BitBoardEngine {
 
 impl BitBoardEngine {
     pub fn new() -> Self {
-        // Precompute LMR reduction table: R = ln(depth) * ln(move_count)
-        // Divisor 1.0 tuned for 6x6 board (shallower depths than standard chess)
-        let mut lmr_table = [[0u8; 64]; 32];
-        for d in 1..32 {
-            for m in 1..64 {
-                lmr_table[d][m] = ((d as f64).ln() * (m as f64).ln() / 1.0) as u8;
-            }
-        }
+        let lmr_table = build_lmr_table(100);
 
         BitBoardEngine {
             nodes_searched: 0,
@@ -867,7 +935,22 @@ impl BitBoardEngine {
             // qs_mode 2 PASSED both gates: +53 [+28,+78] @ 50ms, +62 [+35,+91]
             // @ 200ms vs legacy; beats qs_mode 1 head-to-head +29 [+11,+47].
             qs_mode: 2,
+            asp_delta: 30,
+            razor_base: 200,
+            razor_slope: 150,
+            nmp_margin: 50,
+            nmp_boost_margin: 150,
+            fut_scale: 100,
+            lmr_div: 100,
+            lmr_hist_good: 1000,
+            lmr_hist_bad: -500,
+            iir_depth: 4,
         }
+    }
+
+    pub fn set_lmr_div(&mut self, div_x100: i32) {
+        self.lmr_div = div_x100;
+        self.lmr_table = build_lmr_table(div_x100);
     }
 
     /// Clear history table (call between games)
@@ -1372,16 +1455,16 @@ impl BitBoardEngine {
         // failed side geometrically (a fail-low says nothing about beta).
         // SPRT-passed vs fixed ±50 + full-window re-search: +42 @ 50ms,
         // +31 @ 200ms.
-        const ASPIRATION_DELTA: i32 = 30;
+        let asp_delta = self.asp_delta.max(1);
 
         let (mut alpha, mut beta) = match prev_score {
-            Some(score) => (score - ASPIRATION_DELTA, score + ASPIRATION_DELTA),
+            Some(score) => (score - asp_delta, score + asp_delta),
             None => (i32::MIN + 1, i32::MAX - 1),
         };
 
         let mut best_move;
         let mut score;
-        let mut delta: i32 = ASPIRATION_DELTA;
+        let mut delta: i32 = asp_delta;
 
         loop {
             let (s, mv) = self.minimax(bb, depth, alpha, beta, maximizing);
@@ -1687,7 +1770,7 @@ impl BitBoardEngine {
         // Without a TT move, the search has no good first move for PVS.
         // Reduce depth by 1 — the shallower result will populate the TT
         // for the next iterative deepening iteration.
-        if tt_move.is_none() && depth >= 4 {
+        if tt_move.is_none() && depth as i32 >= self.iir_depth {
             depth -= 1;
         }
 
@@ -1735,7 +1818,7 @@ impl BitBoardEngine {
         // drop to quiescence search. If even qsearch can't save the
         // position, prune the entire subtree.
         if depth <= 3 && !is_endgame && !is_pail_position {
-            let razor_margin = 200 + 150 * depth as i32;
+            let razor_margin = self.razor_base + self.razor_slope * depth as i32;
             if maximizing && corrected_eval + razor_margin < alpha {
                 let qscore = self.quiesce(bb, alpha, beta, maximizing, 0);
                 if qscore < alpha {
@@ -1779,7 +1862,7 @@ impl BitBoardEngine {
         // If giving opponent a free move still results in a beta cutoff,
         // this position is so good we can prune.
         // Only use when position is already favorable (otherwise unlikely to cutoff)
-        let nmp_margin = 50; // Only try NMP if we're at least this much better
+        let nmp_margin = self.nmp_margin; // Only try NMP if we're at least this much better
         let nmp_allowed = depth >= 4
             && !is_endgame
             && !is_pail_position
@@ -1800,10 +1883,10 @@ impl BitBoardEngine {
                 r += 1;
             }
             // Eval-based boost: if eval strongly exceeds the bound, prune harder
-            if maximizing && corrected_eval >= beta + 150 {
+            if maximizing && corrected_eval >= beta + self.nmp_boost_margin {
                 r += 1;
             }
-            if !maximizing && corrected_eval <= alpha - 150 {
+            if !maximizing && corrected_eval <= alpha - self.nmp_boost_margin {
                 r += 1;
             }
             let null_depth = (depth as i16 - r as i16 - 1).max(1) as u8;
@@ -1839,7 +1922,8 @@ impl BitBoardEngine {
         // alpha). Margins scale super-linearly with depth.
         const FUTILITY_MARGINS: [i32; 9] = [0, 80, 160, 250, 350, 450, 600, 750, 950];
         // Use half the futility margin in endgame (prune less aggressively)
-        let margin = if is_endgame { FUTILITY_MARGINS[depth.min(8) as usize] / 2 } else { FUTILITY_MARGINS[depth.min(8) as usize] };
+        let base_margin = FUTILITY_MARGINS[depth.min(8) as usize] * self.fut_scale / 100;
+        let margin = if is_endgame { base_margin / 2 } else { base_margin };
         let futility_pruning = depth <= 8
             && !is_pail_position
             && corrected_eval.abs() < 90_000 // Not near mate
@@ -1935,8 +2019,8 @@ impl BitBoardEngine {
                     if let Some(from) = mv.barrel_from() {
                         let to = mv.barrel_to() as usize;
                         let from = from as usize;
-                        if self.history[from][to] > 1000 { reduction = reduction.saturating_sub(1); }
-                        if self.history[from][to] < -500 { reduction += 1; }
+                        if self.history[from][to] > self.lmr_hist_good { reduction = reduction.saturating_sub(1); }
+                        if self.history[from][to] < self.lmr_hist_bad { reduction += 1; }
                         // Don't reduce goal-reaching moves
                         let (to_row, _) = sq_to_coords(to);
                         if to_row == bb.goal_row(bb.current_player) { reduction = 0; }

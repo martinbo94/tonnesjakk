@@ -496,7 +496,13 @@ pub fn solve_packed(lower: &Tablebase, r: usize, dir: &Path, checkpoint_every: u
             eprintln!("  pass {:3}: assigned {:10} ({:.0}s)", pass, n_assigned, t_start.elapsed().as_secs_f64());
         }
         if checkpoint_every > 0 && pass % checkpoint_every == 0 {
-            let _ = std::fs::write(&ckpt_path, &data);
+            // Write-then-rename so a reboot mid-write leaves the previous
+            // checkpoint intact instead of a truncated file (which the
+            // length check on resume would reject, restarting from scratch).
+            let tmp = ckpt_path.with_extension("partial.tmp");
+            if std::fs::write(&tmp, &data).is_ok() {
+                let _ = std::fs::rename(&tmp, &ckpt_path);
+            }
         }
         if n_assigned == 0 { break; }
     }

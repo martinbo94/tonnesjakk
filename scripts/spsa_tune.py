@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""SPSA tuning of the heuristic eval weights via engine self-play.
+"""SPSA tuning of engine parameters via self-play: the heuristic eval weights
+(--params eval, default) or the search/pruning knobs (--params search, meant
+to run with --nnue and --time-ms).
 
 Classic chess-engine SPSA (as used for Stockfish): each iteration perturbs
 all weights simultaneously by +/- c_k (Rademacher signs), plays a small match
@@ -32,7 +34,7 @@ from match import EngineSpec, make_engine, play_game  # noqa: E402
 
 # name: (initial, step_scale, min, max)
 # Initials = current engine defaults (SPSA round 1 result, 2026-08-20).
-PARAMS = {
+EVAL_PARAMS = {
     "weight_progress":     (77,  10, 10, 400),
     "weight_center_pail":  (15,   5, -50, 100),
     "weight_blocking":     (19,   6, -50, 200),
@@ -49,11 +51,31 @@ PARAMS = {
     "weight_race":         (80,  10, -50, 400),
 }
 
+# Search/pruning knobs (--params search). Initials = engine defaults, which
+# were hand-tuned against the heuristic eval; run this with --nnue and a time
+# control, since pruning trades depth for accuracy.
+SEARCH_PARAMS = {
+    "asp_delta":        (30,   8,   5,  200),
+    "razor_base":       (200, 40,   0,  800),
+    "razor_slope":      (150, 30,   0,  600),
+    "nmp_margin":       (50,  15, -200, 400),
+    "nmp_boost_margin": (150, 30,   0,  800),
+    "fut_scale":        (100, 15,  20,  300),
+    "lmr_div":          (100, 12,  40,  300),
+    "lmr_hist_good":    (1000, 200, 0, 5000),
+    "lmr_hist_bad":     (-500, 150, -5000, 0),
+    "lmp_base":         (6,   2,   1,   30),
+    "rfp_margin":       (0,   30,  0,  400),
+    "iir_depth":        (4,   1,   2,   12),
+}
+
+PARAMS = EVAL_PARAMS  # selected in main() via --params
+
 _state = {}
 
 
-def _worker_init(depth, time_ms):
-    spec = EngineSpec(label="w", depth=depth, time_ms=time_ms)
+def _worker_init(depth, time_ms, nnue):
+    spec = EngineSpec(label="w", depth=depth, time_ms=time_ms, nnue=nnue)
     _state["spec"] = spec
     _state["e1"] = make_engine(spec)
     _state["e2"] = make_engine(spec)
@@ -94,7 +116,13 @@ def main():
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--out", type=str, default="scripts/results/spsa_tune.json")
     ap.add_argument("--resume", type=str, default="", help="Resume theta from a previous out-file")
+    ap.add_argument("--nnue", type=str, default="", help="NNUE weights loaded into both engines")
+    ap.add_argument("--params", choices=("eval", "search"), default="eval",
+                    help="eval = heuristic weights; search = pruning knobs")
     args = ap.parse_args()
+
+    global PARAMS
+    PARAMS = SEARCH_PARAMS if args.params == "search" else EVAL_PARAMS
 
     rng = random.Random(args.seed)
     theta = {k: float(v[0]) for k, v in PARAMS.items()}
@@ -114,7 +142,7 @@ def main():
 
     t0 = time.time()
     with mp.get_context("spawn").Pool(
-        args.workers, initializer=_worker_init, initargs=(args.depth, args.time_ms)
+        args.workers, initializer=_worker_init, initargs=(args.depth, args.time_ms, args.nnue)
     ) as pool:
         for k in range(1 + len(history), args.iterations + 1 + len(history)):
             ck = args.c / (k ** gamma)
@@ -161,7 +189,10 @@ def main():
     print(f"Saved to {args.out}")
     print("\nValidate with:")
     sets = " ".join(f"--set-a {n}={v}" for n, v in final.items())
-    print(f"  python scripts/match.py --depth-a 7 --depth-b 7 --games 400 {sets}")
+    tc = (f"--time-a {args.time_ms} --time-b {args.time_ms}" if args.time_ms
+          else "--depth-a 7 --depth-b 7")
+    nn = f" --nnue-a {args.nnue} --nnue-b {args.nnue}" if args.nnue else ""
+    print(f"  python scripts/match.py {tc}{nn} --games 600 {sets}")
 
 
 if __name__ == "__main__":

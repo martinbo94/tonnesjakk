@@ -531,6 +531,48 @@ gen-1+1b+2). Added to the ladder; web UI default. First closed turn of the
 self-improvement loop: heuristic → net-1b (+225) → net-2 (+251 vs heuristic,
 +46 over its own teacher).
 
+## Round 7 — walking the net down, gated vs net-3 (2026-08-27)
+
+Same gen-1..3 data. Gate: 600 games @ 100ms vs **net-3**, 4 nice'd workers
+(daytime). Includes a net-3 config re-run as the seed-noise control.
+
+| architecture (plain+m, 25 buckets) | Elo vs net-3 | W-D-L | val loss |
+|---|---|---|---|
+| d20 48×16 λ0.5 | +11 [−6, +28] | 252-115-233 | 0.2413 |
+| d20 64×16 λ0.35 (more outcome weight) | +8 [−12, +27] | 248-117-235 | 0.2459 |
+| d20 32×16 λ0.5 | +5 [−13, +23] | 244-121-235 | 0.2435 |
+| **d20 64×16 λ0.5 = net-3 re-run (control)** | **−5 [−23, +13]** | 244-104-252 | 0.2409 |
+| **d0 64×16 λ0.5 (no dense block)** | **−28 [−47, −9]** | 232-88-280 | 0.2577 |
+
+Findings:
+- **Plateau.** 48/32-wide and λ0.35 are all within the seed-noise band the
+  control defines (≈ ±10). No promotion. The speed curve that gave +29 from
+  96→64 is flat from 64 down; the label mix is not a lever at this size.
+- **The dense block matters: −28 without it.** The 20 relational features
+  (threats, race distances, blocking) carry information the sparse planes do
+  not reconstruct through a 64-wide layer. That points the other way for the
+  next NNUE experiment: *richer engineered inputs*, not a wider net.
+- Draw rate keeps climbing as the nets converge: ~20% of net-3-vs-candidate
+  games end by repetition (16% in round 6, 1–2% vs the heuristic).
+- Ladder on the nominal winner (48×16), 600 games/rung: +231 heuristic, +77
+  net-1, +78 net-1a, +65 net-1b, **−3 [−21,+15] net-2, −2 [−20,+17] net-3**.
+  Not promoted. Note net-3 itself is only +21 over net-2 pooled: net-2, net-3
+  and 48×16 are within ~20 Elo of each other; the ladder's older rungs are
+  where the differences are real.
+- Loop state: heuristic → net-1b (+225) → net-2 (+46 over teacher) → net-3
+  (+21 over teacher) → round 7 (0). The architecture axis is exhausted at
+  this data/search. Next levers, in order of expected value per hour:
+  1. **Search-side with the NNUE loaded**: SPSA re-tune (LMR/LMP/futility/
+     aspiration were tuned against the heuristic eval; the NNUE's score
+     distribution differs), then time management.
+  2. **Inputs**: extend the dense block (the −28 says it is under-provisioned)
+     — e.g. per-barrel race distance, pail-in-hand × phase, jump-chain
+     availability — and re-run the 64×16 gate.
+  3. **Slow-TC confirmation**: net-3 vs net-2 at 200 ms (all gates so far are
+     100 ms; pruning-style gains sometimes invert at longer TC).
+  4. Gen-4 by net-3 is *not* on the list until one of the above moves: more
+     of the same data was −4 in round 6.
+
 ## Gen-3 (2026-08-26): labeled by net-2 WITH tablebases
 
 `--tb tablebases`: workers' engines probe the solved phases (≤5 barrels
