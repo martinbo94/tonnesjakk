@@ -573,6 +573,34 @@ Findings:
   4. Gen-4 by net-3 is *not* on the list until one of the above moves: more
      of the same data was −4 in round 6.
 
+## Search re-tune with the NNUE loaded (2026-08-27) — **+60 / +54 Elo**
+
+Every pruning constant had been hand-tuned (and SPRT-gated) against the
+heuristic eval. Exposed them as engine knobs (`asp_delta`, `razor_base/slope`,
+`nmp_margin`, `nmp_boost_margin`, `fut_scale`, `lmr_div`, `lmr_hist_good/bad`,
+`iir_depth`, plus the existing `lmp_base`/`rfp_margin`; defaults verified
+unchanged by a 30-position depth-7 fingerprint) and ran SPSA over all twelve
+with net-3 loaded at 100 ms (`spsa_tune.py --params search --nnue`).
+
+- First attempt with the eval-weight settings (a=2, c=1) did not leave the
+  starting point in 100 iterations — abandoned (`spsa_search_net3_a2c1_abandoned.json`).
+- a=6, c=2, 250 iters × 24 pairs, 4 nice'd workers (1.8 h): result
+  `scripts/results/spsa_search_net3.json`. Material moves: **rfp_margin 0→63**
+  (reverse futility pruning on), razor_slope 150→137, lmr_hist_good
+  1000→877, nmp_boost_margin 150→161, lmp_base 6→7, iir_depth 4→3; the rest
+  within a few units of default.
+- **Validation, tuned vs previous defaults, net-3 both sides:
+  +60 [+40, +79] @ 100 ms (600 games); +54 [+32, +77] @ 200 ms (400 games).**
+  Holds at the longer TC → new engine defaults (`search.rs`, previous values
+  kept in comments).
+
+Biggest single step since the NNUE itself, and it cost 3 h of a 4-core
+daytime budget. Lesson: every time the evaluator changes materially, the
+search constants must be re-tuned against it — the RFP margin that was
+"inconclusive" against the heuristic is worth a lot against the NNUE's score
+scale. Ablation (RFP alone vs the full vector) queued; the whole ladder is
+implicitly re-baselined since both sides of every match use the same engine.
+
 ## Gen-3 (2026-08-26): labeled by net-2 WITH tablebases
 
 `--tb tablebases`: workers' engines probe the solved phases (≤5 barrels

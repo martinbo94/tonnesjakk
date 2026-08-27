@@ -880,7 +880,7 @@ impl Default for BitBoardEngine {
 
 impl BitBoardEngine {
     pub fn new() -> Self {
-        let lmr_table = build_lmr_table(100);
+        let lmr_table = build_lmr_table(101);
 
         BitBoardEngine {
             nodes_searched: 0,
@@ -928,23 +928,27 @@ impl BitBoardEngine {
             // Validated 2026-08-24: +36 Elo @ d5 [+6,+67], +34 @ 50ms [+2,+66],
             // +63 @ d7 [+24,+104] vs 0. Sweep: 40 +13(ns), 120 +5(ns) → 80.
             weight_race: 80,
-            rfp_margin: 0,   // SPRT inconclusive at 120 (+2, 1000 games)
+            // Search knobs: SPSA-tuned 2026-08-27 with net-3 loaded, 100 ms
+            // (scripts/results/spsa_search_net3.json). Tuned vs previous
+            // defaults, same net both sides: +60 [+40,+79] @ 100ms (600 games),
+            // +54 [+32,+77] @ 200ms (400 games). Previous values in comments.
+            rfp_margin: 63,  // was 0 (SPRT vs heuristic eval inconclusive at 120)
             // LMP: SPRT PASS @ 50ms (+27 [+10,+45]); @ 200ms accepted on CI
             // (+14 [+3,+26] over 1600 games; two independent LTC runs +16/+14).
-            lmp_base: 6,
+            lmp_base: 7,     // was 6
             // qs_mode 2 PASSED both gates: +53 [+28,+78] @ 50ms, +62 [+35,+91]
             // @ 200ms vs legacy; beats qs_mode 1 head-to-head +29 [+11,+47].
             qs_mode: 2,
-            asp_delta: 30,
-            razor_base: 200,
-            razor_slope: 150,
-            nmp_margin: 50,
-            nmp_boost_margin: 150,
-            fut_scale: 100,
-            lmr_div: 100,
-            lmr_hist_good: 1000,
-            lmr_hist_bad: -500,
-            iir_depth: 4,
+            asp_delta: 29,          // was 30
+            razor_base: 198,        // was 200
+            razor_slope: 137,       // was 150
+            nmp_margin: 49,         // was 50
+            nmp_boost_margin: 161,  // was 150
+            fut_scale: 104,         // was 100
+            lmr_div: 101,           // was 100
+            lmr_hist_good: 877,     // was 1000
+            lmr_hist_bad: -559,     // was -500
+            iir_depth: 3,           // was 4
         }
     }
 

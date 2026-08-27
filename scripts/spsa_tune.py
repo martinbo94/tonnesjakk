@@ -51,22 +51,22 @@ EVAL_PARAMS = {
     "weight_race":         (80,  10, -50, 400),
 }
 
-# Search/pruning knobs (--params search). Initials = engine defaults, which
-# were hand-tuned against the heuristic eval; run this with --nnue and a time
-# control, since pruning trades depth for accuracy.
+# Search/pruning knobs (--params search). Initials = engine defaults (SPSA
+# 2026-08-27 with net-3 @ 100ms, a=6 c=2: +60/+54 Elo vs the hand-tuned
+# values). Run with --nnue and a time control: pruning trades depth for accuracy.
 SEARCH_PARAMS = {
-    "asp_delta":        (30,   8,   5,  200),
-    "razor_base":       (200, 40,   0,  800),
-    "razor_slope":      (150, 30,   0,  600),
-    "nmp_margin":       (50,  15, -200, 400),
-    "nmp_boost_margin": (150, 30,   0,  800),
-    "fut_scale":        (100, 15,  20,  300),
-    "lmr_div":          (100, 12,  40,  300),
-    "lmr_hist_good":    (1000, 200, 0, 5000),
-    "lmr_hist_bad":     (-500, 150, -5000, 0),
-    "lmp_base":         (6,   2,   1,   30),
-    "rfp_margin":       (0,   30,  0,  400),
-    "iir_depth":        (4,   1,   2,   12),
+    "asp_delta":        (29,   8,   5,  200),
+    "razor_base":       (198, 40,   0,  800),
+    "razor_slope":      (137, 30,   0,  600),
+    "nmp_margin":       (49,  15, -200, 400),
+    "nmp_boost_margin": (161, 30,   0,  800),
+    "fut_scale":        (104, 15,  20,  300),
+    "lmr_div":          (101, 12,  40,  300),
+    "lmr_hist_good":    (877, 200, 0, 5000),
+    "lmr_hist_bad":     (-559, 150, -5000, 0),
+    "lmp_base":         (7,   2,   1,   30),
+    "rfp_margin":       (63,  30,  0,  400),
+    "iir_depth":        (3,   1,   2,   12),
 }
 
 PARAMS = EVAL_PARAMS  # selected in main() via --params
