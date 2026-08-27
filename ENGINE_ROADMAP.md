@@ -594,6 +594,14 @@ with net-3 loaded at 100 ms (`spsa_tune.py --params search --nnue`).
   Holds at the longer TC → new engine defaults (`search.rs`, previous values
   kept in comments).
 
+- **Pass 2** (same settings, from the new defaults, on the root-fixed engine):
+  rfp 63→77, lmp_base 7→9, iir_depth 3→2, lmr_div 101→95, nmp_boost 161→170,
+  razor_base 198→190. Validation vs pass-1 defaults: +12 [−7, +32] @ 100 ms,
+  +13 [−10, +37] @ 200 ms — not significant, **not adopted**
+  (`spsa_search_net3.json` = pass 2 vector; pass 1 archived as `*_pass1*`).
+  The optimizer keeps asking for a little more pruning; a longer/larger run
+  could confirm ~+10, but the easy gain was pass 1.
+
 Biggest single step since the NNUE itself, and it cost 3 h of a 4-core
 daytime budget. Lesson: every time the evaluator changes materially, the
 search constants must be re-tuned against it — the RFP margin that was
