@@ -350,18 +350,62 @@ pub struct PackedPhase {
     pub r: usize,
     wcfg: ConfigSpace,
     bcfg: ConfigSpace,
-    /// 2 bits per white-to-move state
+    /// 2 bits per VALID white-to-move state (no invalid slots: 3v3 is 30.1B
+    /// valid of 56.1B raw combinations → 7.5 GB instead of 14 GB).
     data: Vec<u8>,
     mapped: Option<memmap2::Mmap>,
     n_states: usize,
+    /// Per (white cfg, black cfg) pair (index wi * bcount + bi): offset of its
+    /// first state, or u64::MAX when the configs overlap.
+    pair_offset: Vec<u64>,
+    /// Disjoint pairs in index order: their first state and pair id (for decode).
+    pair_start: Vec<u64>,
+    pair_id: Vec<u32>,
 }
+
+const ALL_SQUARES: u64 = (1u64 << NUM_SQUARES) - 1;
+
+/// Square of the i-th set bit (ascending) of `mask`.
+#[inline]
+fn select_bit(mut mask: u64, mut i: usize) -> u64 {
+    while i > 0 { mask &= mask - 1; i -= 1; }
+    mask & mask.wrapping_neg()
+}
+
+/// Number of (white pail, black pail, awaiting) combinations with `f` free
+/// squares: white pail unplaced → black pail unplaced or on any free square
+/// (1 + f, awaiting impossible); white pail on one of f squares → black pail
+/// unplaced or on one of the other f-1 → f options, times awaiting ∈ {0,1}.
+#[inline]
+fn pail_combos(f: usize) -> usize { (1 + f) + 2 * f * f }
 
 impl PackedPhase {
     pub fn new(r: usize) -> Self {
         let wcfg = ConfigSpace::new(Player::White, r);
         let bcfg = ConfigSpace::new(Player::Black, r);
-        let n = (wcfg.count * bcfg.count) as usize * PAIL_STATES * PAIL_STATES * 2; // awaiting flag only
-        PackedPhase { r, wcfg, bcfg, data: vec![0u8; (n + 3) / 4], mapped: None, n_states: n }
+        let wc = wcfg.count as usize;
+        let bc = bcfg.count as usize;
+        let wmasks: Vec<u64> = (0..wc).map(|i| wcfg.unrank(i as u64)).collect();
+        let bmasks: Vec<u64> = (0..bc).map(|i| bcfg.unrank(i as u64)).collect();
+        let mut pair_offset = vec![u64::MAX; wc * bc];
+        let mut pair_start = Vec::new();
+        let mut pair_id = Vec::new();
+        let mut acc = 0u64;
+        for wi in 0..wc {
+            for bi in 0..bc {
+                let (w, b) = (wmasks[wi], bmasks[bi]);
+                if w & b != 0 { continue; }
+                let f = NUM_SQUARES - (w | b).count_ones() as usize;
+                let p = wi * bc + bi;
+                pair_offset[p] = acc;
+                pair_start.push(acc);
+                pair_id.push(p as u32);
+                acc += pail_combos(f) as u64;
+            }
+        }
+        let n = acc as usize;
+        PackedPhase { r, wcfg, bcfg, data: vec![0u8; (n + 3) / 4], mapped: None, n_states: n,
+                      pair_offset, pair_start, pair_id }
     }
 
     pub fn num_states(&self) -> usize { self.n_states }
@@ -389,27 +433,54 @@ impl PackedPhase {
         if (4 - bb.white_scored as usize) != self.r || (4 - bb.black_scored as usize) != self.r {
             return None;
         }
-        let wi = self.wcfg.rank(bb.white_barrels)?;
-        let bi = self.bcfg.rank(bb.black_barrels)?;
-        Some((((wi * self.bcfg.count + bi) as usize * PAIL_STATES + Phase::pail_index(bb.white_pail))
-            * PAIL_STATES + Phase::pail_index(bb.black_pail)) * 2 + bb.awaiting_barrel as usize)
+        let wi = self.wcfg.rank(bb.white_barrels)? as usize;
+        let bi = self.bcfg.rank(bb.black_barrels)? as usize;
+        let off = self.pair_offset[wi * self.bcfg.count as usize + bi];
+        if off == u64::MAX { return None; }
+        let free = ALL_SQUARES & !(bb.white_barrels | bb.black_barrels);
+        let f = free.count_ones() as usize;
+        let (wp, bp) = (bb.white_pail, bb.black_pail);
+        if (wp & !free) != 0 || (bp & !free) != 0 || (wp & bp) != 0 { return None; }
+        let local = if wp == 0 {
+            if bb.awaiting_barrel { return None; }
+            if bp == 0 { 0 } else { 1 + (free & (bp - 1)).count_ones() as usize }
+        } else {
+            let i = (free & (wp - 1)).count_ones() as usize;
+            let free2 = free & !wp;
+            let j = if bp == 0 { 0 } else { 1 + (free2 & (bp - 1)).count_ones() as usize };
+            (1 + f) + (i * f + j) * 2 + bb.awaiting_barrel as usize
+        };
+        Some(off as usize + local)
     }
 
-    pub fn decode(&self, idx: usize) -> Option<BitBoard> {
-        let aw = idx % 2;
-        let bp = (idx / 2) % PAIL_STATES;
-        let wp = (idx / (2 * PAIL_STATES)) % PAIL_STATES;
-        let cfg = (idx / (2 * PAIL_STATES * PAIL_STATES)) as u64;
-        let wmask = self.wcfg.unrank(cfg / self.bcfg.count);
-        let bmask = self.bcfg.unrank(cfg % self.bcfg.count);
-        let wpail = if wp == 0 { 0 } else { 1u64 << (wp - 1) };
-        let bpail = if bp == 0 { 0 } else { 1u64 << (bp - 1) };
-        let mut all = 0u64;
-        for o in [wmask, bmask, wpail, bpail] {
-            if all & o != 0 { return None; }
-            all |= o;
+    /// Position of the disjoint pair containing state `idx` (index into
+    /// `pair_start`/`pair_id`).
+    fn pair_at(&self, idx: usize) -> usize {
+        match self.pair_start.binary_search(&(idx as u64)) {
+            Ok(p) => p,
+            Err(p) => p - 1,
         }
-        if aw == 1 && wpail == 0 { return None; } // white awaiting ⇒ white pail placed
+    }
+
+    /// The `local`-th state of the disjoint pair at position `pi`.
+    fn decode_in_pair(&self, pi: usize, local: usize) -> BitBoard {
+        let p = self.pair_id[pi] as usize;
+        let bc = self.bcfg.count as usize;
+        let wmask = self.wcfg.unrank((p / bc) as u64);
+        let bmask = self.bcfg.unrank((p % bc) as u64);
+        let free = ALL_SQUARES & !(wmask | bmask);
+        let f = free.count_ones() as usize;
+        let (wpail, bpail, aw) = if local <= f {
+            (0u64, if local == 0 { 0 } else { select_bit(free, local - 1) }, false)
+        } else {
+            let t = local - (1 + f);
+            let aw = t & 1 == 1;
+            let t = t >> 1;
+            let (i, j) = (t / f, t % f);
+            let wpail = select_bit(free, i);
+            let free2 = free & !wpail;
+            (wpail, if j == 0 { 0 } else { select_bit(free2, j - 1) }, aw)
+        };
         let mut bb = BitBoard::new();
         bb.white_barrels = wmask;
         bb.black_barrels = bmask;
@@ -417,14 +488,21 @@ impl PackedPhase {
         bb.black_pail = bpail;
         bb.white_pail_placed = wpail != 0;
         bb.black_pail_placed = bpail != 0;
-        bb.occupied = all;
+        bb.occupied = wmask | bmask | wpail | bpail;
         bb.white_scored = (4 - self.r) as u8;
         bb.black_scored = (4 - self.r) as u8;
         bb.white_barrels_off_board = (self.r - wmask.count_ones() as usize) as u8;
         bb.black_barrels_off_board = (self.r - bmask.count_ones() as usize) as u8;
         bb.current_player = Player::White;
-        bb.awaiting_barrel = aw == 1;
-        Some(bb)
+        bb.awaiting_barrel = aw;
+        bb
+    }
+
+    /// Reconstruct the position at an index (every index is a valid state).
+    pub fn decode(&self, idx: usize) -> Option<BitBoard> {
+        if idx >= self.n_states { return None; }
+        let pi = self.pair_at(idx);
+        Some(self.decode_in_pair(pi, idx - self.pair_start[pi] as usize))
     }
 
     /// WDL value (White perspective, as a Phase-style byte with distance 0)
@@ -480,25 +558,7 @@ pub fn solve_packed(lower: &Tablebase, r: usize, dir: &Path, checkpoint_every: u
         }
     } else { false };
 
-    if !resumed {
-        // Mark invalid states in parallel (byte-aligned chunks)
-        std::thread::scope(|s| {
-            let phase = &phase;
-            for (ci, slice) in data.chunks_mut(chunk_states / 4).enumerate() {
-                s.spawn(move || {
-                    let base = ci * chunk_states;
-                    for i in 0..slice.len() * 4 {
-                        let idx = base + i;
-                        if idx >= n { break; }
-                        if phase.decode(idx).is_none() {
-                            PackedPhase::set(slice, i, P_INVALID);
-                        }
-                    }
-                });
-            }
-        });
-    }
-    let valid = data.iter().map(|b| (0..4).filter(|k| (b >> (k * 2)) & 3 != P_INVALID).count()).sum::<usize>().min(n);
+    let valid = n; // every index is a valid state
     if verbose {
         eprintln!("packed phase {}v{}: {} states (white to move), {} valid, {} threads, resumed={} ({:.0}s)",
                   r, r, n, valid, threads, resumed, t_start.elapsed().as_secs_f64());
@@ -517,9 +577,18 @@ pub fn solve_packed(lower: &Tablebase, r: usize, dir: &Path, checkpoint_every: u
                     let hi = ((ci + 1) * chunk_states).min(n);
                     let mut out = Vec::new();
                     let get = |idx: usize| (snap[idx >> 2] >> ((idx & 3) * 2)) & 3;
-                    for idx in lo..hi {
+                    // Walk pair by pair: decoding a state inside a known pair
+                    // is O(1); decode(idx) would binary-search every state.
+                    let mut pi = if lo < n { phase.pair_at(lo) } else { 0 };
+                    let mut idx = lo;
+                    while idx < hi {
+                      let start = phase.pair_start[pi] as usize;
+                      let end = if pi + 1 < phase.pair_start.len() { phase.pair_start[pi + 1] as usize } else { n };
+                      for local in (idx - start)..(end - start) {
+                        let idx = start + local;
+                        if idx >= hi { break; }
                         if get(idx) != P_UNKNOWN { continue; }
-                        let bb = match phase.decode(idx) { Some(b) => b, None => continue };
+                        let bb = phase.decode_in_pair(pi, local);
                         let moves = bb.generate_moves();
                         if moves.is_empty() { continue; } // boxed in: stays unknown = draw
                         let mut any_win = false;
@@ -545,6 +614,9 @@ pub fn solve_packed(lower: &Tablebase, r: usize, dir: &Path, checkpoint_every: u
                         }
                         if any_win { out.push((idx, P_WHITE)); }
                         else if all_lose { out.push((idx, P_BLACK)); }
+                      }
+                      idx = end;
+                      pi += 1;
                     }
                     out
                 })
@@ -900,6 +972,29 @@ mod tests {
             }
         }
         assert!(seen > 1_000_000);
+    }
+
+    /// Valid-only packed indexing: every index decodes to a distinct valid
+    /// state that indexes back to itself; the state count matches the number
+    /// of valid states the old full enumeration reported (3v3: 30,053,815,328).
+    #[test]
+    fn test_packed_index_roundtrip() {
+        let p1 = PackedPhase::new(1);
+        let mut seen = std::collections::HashSet::new();
+        for idx in 0..p1.num_states() {
+            let bb = p1.decode(idx).expect("valid");
+            assert_eq!(bb.occupied, bb.white_barrels | bb.black_barrels | bb.white_pail | bb.black_pail);
+            assert_eq!((bb.white_barrels & bb.black_barrels) | (bb.white_pail & bb.occupied & !bb.white_pail), 0);
+            assert!(!bb.awaiting_barrel || bb.white_pail != 0);
+            assert_eq!(p1.index(&bb), Some(idx), "roundtrip at {}", idx);
+            assert!(seen.insert((bb.white_barrels, bb.black_barrels, bb.white_pail, bb.black_pail, bb.awaiting_barrel)), "duplicate state at {}", idx);
+        }
+        let p2 = PackedPhase::new(2);
+        for idx in (0..p2.num_states()).step_by(1009) {
+            let bb = p2.decode(idx).unwrap();
+            assert_eq!(p2.index(&bb), Some(idx));
+        }
+        assert_eq!(PackedPhase::new(3).num_states(), 30_053_815_328);
     }
 
     /// Packed WDL solve of a symmetric phase must agree (win/loss/draw) with
