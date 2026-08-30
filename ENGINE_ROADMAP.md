@@ -627,6 +627,40 @@ slice has only 3.8 % duplicates vs ~30 % overall — nearly all duplication was
 in the endgames the tables now own. Round 10 = same candidates trained with
 `--max-scored 1` (positions with ≥ 7 barrels remaining only).
 
+## Round 10 — phase-filtered training (2026-08-30) and the NNUE verdict
+
+Same candidates trained with `--max-scored 1` (positions with ≥ 7 barrels
+remaining only: 30.1M of 52.1M rows, 21.5M unique — and only 3.8 % duplicates
+inside that slice). **Gates and ladder run with tablebases on both sides**
+(new `--tb` in tournament/ladder): a net that never saw ≤ 6-remaining
+positions must be tested in its deployment — TB-off it scored −463 (34-10-556):
+25 output heads for ≥ 2 scored still at random init. The WDL-only progress
+term in search was made net-independent (race-distance difference; converts
+40/40 TB-won 3v3 positions vs a 200 ms opponent) so such nets are never asked
+about positions they did not see.
+
+| candidate (gen-1..4, filtered, TB on) | vs net-3 |
+|---|---|
+| d28 96×16 | **+13 [−4, +30]** |
+| d28 64×16 | −8 [−25, +9] |
+| d20 64×16 (control) | −8 [−25, +9] |
+
+Ladder (TB on) on d28 96×16: +213 heuristic, +71 / +68 / +49 net-1 / 1a / 1b,
+**+10 [−6, +27] net-2, +14 [−4, +32] net-3.** Not promoted.
+
+**NNUE verdict after rounds 6–10.** Size (32–128 × 16/32), width, λ, data
+volume (gen-3, gen-4), label quality (stronger labeller + tablebases), richer
+inputs (28), and phase filtering have all been tried against net-3 with the
+same 600-game gate: the best of each round lands at +11 … +15 and the
+control at −5 … −14, so the whole family sits on one plateau within ±15.
+What did move Elo this week was the search (+60/+54), root-search bug fixes,
+and tablebases (+25/+32). The binding constraint is search depth at 100 ms,
+not the evaluator. Net-3 stays. Things that could still matter for the net
+and were *not* tried: a different sparse representation (e.g. pail-relative
+"HalfPail" buckets — lost to plain in round 1 on gen-1 data, untested since),
+training at longer TC labels (d10+), or a much larger net evaluated at a
+longer time control where speed matters less.
+
 ## Search re-tune with the NNUE loaded (2026-08-27) — **+60 / +54 Elo**
 
 Every pruning constant had been hand-tuned (and SPRT-gated) against the
