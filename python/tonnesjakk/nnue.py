@@ -924,6 +924,7 @@ def train_nnue(
     dedupe: bool = False,
     noise_prob: float = 0.0,
     data_fraction: float = 1.0,
+    max_scored: Optional[int] = None,
     tb_dir: Optional[str] = None,
 ) -> Optional[nn.Module]:
     """
@@ -1041,6 +1042,23 @@ def train_nnue(
             print(f"\n  Loading generated data via memory-map...")
             X, y, stats, _ = DataGenerator.load_streaming_dataset(save_data)
             print(f"  Loaded {len(X):,} positions (memory-mapped)")
+
+    # Phase filter: keep only positions with at most `max_scored` barrels scored
+    # in total. With tablebases through 3v3 the engine never evaluates
+    # positions with <= 6 barrels remaining (2+ scored) through the net, and
+    # gen-4 carries exact +-1 labels for 71% of them — capacity spent where it
+    # is never used. Features 152/153 are white/black scored (/4).
+    if max_scored is not None:
+        from .nnue_arch import RowView
+        keep = []
+        chunk = 1_000_000
+        for s0 in range(0, len(X), chunk):
+            xb = np.asarray(X[s0:s0 + chunk])
+            sc = np.round(xb[:, 152] * 4) + np.round(xb[:, 153] * 4)
+            keep.append(np.nonzero(sc <= max_scored)[0] + s0)
+        keep = np.concatenate(keep)
+        print(f"  Phase filter max_scored={max_scored}: keeping {len(keep):,} of {len(X):,} rows ({100*len(keep)/len(X):.1f}%)")
+        X, y = RowView(X, keep), np.asarray(y)[keep]
 
     # Data-size curve support: train on a random subset of the rows
     if data_fraction < 1.0:
@@ -1168,6 +1186,8 @@ Examples:
                         help="Drop the 20 dense relational features")
     parser.add_argument("--dense-size", type=int, default=None, choices=(0, 20, 28),
                         help="dense inputs before FC2 (default 20; 28 adds race/jump/mobility/clock features)")
+    parser.add_argument("--max-scored", type=int, default=None,
+                        help="train only on positions with at most this many barrels scored in total (1 = the 7-8-remaining phases the net is used for)")
     parser.add_argument("--output-buckets", type=int, default=1, choices=[1, 25],
                         help="Output heads: 1, or 25 keyed on (white_scored, black_scored)")
     parser.add_argument("--dedupe", action="store_true",
@@ -1210,6 +1230,7 @@ Examples:
         dedupe=args.dedupe,
         noise_prob=args.noise_prob,
         data_fraction=args.data_fraction,
+        max_scored=args.max_scored,
         tb_dir=args.tb,
     )
 

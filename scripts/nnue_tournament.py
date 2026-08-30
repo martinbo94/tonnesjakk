@@ -37,6 +37,7 @@ class Candidate:
     dedupe: bool = True
     loss: str = "wdl-ce"
     fraction: float = 1.0
+    max_scored: int = -1   # -1 = all phases
 
     @property
     def tag(self) -> str:
@@ -50,6 +51,8 @@ class Candidate:
             t += f"_{self.loss}"
         if self.fraction < 1.0:
             t += f"_f{self.fraction:g}"
+        if self.max_scored >= 0:
+            t += f"_ms{self.max_scored}"
         return t
 
 
@@ -157,11 +160,22 @@ ROUND9_CANDIDATES = [
     Candidate("plain", True, 20, 64, 16, 25, lam=0.5),    # net-3 config on 4 gens = data-only effect
 ]
 
+# Round 10: PHASE FILTER. Gen-4 made round 9 worse (d28 96x16: +11 -> -19 vs
+# net-3): 36% of its rows are exact +-1 tablebase labels on positions the
+# engine never evaluates through the net (tablebases answer <= 6 remaining).
+# Train only on >= 7 remaining (max_scored=1). Gate vs net-3.
+ROUND10_CANDIDATES = [
+    Candidate("plain", True, 28, 96, 16, 25, lam=0.5, max_scored=1),
+    Candidate("plain", True, 28, 64, 16, 25, lam=0.5, max_scored=1),
+    Candidate("plain", True, 20, 64, 16, 25, lam=0.5, max_scored=1),   # net-3 config, filtered
+]
+
 PRESETS = {"round1": DEFAULT_CANDIDATES, "round2": ROUND2_CANDIDATES,
            "round3": ROUND3_CANDIDATES, "round4": ROUND4_CANDIDATES,
            "round5": ROUND5_CANDIDATES, "round6": ROUND6_CANDIDATES,
            "round7": ROUND7_CANDIDATES, "round8": ROUND8_CANDIDATES,
-           "round9": ROUND9_CANDIDATES}
+           "round9": ROUND9_CANDIDATES,
+           "round10": ROUND10_CANDIDATES}
 
 
 def train(c: Candidate, data: str, out_dir: Path, epochs: int, lr: float, batch: int, log) -> float:
@@ -178,6 +192,8 @@ def train(c: Candidate, data: str, out_dir: Path, epochs: int, lr: float, batch:
         cmd += ["--dense-size", str(c.dense)]
     if c.dedupe:
         cmd.append("--dedupe")
+    if c.max_scored >= 0:
+        cmd += ["--max-scored", str(c.max_scored)]
     t0 = time.time()
     proc = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True)
     (run_dir / "train.log").write_text(proc.stdout + proc.stderr)
