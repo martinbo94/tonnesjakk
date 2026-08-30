@@ -206,7 +206,7 @@ def train(c: Candidate, data: str, out_dir: Path, epochs: int, lr: float, batch:
 
 
 def start_match(c: Candidate, out_dir: Path, games: int, time_ms: int, workers: int,
-                opponent_nnue: str = ""):
+                opponent_nnue: str = "", tb: str = ""):
     """Gate vs the heuristic engine, or vs a reference net (--opponent-nnue):
     once every candidate beats the heuristic by ~200 Elo, a fixed weaker
     opponent no longer resolves differences between nets."""
@@ -218,6 +218,11 @@ def start_match(c: Candidate, out_dir: Path, games: int, time_ms: int, workers: 
            "--out", str(run_dir / "match.json")]
     if opponent_nnue:
         cmd += ["--nnue-b", opponent_nnue]
+    if tb:
+        # Both sides probe the tablebases: required for nets trained only on
+        # the phases the tables do not cover (--max-scored), and the real
+        # deployment for every net since 2026-08-30.
+        cmd += ["--tb-a", tb, "--tb-b", tb]
     return subprocess.Popen(cmd, cwd=ROOT, stdout=open(run_dir / "match.log", "w"),
                             stderr=subprocess.STDOUT)
 
@@ -258,6 +263,8 @@ def main():
     ap.add_argument("--opponent-nnue", type=str, default="",
                     help="Gate vs this reference net instead of the heuristic engine")
     ap.add_argument("--skip-train", action="store_true")
+    ap.add_argument("--reuse-trained", action="store_true", help="skip training for candidates whose weights already exist")
+    ap.add_argument("--tb", type=str, default="", help="tablebase dir loaded by BOTH sides of every gate")
     ap.add_argument("--skip-match", action="store_true")
     args = ap.parse_args()
     opp_label = "reference net" if args.opponent_nnue else "heuristic"
@@ -287,7 +294,8 @@ def main():
 
     pending_match = None
     for c in cands:
-        if not args.skip_train:
+        already = (out_dir / c.tag / "nnue_weights.json").exists()
+        if not args.skip_train and not (args.reuse_trained and already):
             val_losses[c.tag] = train(c, args.data, out_dir, args.epochs, args.lr, args.batch_size, log)
             vl_path.write_text(json.dumps(val_losses, indent=1))
         if args.skip_match:
@@ -298,7 +306,7 @@ def main():
             log(f"  match done {pc.tag}")
             log("\n" + leaderboard(out_dir, cands, val_losses, opp_label))
         pending_match = (c, start_match(c, out_dir, args.games, args.time, args.workers,
-                                        args.opponent_nnue))
+                                        args.opponent_nnue, args.tb))
         log(f"  match started {c.tag}")
 
     if pending_match is not None:

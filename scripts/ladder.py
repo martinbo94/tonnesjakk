@@ -27,6 +27,7 @@ from pathlib import Path
 
 PY = sys.executable
 ROOT = Path(__file__).resolve().parent.parent
+TB_DIR = ""  # set from --tb
 LADDER_DIR = ROOT / "models" / "ladder"
 
 
@@ -46,6 +47,8 @@ def play(a_label, a_nnue, b_label, b_nnue, time_ms, games, workers, out_dir):
         cmd += ["--nnue-a", a_nnue]
     if b_nnue:
         cmd += ["--nnue-b", b_nnue]
+    if TB_DIR:
+        cmd += ["--tb-a", TB_DIR, "--tb-b", TB_DIR]
     subprocess.run(cmd, cwd=ROOT, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
     s = json.loads(out.read_text())["summary"]
     return s
@@ -64,7 +67,10 @@ def main():
     ap.add_argument("--games", type=int, default=300)
     ap.add_argument("--workers", type=int, default=10)
     ap.add_argument("--out", type=str, default="runs/ladder")
+    ap.add_argument("--tb", type=str, default="", help="tablebase dir loaded by BOTH sides of every match")
     args = ap.parse_args()
+    global TB_DIR
+    TB_DIR = args.tb
 
     out_dir = Path(args.out) / time.strftime("%Y%m%d_%H%M%S")
     out_dir.mkdir(parents=True, exist_ok=True)
