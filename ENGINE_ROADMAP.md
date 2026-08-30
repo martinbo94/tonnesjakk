@@ -607,6 +607,26 @@ matter; the plateau is the search depth reachable at 100 ms, not the net.
 Next: round 9 = the same candidates on gen-1..4 (gen-4 labelled by the +120
 Elo stronger engine with tablebases through 3v3 → many exact labels).
 
+## Gen-4 and round 9 (2026-08-30): better labels did not help — the wrong positions did
+
+Gen-4 = 300k games labelled by net-3 + re-tuned search + tablebases through
+3v3 (23 games/s on 8 workers; 13.5M rows, D 5.5 %). Label distribution vs
+gen-3: |score|>0.99 39 → **53 %**, exactly ±1 21 → **36 %**; **71 % of
+positions with ≤ 6 barrels remaining carry an exact tablebase label** (gen-3:
+49 %); 7–8 remaining: 0 % exact in both.
+
+Round 9 (round-8 candidates on gen-1..4, 52.1M rows → 36.0M unique, gate vs
+net-3): d28 64×16 **−2** [−21, +16] (was +15 on gen-1..3), d20 64×16 **−6**
+[−24, +12], d28 96×16 **−19** [−38, −1] (was +11). Ladder skipped.
+
+Reading: the engine never evaluates a ≤ 6-remaining position through the net
+(the tablebase answers first), yet half the training rows are such positions
+and they now carry saturated labels that dominate WDL-CE. Capacity and
+gradient go where the net is never used. Also: the filtered 7–8-remaining
+slice has only 3.8 % duplicates vs ~30 % overall — nearly all duplication was
+in the endgames the tables now own. Round 10 = same candidates trained with
+`--max-scored 1` (positions with ≥ 7 barrels remaining only).
+
 ## Search re-tune with the NNUE loaded (2026-08-27) — **+60 / +54 Elo**
 
 Every pruning constant had been hand-tuned (and SPRT-gated) against the
