@@ -19,6 +19,8 @@ pub const WIN_BOUND: i32 = 90_000;
 /// mate score, far above any eval) plus the clamped static eval for progress.
 pub const TB_WDL_WIN: i32 = 30_000;
 pub const TB_WDL_EVAL_CAP: i32 = 4_000;
+/// cp per move of race-distance difference inside a WDL-only won/lost phase.
+pub const TB_WDL_RACE_CP: i32 = 150;
 
 // ============================================================================
 // AI: EVALUERING OG SØK
@@ -1715,7 +1717,13 @@ impl BitBoardEngine {
                     let terminal = bb.white_scored >= 4 || bb.black_scored >= 4;
                     let wdl_only = !terminal && (is_white_win(v) || is_black_win(v)) && win_dist(v) == 0;
                     let score = if wdl_only {
-                        let e = self.evaluate(bb).clamp(-TB_WDL_EVAL_CAP, TB_WDL_EVAL_CAP);
+                        // Progress term: race-distance difference (net-independent,
+                        // so nets trained only outside the tablebase phases are
+                        // not asked about positions they never saw).
+                        let rt = &*crate::race::RACE_TABLE;
+                        let prog = (rt.side_distance(bb, Player::Black) as i32
+                                  - rt.side_distance(bb, Player::White) as i32) * TB_WDL_RACE_CP;
+                        let e = prog.clamp(-TB_WDL_EVAL_CAP, TB_WDL_EVAL_CAP);
                         if is_white_win(v) { TB_WDL_WIN + e } else { -TB_WDL_WIN + e }
                     } else if is_white_win(v) {
                         WIN_SCORE - (ply + win_dist(v) as i32)
