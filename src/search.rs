@@ -15,6 +15,10 @@ const CORRECTION_TABLE_SIZE: usize = 16384; // 64KB correction history
 /// WIN_SCORE - d (White perspective). Scores beyond WIN_BOUND are wins.
 pub const WIN_SCORE: i32 = 100_000;
 pub const WIN_BOUND: i32 = 90_000;
+/// WDL-only tablebase verdicts: fixed magnitude (below WIN_BOUND so it is not a
+/// mate score, far above any eval) plus the clamped static eval for progress.
+pub const TB_WDL_WIN: i32 = 30_000;
+pub const TB_WDL_EVAL_CAP: i32 = 4_000;
 
 // ============================================================================
 // AI: EVALUERING OG SØK
@@ -1694,13 +1698,26 @@ impl BitBoardEngine {
             if self.path_hashes.contains(&h) || self.game_history.contains(&h) {
                 return (self.draw_score(), None);
             }
-            // Tablebase probe: exact value with distance (root-relative)
+            // Tablebase probe. Phases with distance-to-win give exact,
+            // root-relative mate-like scores. WDL-only phases (packed 3v3:
+            // win/draw/loss, no distance) must NOT: every winning child would
+            // score identically, the engine shuffles among "winning" moves and
+            // repetition or the no-progress clock turns the win into a draw
+            // (measured: adding 3v3 as exact went +16 -> -6 Elo). Instead a
+            // fixed bonus that outranks any NNUE score plus the static eval,
+            // so the eval's sense of progress picks WHICH winning move — until
+            // a barrel scores and a distance-guided phase takes over.
             if let Some(ref tb) = self.tablebase {
                 if let Some(v) = tb.value(bb) {
                     self.tb_hits += 1;
                     let ply = self.path_hashes.len() as i32;
                     use crate::tablebase::{is_black_win, is_white_win, win_dist};
-                    let score = if is_white_win(v) {
+                    let terminal = bb.white_scored >= 4 || bb.black_scored >= 4;
+                    let wdl_only = !terminal && (is_white_win(v) || is_black_win(v)) && win_dist(v) == 0;
+                    let score = if wdl_only {
+                        let e = self.evaluate(bb).clamp(-TB_WDL_EVAL_CAP, TB_WDL_EVAL_CAP);
+                        if is_white_win(v) { TB_WDL_WIN + e } else { -TB_WDL_WIN + e }
+                    } else if is_white_win(v) {
                         WIN_SCORE - (ply + win_dist(v) as i32)
                     } else if is_black_win(v) {
                         -(WIN_SCORE - (ply + win_dist(v) as i32))
