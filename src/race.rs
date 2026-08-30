@@ -19,9 +19,15 @@ use std::sync::LazyLock;
 use crate::board::{BitBoard, Player, BARRELS_PER_PLAYER, BOARD_SIZE, NUM_SQUARES};
 
 pub struct RaceTable {
-    index: HashMap<(u64, u8), u32>,
-    dist: Vec<u16>,
+    /// dist by (combinatorial rank of the mask over the 30 non-goal squares) * 5 + off.
+    /// O(1) lookup with a handful of table reads; the NNUE dense inputs call this
+    /// twice per evaluation, where a HashMap probe cost ~15% of nodes/sec.
+    flat: Vec<u16>,
+    binom: [[u32; 5]; 31],
+    offset: [u32; 5],
 }
+
+const RACE_SQUARES: usize = NUM_SQUARES - BOARD_SIZE; // rows 1..=5
 
 const UNREACHED: u16 = u16::MAX;
 
@@ -115,15 +121,50 @@ impl RaceTable {
             }
         }
 
-        RaceTable { index, dist }
+        // ── Flatten into a rank-indexed array ──
+        let mut binom = [[0u32; 5]; 31];
+        for n in 0..=30usize {
+            for k in 0..=4usize {
+                binom[n][k] = if k > n { 0 } else { let mut r = 1u64; for i in 0..k { r = r * (n - i) as u64 / (i + 1) as u64; } r as u32 };
+            }
+        }
+        let mut offset = [0u32; 5];
+        let mut acc = 0u32;
+        for k in 0..=4usize { offset[k] = acc; acc += binom[RACE_SQUARES][k]; }
+        let table = RaceTable { flat: Vec::new(), binom, offset };
+        let mut flat = vec![UNREACHED; acc as usize * 5];
+        for (id, &(mask, off)) in states.iter().enumerate() {
+            let r = table.rank(mask).expect("enumerated mask ranks");
+            flat[r * 5 + off as usize] = dist[id];
+        }
+        RaceTable { flat, ..table }
+    }
+
+    /// Combinatorial rank of a barrel mask over squares 6..=35 (None if a bit
+    /// is on the goal row or more than 4 barrels).
+    #[inline]
+    fn rank(&self, mask: u64) -> Option<usize> {
+        let k = mask.count_ones() as usize;
+        if k > BARRELS_PER_PLAYER { return None; }
+        let mut r = 0u32;
+        let mut m = mask;
+        let mut i = 0usize;
+        while m != 0 {
+            let sq = m.trailing_zeros() as usize;
+            if sq < BOARD_SIZE { return None; }
+            i += 1;
+            r += self.binom[sq - BOARD_SIZE][i];
+            m &= m - 1;
+        }
+        Some((self.offset[k] + r) as usize)
     }
 
     /// Min moves for a lone side (white orientation) to score everything.
     #[inline]
     pub fn lookup(&self, mask: u64, off: u8) -> u16 {
-        match self.index.get(&(mask, off)) {
-            Some(&id) => self.dist[id as usize],
-            None => UNREACHED, // shouldn't happen for legal states
+        match self.rank(mask) {
+            Some(r) if (off as usize) < 5 => self.flat[r * 5 + off as usize],
+            _ => UNREACHED, // shouldn't happen for legal states
         }
     }
 

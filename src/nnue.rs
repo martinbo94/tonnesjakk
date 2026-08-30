@@ -189,6 +189,35 @@ impl NnueConfig {
     }
 }
 
+
+const ALL36: u64 = (1u64 << NUM_SQUARES) - 1;
+const COL0: u64 = 0x041041041; // column 0 of a 6x6 board (bits 0,6,12,18,24,30)
+const COL5: u64 = COL0 << 5;
+
+/// Shift every set square by (dr, dc); squares leaving the board are dropped.
+#[inline(always)]
+fn shift_sq(mask: u64, dr: i32, dc: i32) -> u64 {
+    let m = match dc { -1 => mask & !COL0, 1 => mask & !COL5, _ => mask };
+    let s = dr * BOARD_SIZE as i32 + dc;
+    (if s >= 0 { m << s } else { m >> (-s) }) & ALL36
+}
+
+/// Origin barrels (subset of `barrels`) that have (a) a forward jump — over any
+/// piece except `enemy_pail`, landing on an empty on-board square — and (b) an
+/// empty forward step square, for the side whose forward row delta is `dr`.
+#[inline]
+fn forward_jump_step_origins(barrels: u64, occ: u64, enemy_pail: u64, dr: i32) -> (u64, u64) {
+    let (mut jump, mut step) = (0u64, 0u64);
+    for dc in -1i32..=1 {
+        let s1 = shift_sq(barrels, dr, dc);
+        step |= shift_sq(s1 & !occ, -dr, -dc) & barrels;
+        let over = s1 & occ & !enemy_pail;
+        let land = shift_sq(over, dr, dc) & !occ;
+        jump |= shift_sq(shift_sq(land, -dr, -dc), -dr, -dc) & barrels;
+    }
+    (jump, step)
+}
+
 /// Dense inputs for a given `dense_size` (0, 20 or 28). Sizes above 20 extend
 /// the 20 relational features; all are computed from the board, so training
 /// data (which stores only the first 20) never needs regenerating.
@@ -206,38 +235,15 @@ pub fn compute_dense(bb: &BitBoard, dense_size: usize) -> [f32; MAX_DENSE] {
     // [22-23] barrels with a forward jump available; [24-25] barrels with an
     // empty forward square (per side, /4). Forward = toward the goal row;
     // jumps go over any piece except the enemy pail and land on an empty
-    // on-board square.
+    // on-board square. Bit-parallel: shift the whole side's mask per
+    // direction and map landing squares back to their origin barrels.
     let occ = bb.white_barrels | bb.black_barrels | bb.white_pail | bb.black_pail;
-    let n = BOARD_SIZE as i32;
-    for (side, barrels, dir, enemy_pail) in [
-        (0usize, bb.white_barrels, -1i32, bb.black_pail),
-        (1usize, bb.black_barrels, 1i32, bb.white_pail),
-    ] {
-        let mut jumps = 0u32;
-        let mut steps = 0u32;
-        let mut m = barrels;
-        while m != 0 {
-            let sq = m.trailing_zeros() as i32;
-            m &= m - 1;
-            let (r, c) = (sq / n, sq % n);
-            let mut can_jump = false;
-            let mut can_step = false;
-            for dc in -1i32..=1 {
-                let (r1, c1) = (r + dir, c + dc);
-                if r1 < 0 || r1 >= n || c1 < 0 || c1 >= n { continue; }
-                let s1 = 1u64 << (r1 * n + c1);
-                if occ & s1 == 0 { can_step = true; continue; }
-                if enemy_pail & s1 != 0 { continue; }
-                let (r2, c2) = (r + 2 * dir, c + 2 * dc);
-                if r2 < 0 || r2 >= n || c2 < 0 || c2 >= n { continue; }
-                if occ & (1u64 << (r2 * n + c2)) == 0 { can_jump = true; }
-            }
-            jumps += can_jump as u32;
-            steps += can_step as u32;
-        }
-        out[22 + side] = jumps as f32 / 4.0;
-        out[24 + side] = steps as f32 / 4.0;
-    }
+    let (wj, ws) = forward_jump_step_origins(bb.white_barrels, occ, bb.black_pail, -1);
+    let (bj, bs) = forward_jump_step_origins(bb.black_barrels, occ, bb.white_pail, 1);
+    out[22] = wj.count_ones() as f32 / 4.0;
+    out[23] = bj.count_ones() as f32 / 4.0;
+    out[24] = ws.count_ones() as f32 / 4.0;
+    out[25] = bs.count_ones() as f32 / 4.0;
     // [26] no-progress clock (/60, clamped); [27] mid-turn (pail just placed)
     out[26] = (bb.halfmove_clock as f32 / 60.0).min(1.0);
     out[27] = if bb.awaiting_barrel { 1.0 } else { 0.0 };
@@ -1152,6 +1158,50 @@ mod tests {
             if d[22] > 0.0 || d[23] > 0.0 { saw_jump = true; }
         }
         assert!(saw_jump, "expected some forward jump availability in a random game");
+    }
+
+    /// Bit-parallel jump/step origins must equal a plain per-barrel scan.
+    #[test]
+    fn test_forward_jump_step_bitparallel_matches_loop() {
+        fn loop_version(barrels: u64, occ: u64, enemy_pail: u64, dir: i32) -> (u32, u32) {
+            let n = BOARD_SIZE as i32;
+            let (mut jumps, mut steps) = (0u32, 0u32);
+            let mut m = barrels;
+            while m != 0 {
+                let sq = m.trailing_zeros() as i32; m &= m - 1;
+                let (r, c) = (sq / n, sq % n);
+                let (mut cj, mut cs) = (false, false);
+                for dc in -1i32..=1 {
+                    let (r1, c1) = (r + dir, c + dc);
+                    if r1 < 0 || r1 >= n || c1 < 0 || c1 >= n { continue; }
+                    let s1 = 1u64 << (r1 * n + c1);
+                    if occ & s1 == 0 { cs = true; continue; }
+                    if enemy_pail & s1 != 0 { continue; }
+                    let (r2, c2) = (r + 2 * dir, c + 2 * dc);
+                    if r2 < 0 || r2 >= n || c2 < 0 || c2 >= n { continue; }
+                    if occ & (1u64 << (r2 * n + c2)) == 0 { cj = true; }
+                }
+                jumps += cj as u32; steps += cs as u32;
+            }
+            (jumps, steps)
+        }
+        let mut rng = 0x9E3779B97F4A7C15u64;
+        let mut next = || { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; rng };
+        for _ in 0..20000 {
+            // random sparse occupancy: up to 4 barrels per side, pails
+            let mut w = 0u64; let mut b = 0u64;
+            for _ in 0..4 { w |= 1u64 << (next() % 36); }
+            for _ in 0..4 { let s = 1u64 << (next() % 36); if w & s == 0 { b |= s; } }
+            let mut wp = 1u64 << (next() % 36); if (w | b) & wp != 0 { wp = 0; }
+            let mut bp = 1u64 << (next() % 36); if (w | b | wp) & bp != 0 { bp = 0; }
+            let occ = w | b | wp | bp;
+            for (side, dir, ep) in [(w, -1i32, bp), (b, 1i32, wp)] {
+                let (j, s) = forward_jump_step_origins(side, occ, ep, dir);
+                let (lj, ls) = loop_version(side, occ, ep, dir);
+                assert_eq!((j.count_ones(), s.count_ones()), (lj, ls), "w={:x} b={:x} wp={:x} bp={:x} dir={}", w, b, wp, bp, dir);
+                assert_eq!(j & !side, 0); assert_eq!(s & !side, 0);
+            }
+        }
     }
 
 }
