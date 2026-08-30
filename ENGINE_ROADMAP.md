@@ -647,6 +647,22 @@ swing between v1 and v2 is the bug fix, which also applies to the plain
 engine. v1 results archived as `tb_ab_v1_*.json`. Web UI loads `tablebases/`
 when present; ladder/tournament gates stay TB-off (they compare nets).
 
+**With 3v3 (2026-08-30).** A/B v3, 3v3 added as *exact* scores: **−6 [−22, +9]
+@ 100 ms, −10 [−32, +12] @ 200 ms** — the gain vanished; threefold draws rose
+to 22–27 % and games hit the no-progress limit. Cause: 3v3 is WDL-only (no
+distance-to-win), so every winning child scored `WIN_SCORE − ply` and the
+engine shuffled among equal "wins" until repetition took the win away — the
+classic WDL-without-DTZ trap. Fix (`search.rs`): WDL-only verdicts score
+±`TB_WDL_WIN` (30 000, below `WIN_BOUND`) **plus the clamped static eval**,
+so the NNUE's sense of progress chooses *which* winning move until a barrel
+scores and a distance-guided phase takes over; distance phases and terminals
+unchanged. Sanity: from TB-won 3v3 positions the TB engine at 100 ms converts
+39/40 vs a 200 ms opponent (plain engine 37/40, 1 loss); holds 8/8 TB draws.
+**A/B v4 (soft WDL): +25 [+9, +41] @ 100 ms, +32 [+12, +53] @ 200 ms.**
+Rule for later phases: a WDL-only table needs progress guidance from the eval;
+a distance table does not. Archives: `tb_ab_v1_*` (buggy root), `tb_ab_v2_*`
+(through 3v2), `tb_ab_v3_*` (3v3 exact), current = `tb_ab_*ms.json`.
+
 RFP ablation for the search re-tune: old constants + `rfp_margin=63` vs old
 constants = **+26 [+7, +45]** @ 100 ms. RFP is about a third of the +60; the
 other knobs jointly carry the rest.
