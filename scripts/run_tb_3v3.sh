@@ -6,7 +6,7 @@
 cd "$(dirname "$0")/.."
 source .venv/bin/activate
 set -x
-caffeinate -i python3 -c "
+TB_THREADS=${TB_THREADS:-12} caffeinate -i python3 -c "
 import time
 from tonnesjakk._core import solve_tablebase_packed
 t0 = time.time()

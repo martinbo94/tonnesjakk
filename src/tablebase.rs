@@ -545,7 +545,9 @@ impl PackedPhase {
 pub fn solve_packed(lower: &Tablebase, r: usize, dir: &Path, checkpoint_every: usize, verbose: bool) -> PackedPhase {
     let mut phase = PackedPhase::new(r);
     let n = phase.num_states();
-    let threads = std::thread::available_parallelism().map(|t| t.get()).unwrap_or(4).max(1);
+    // TB_THREADS caps the worker count (leave a core or two for the desktop).
+    let threads = std::env::var("TB_THREADS").ok().and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or_else(|| std::thread::available_parallelism().map(|t| t.get()).unwrap_or(4)).max(1);
     let chunk_states = ((n + threads - 1) / threads + 3) / 4 * 4; // multiple of 4 → byte-aligned chunks
     let t_start = std::time::Instant::now();
     let ckpt_path = dir.join(format!("tb_{}v{}.p2.partial", r, r));
