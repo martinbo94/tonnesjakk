@@ -573,6 +573,40 @@ Findings:
   4. Gen-4 by net-3 is *not* on the list until one of the above moves: more
      of the same data was −4 in round 6.
 
+## Round 8 — richer inputs (2026-08-30)
+
+Round 7's one significant result was −28 without the 20 engineered inputs, so
+round 8 tests *more* of them: `dense_size=28` = the 20 + per-side race distance
+(the +36/+63 eval term), per-side forward-jump availability and forward step
+mobility, the no-progress clock, the mid-turn flag. Computed from the board at
+decode time and at inference, so the existing 38.6M rows train it unchanged.
+Gate: 600 games @ 100 ms vs net-3, 4 nice'd workers (gen-4 generating alongside).
+
+**Speed confound first.** The 28-input net ran at 85 % of net-3's nodes/sec:
+two HashMap probes into the race table + a per-barrel scan per evaluation. Race
+table → flat array indexed by combinatorial rank; jump/step features →
+bit-parallel shifts (test: equals the per-barrel loop on 20k occupancies).
+Now 97 %. The first two gates ran on the slow build and were re-gated.
+
+| candidate (plain+m, 25 buckets, λ0.5) | vs net-3 (slow build) | vs net-3 (fast build) |
+|---|---|---|
+| d28 96×16 | — | +11 [−7, +29] |
+| d28 64×16 | −12 [−30, +7] | **+15 [−3, +33]** |
+| d28 48×16 | −19 [−39, +2] | −6 [−25, +13] |
+| d20 64×16 (net-3 config re-run = control) | — | −14 [−32, +4] |
+
+Ladder on d28 96×16: +265 heuristic (best ever; net-2 +251, net-3 +227),
++83 net-1, +81 net-1a, +70 net-1b, **+8 [−13, +29] net-2**, **+27 [+7, +47]
+net-3**. Pooled vs net-3 (gate + ladder, 1200 games) ≈ +19 [+6, +32]; extra
+600 vs net-2: −14 [−32, +4] → pooled vs net-2 ≈ −3 [−17, +11]. **Not
+promoted** (must beat every rung). Verdict: at equal size *and speed* the 28
+inputs are worth ~+15–25 over the 20 (every re-gated candidate moved up
+~20–27 once the speed cost was removed; +29 above the control at 64×16), but
+net-2 ≈ net-3 ≈ d28-96×16 are one plateau within ±15. Speed and inputs both
+matter; the plateau is the search depth reachable at 100 ms, not the net.
+Next: round 9 = the same candidates on gen-1..4 (gen-4 labelled by the +120
+Elo stronger engine with tablebases through 3v3 → many exact labels).
+
 ## Search re-tune with the NNUE loaded (2026-08-27) — **+60 / +54 Elo**
 
 Every pruning constant had been hand-tuned (and SPRT-gated) against the

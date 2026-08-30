@@ -149,10 +149,19 @@ ROUND8_CANDIDATES = [
     Candidate("plain", True, 20, 64, 16, 25, lam=0.5),    # net-3 config re-run = seed noise control
 ]
 
+# Round 9: round-8 candidates on gen-1..4 (gen-4 labelled by net-3 + search
+# re-tune + tablebases through 3v3). Gate vs net-3.
+ROUND9_CANDIDATES = [
+    Candidate("plain", True, 28, 96, 16, 25, lam=0.5),
+    Candidate("plain", True, 28, 64, 16, 25, lam=0.5),
+    Candidate("plain", True, 20, 64, 16, 25, lam=0.5),    # net-3 config on 4 gens = data-only effect
+]
+
 PRESETS = {"round1": DEFAULT_CANDIDATES, "round2": ROUND2_CANDIDATES,
            "round3": ROUND3_CANDIDATES, "round4": ROUND4_CANDIDATES,
            "round5": ROUND5_CANDIDATES, "round6": ROUND6_CANDIDATES,
-           "round7": ROUND7_CANDIDATES, "round8": ROUND8_CANDIDATES}
+           "round7": ROUND7_CANDIDATES, "round8": ROUND8_CANDIDATES,
+           "round9": ROUND9_CANDIDATES}
 
 
 def train(c: Candidate, data: str, out_dir: Path, epochs: int, lr: float, batch: int, log) -> float:
