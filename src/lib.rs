@@ -110,23 +110,24 @@ fn repack_tablebase_wdl(py: Python, dir: &str, wr: usize, br: usize) -> PyResult
     Ok((phase.num_states() + 3) / 4)
 }
 
-/// Solve a SYMMETRIC phase (r v r) into the packed 2-bit WDL format
-/// (`dir/tb_{r}v{r}.p2`): white-to-move states only, no distances — 3v3 fits
-/// in ~14 GB. Checkpoints every `checkpoint_every` passes (resumable).
-/// `lowmem` loads the lower phases from their `.wdl` companions (see
-/// `repack_tablebase_wdl`) so the 11.5 GB 3v2 table is not resident too.
-/// Returns (states, white_wins, black_wins, draws) over white-to-move states.
+/// Solve a phase into the packed 2-bit WDL format (`dir/tb_{wr}v{br}.p2`):
+/// symmetric phases store white-to-move states only, asymmetric ones both
+/// sides; no distances. Checkpoints every `checkpoint_every` passes
+/// (resumable). `lowmem` loads the lower phases from their `.wdl` companions
+/// (see `repack_tablebase_wdl`). Returns (states, white_wins, black_wins, draws).
 #[pyfunction]
-#[pyo3(signature = (dir, r, checkpoint_every = 5, verbose = true, lowmem = false))]
-fn solve_tablebase_packed(py: Python, dir: &str, r: usize, checkpoint_every: usize, verbose: bool, lowmem: bool) -> PyResult<(usize, usize, usize, usize)> {
+#[pyo3(signature = (dir, wr, br, checkpoint_every = 5, verbose = true, lowmem = false))]
+fn solve_tablebase_packed(py: Python, dir: &str, wr: usize, br: usize, checkpoint_every: usize, verbose: bool, lowmem: bool) -> PyResult<(usize, usize, usize, usize)> {
     let path = std::path::Path::new(dir);
     let tb = if lowmem { tablebase::Tablebase::load_dir_lowmem(path) } else { tablebase::Tablebase::load_dir(path) }
         .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("load tablebases: {}", e)))?;
-    if r >= 2 && tb.get(r, r - 1).is_none() && tb.get(r - 1, r).is_none() {
-        return Err(pyo3::exceptions::PyValueError::new_err(format!("phase {}v{} must be solved first", r, r - 1)));
+    for (lw, lb) in [(wr.saturating_sub(1), br), (wr, br.saturating_sub(1))] {
+        if lw >= 1 && lb >= 1 && !tb.has_phase(lw, lb) {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!("phase {}v{} must be solved before {}v{}", lw, lb, wr, br)));
+        }
     }
     py.allow_threads(|| {
-        let p = tablebase::solve_packed(&tb, r, path, checkpoint_every, verbose);
+        let p = tablebase::solve_packed(&tb, wr, br, path, checkpoint_every, verbose);
         let n = p.num_states();
         let (mut w, mut b, mut d) = (0usize, 0usize, 0usize);
         for idx in 0..n {

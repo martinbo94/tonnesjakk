@@ -347,11 +347,16 @@ pub const P_BLACK: u8 = 2;
 pub const P_INVALID: u8 = 3;
 
 pub struct PackedPhase {
-    pub r: usize,
+    pub wr: usize,
+    pub br: usize,
+    /// r v r phases store WHITE-TO-MOVE states only (black to move is answered
+    /// through the colour mirror, halving the table); asymmetric phases store
+    /// both sides to move.
+    symmetric: bool,
     wcfg: ConfigSpace,
     bcfg: ConfigSpace,
-    /// 2 bits per VALID white-to-move state (no invalid slots: 3v3 is 30.1B
-    /// valid of 56.1B raw combinations → 7.5 GB instead of 14 GB).
+    /// 2 bits per VALID state (no invalid slots: 3v3 is 30.1B valid of 56.1B
+    /// raw combinations → 7.5 GB instead of 14 GB).
     data: Vec<u8>,
     mapped: Option<memmap2::Mmap>,
     n_states: usize,
@@ -372,17 +377,49 @@ fn select_bit(mut mask: u64, mut i: usize) -> u64 {
     mask & mask.wrapping_neg()
 }
 
-/// Number of (white pail, black pail, awaiting) combinations with `f` free
-/// squares: white pail unplaced → black pail unplaced or on any free square
-/// (1 + f, awaiting impossible); white pail on one of f squares → black pail
-/// unplaced or on one of the other f-1 → f options, times awaiting ∈ {0,1}.
+/// Number of (own pail, other pail, awaiting) combinations for one side to
+/// move with `f` free squares: own pail unplaced → other pail unplaced or on
+/// any free square (1 + f, awaiting impossible); own pail on one of f squares
+/// → other pail unplaced or on one of the other f-1 → f options, times
+/// awaiting ∈ {0,1}.
 #[inline]
 fn pail_combos(f: usize) -> usize { (1 + f) + 2 * f * f }
 
+/// Rank of (own pail, other pail, awaiting) among the combinations for `free`.
+#[inline]
+fn encode_pails(own: u64, other: u64, aw: bool, free: u64, f: usize) -> Option<usize> {
+    if own == 0 {
+        if aw { return None; }
+        Some(if other == 0 { 0 } else { 1 + (free & (other - 1)).count_ones() as usize })
+    } else {
+        let i = (free & (own - 1)).count_ones() as usize;
+        let free2 = free & !own;
+        let j = if other == 0 { 0 } else { 1 + (free2 & (other - 1)).count_ones() as usize };
+        Some((1 + f) + (i * f + j) * 2 + aw as usize)
+    }
+}
+
+/// Inverse of `encode_pails`.
+#[inline]
+fn decode_pails(local: usize, free: u64, f: usize) -> (u64, u64, bool) {
+    if local <= f {
+        (0u64, if local == 0 { 0 } else { select_bit(free, local - 1) }, false)
+    } else {
+        let t = local - (1 + f);
+        let aw = t & 1 == 1;
+        let t = t >> 1;
+        let (i, j) = (t / f, t % f);
+        let own = select_bit(free, i);
+        let free2 = free & !own;
+        (own, if j == 0 { 0 } else { select_bit(free2, j - 1) }, aw)
+    }
+}
+
 impl PackedPhase {
-    pub fn new(r: usize) -> Self {
-        let wcfg = ConfigSpace::new(Player::White, r);
-        let bcfg = ConfigSpace::new(Player::Black, r);
+    pub fn new(wr: usize, br: usize) -> Self {
+        let symmetric = wr == br;
+        let wcfg = ConfigSpace::new(Player::White, wr);
+        let bcfg = ConfigSpace::new(Player::Black, br);
         let wc = wcfg.count as usize;
         let bc = bcfg.count as usize;
         let wmasks: Vec<u64> = (0..wc).map(|i| wcfg.unrank(i as u64)).collect();
@@ -391,6 +428,7 @@ impl PackedPhase {
         let mut pair_start = Vec::new();
         let mut pair_id = Vec::new();
         let mut acc = 0u64;
+        let sides = if symmetric { 1 } else { 2 };
         for wi in 0..wc {
             for bi in 0..bc {
                 let (w, b) = (wmasks[wi], bmasks[bi]);
@@ -400,15 +438,16 @@ impl PackedPhase {
                 pair_offset[p] = acc;
                 pair_start.push(acc);
                 pair_id.push(p as u32);
-                acc += pail_combos(f) as u64;
+                acc += (sides * pail_combos(f)) as u64;
             }
         }
         let n = acc as usize;
-        PackedPhase { r, wcfg, bcfg, data: vec![0u8; (n + 3) / 4], mapped: None, n_states: n,
+        PackedPhase { wr, br, symmetric, wcfg, bcfg, data: vec![0u8; (n + 3) / 4], mapped: None, n_states: n,
                       pair_offset, pair_start, pair_id }
     }
 
     pub fn num_states(&self) -> usize { self.n_states }
+    pub fn is_symmetric(&self) -> bool { self.symmetric }
 
     #[inline]
     fn bytes(&self) -> &[u8] {
@@ -427,10 +466,11 @@ impl PackedPhase {
         *b = (*b & !(3 << shift)) | (v << shift);
     }
 
-    /// Index of a WHITE-TO-MOVE position in this phase.
+    /// Index of a position in this phase (white to move only when symmetric).
     pub fn index(&self, bb: &BitBoard) -> Option<usize> {
-        if bb.current_player != Player::White { return None; }
-        if (4 - bb.white_scored as usize) != self.r || (4 - bb.black_scored as usize) != self.r {
+        let stm_black = bb.current_player == Player::Black;
+        if self.symmetric && stm_black { return None; }
+        if (4 - bb.white_scored as usize) != self.wr || (4 - bb.black_scored as usize) != self.br {
             return None;
         }
         let wi = self.wcfg.rank(bb.white_barrels)? as usize;
@@ -441,15 +481,9 @@ impl PackedPhase {
         let f = free.count_ones() as usize;
         let (wp, bp) = (bb.white_pail, bb.black_pail);
         if (wp & !free) != 0 || (bp & !free) != 0 || (wp & bp) != 0 { return None; }
-        let local = if wp == 0 {
-            if bb.awaiting_barrel { return None; }
-            if bp == 0 { 0 } else { 1 + (free & (bp - 1)).count_ones() as usize }
-        } else {
-            let i = (free & (wp - 1)).count_ones() as usize;
-            let free2 = free & !wp;
-            let j = if bp == 0 { 0 } else { 1 + (free2 & (bp - 1)).count_ones() as usize };
-            (1 + f) + (i * f + j) * 2 + bb.awaiting_barrel as usize
-        };
+        let (own, other) = if stm_black { (bp, wp) } else { (wp, bp) };
+        let local = encode_pails(own, other, bb.awaiting_barrel, free, f)?;
+        let local = if self.symmetric { local } else { (stm_black as usize) * pail_combos(f) + local };
         Some(off as usize + local)
     }
 
@@ -470,17 +504,12 @@ impl PackedPhase {
         let bmask = self.bcfg.unrank((p % bc) as u64);
         let free = ALL_SQUARES & !(wmask | bmask);
         let f = free.count_ones() as usize;
-        let (wpail, bpail, aw) = if local <= f {
-            (0u64, if local == 0 { 0 } else { select_bit(free, local - 1) }, false)
-        } else {
-            let t = local - (1 + f);
-            let aw = t & 1 == 1;
-            let t = t >> 1;
-            let (i, j) = (t / f, t % f);
-            let wpail = select_bit(free, i);
-            let free2 = free & !wpail;
-            (wpail, if j == 0 { 0 } else { select_bit(free2, j - 1) }, aw)
+        let (stm_black, local) = if self.symmetric { (false, local) } else {
+            let c = pail_combos(f);
+            (local >= c, local % c)
         };
+        let (own, other, aw) = decode_pails(local, free, f);
+        let (wpail, bpail) = if stm_black { (other, own) } else { (own, other) };
         let mut bb = BitBoard::new();
         bb.white_barrels = wmask;
         bb.black_barrels = bmask;
@@ -489,11 +518,11 @@ impl PackedPhase {
         bb.white_pail_placed = wpail != 0;
         bb.black_pail_placed = bpail != 0;
         bb.occupied = wmask | bmask | wpail | bpail;
-        bb.white_scored = (4 - self.r) as u8;
-        bb.black_scored = (4 - self.r) as u8;
-        bb.white_barrels_off_board = (self.r - wmask.count_ones() as usize) as u8;
-        bb.black_barrels_off_board = (self.r - bmask.count_ones() as usize) as u8;
-        bb.current_player = Player::White;
+        bb.white_scored = (4 - self.wr) as u8;
+        bb.black_scored = (4 - self.br) as u8;
+        bb.white_barrels_off_board = (self.wr - wmask.count_ones() as usize) as u8;
+        bb.black_barrels_off_board = (self.br - bmask.count_ones() as usize) as u8;
+        bb.current_player = if stm_black { Player::Black } else { Player::White };
         bb.awaiting_barrel = aw;
         bb
     }
@@ -505,11 +534,14 @@ impl PackedPhase {
         Some(self.decode_in_pair(pi, idx - self.pair_start[pi] as usize))
     }
 
-    /// WDL value (White perspective, as a Phase-style byte with distance 0)
-    /// for any side to move: black-to-move goes through the colour mirror.
-    pub fn value(&self, bb: &BitBoard) -> Option<u8> {
-        let (pos, flip) = if bb.current_player == Player::White { (*bb, false) } else { (color_mirror(bb), true) };
-        let v = self.get(self.index(&pos)?);
+    /// WDL of a position IN THIS PHASE through an arbitrary reader of the 2-bit
+    /// array (used by the solver mid-pass). White perspective, distance 0.
+    #[inline]
+    fn wdl_via(&self, bb: &BitBoard, get: &dyn Fn(usize) -> u8) -> Option<u8> {
+        let (pos, flip) = if self.symmetric && bb.current_player == Player::Black {
+            (color_mirror(bb), true)
+        } else { (*bb, false) };
+        let v = get(self.index(&pos)?);
         match (v, flip) {
             (P_INVALID, _) => None,
             (P_UNKNOWN, _) => Some(V_DRAW),
@@ -518,18 +550,24 @@ impl PackedPhase {
         }
     }
 
-    fn file_name(r: usize) -> String { format!("tb_{}v{}.p2", r, r) }
+    /// WDL value (White perspective, as a Phase-style byte with distance 0)
+    /// for any side to move.
+    pub fn value(&self, bb: &BitBoard) -> Option<u8> {
+        self.wdl_via(bb, &|idx| self.get(idx))
+    }
+
+    fn file_name(wr: usize, br: usize) -> String { format!("tb_{}v{}.p2", wr, br) }
 
     pub fn save(&self, dir: &Path) -> std::io::Result<()> {
         std::fs::create_dir_all(dir)?;
-        std::fs::write(dir.join(Self::file_name(self.r)), self.bytes())
+        std::fs::write(dir.join(Self::file_name(self.wr, self.br)), self.bytes())
     }
 
-    pub fn load(dir: &Path, r: usize) -> std::io::Result<Self> {
-        let mut p = PackedPhase::new(r);
+    pub fn load(dir: &Path, wr: usize, br: usize) -> std::io::Result<Self> {
+        let mut p = PackedPhase::new(wr, br);
         let expected = p.data.len();
         p.data = Vec::new();
-        let file = std::fs::File::open(dir.join(Self::file_name(r)))?;
+        let file = std::fs::File::open(dir.join(Self::file_name(wr, br)))?;
         let mmap = unsafe { memmap2::Mmap::map(&file)? };
         if mmap.len() != expected {
             return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "packed tablebase size mismatch"));
@@ -539,18 +577,19 @@ impl PackedPhase {
     }
 }
 
-/// Plain fixpoint solve of a symmetric phase into the packed format.
+/// Plain WDL fixpoint solve of a phase into the packed format (symmetric phases
+/// store white-to-move states only; asymmetric ones both sides).
 /// `checkpoint`: write the partial array to `dir` every N passes and resume
 /// from it if present (long solves survive a stop).
-pub fn solve_packed(lower: &Tablebase, r: usize, dir: &Path, checkpoint_every: usize, verbose: bool) -> PackedPhase {
-    let mut phase = PackedPhase::new(r);
+pub fn solve_packed(lower: &Tablebase, wr: usize, br: usize, dir: &Path, checkpoint_every: usize, verbose: bool) -> PackedPhase {
+    let mut phase = PackedPhase::new(wr, br);
     let n = phase.num_states();
     // TB_THREADS caps the worker count (leave a core or two for the desktop).
     let threads = std::env::var("TB_THREADS").ok().and_then(|v| v.parse::<usize>().ok())
         .unwrap_or_else(|| std::thread::available_parallelism().map(|t| t.get()).unwrap_or(4)).max(1);
     let chunk_states = ((n + threads - 1) / threads + 3) / 4 * 4; // multiple of 4 → byte-aligned chunks
     let t_start = std::time::Instant::now();
-    let ckpt_path = dir.join(format!("tb_{}v{}.p2.partial", r, r));
+    let ckpt_path = dir.join(format!("tb_{}v{}.p2.partial", wr, br));
 
     let mut data = std::mem::take(&mut phase.data);
     let resumed = if ckpt_path.exists() {
@@ -562,8 +601,8 @@ pub fn solve_packed(lower: &Tablebase, r: usize, dir: &Path, checkpoint_every: u
 
     let valid = n; // every index is a valid state
     if verbose {
-        eprintln!("packed phase {}v{}: {} states (white to move), {} valid, {} threads, resumed={} ({:.0}s)",
-                  r, r, n, valid, threads, resumed, t_start.elapsed().as_secs_f64());
+        eprintln!("packed phase {}v{}: {} states ({}), {} valid, {} threads, resumed={} ({:.0}s)",
+                  wr, br, n, if phase.is_symmetric() { "white to move" } else { "both sides to move" }, valid, threads, resumed, t_start.elapsed().as_secs_f64());
     }
 
     // In-place (Gauss-Seidel) fixpoint: values only ever go UNKNOWN -> decided,
@@ -601,28 +640,31 @@ pub fn solve_packed(lower: &Tablebase, r: usize, dir: &Path, checkpoint_every: u
                         let bb = phase.decode_in_pair(pi, local);
                         let moves = bb.generate_moves();
                         if moves.is_empty() { continue; } // boxed in: stays unknown = draw
-                        let mut any_win = false;
-                        let mut all_lose = true;
+                        let stm_white = bb.current_player == Player::White;
+                        let mut any_win = false;   // side to move has a winning move
+                        let mut all_lose = true;   // every move loses for the side to move
                         for mv in &moves {
                             let mut child = bb;
                             child.make_move(mv);
                             // White perspective value of the child
-                            let v: Option<u8> = if child.white_scored as usize > 4 - r || child.black_scored as usize > 4 - r {
+                            let v: Option<u8> = if child.white_scored as usize > 4 - wr || child.black_scored as usize > 4 - br {
                                 lower.value(&child)
-                            } else if child.current_player == Player::White {
-                                // white just made a pail sub-move: still white to move
-                                match get(phase.index(&child).unwrap()) { P_WHITE => Some(v_white_win(0)), P_BLACK => Some(v_black_win(0)), _ => None }
                             } else {
-                                let m = color_mirror(&child);
-                                match get(phase.index(&m).unwrap()) { P_WHITE => Some(v_black_win(0)), P_BLACK => Some(v_white_win(0)), _ => None }
+                                // same phase: UNKNOWN reads as draw-so-far, which
+                                // must count as "not a win / not a loss" here
+                                match phase.wdl_via(&child, &get) {
+                                    Some(x) if x == V_DRAW => None,
+                                    other => other,
+                                }
                             };
-                            match v {
-                                Some(x) if is_white_win(x) => { any_win = true; break; }
-                                Some(x) if is_black_win(x) => {}
-                                _ => { all_lose = false; }
-                            }
+                            let stm_wins = v.map(|x| if stm_white { is_white_win(x) } else { is_black_win(x) }).unwrap_or(false);
+                            let stm_loses = v.map(|x| if stm_white { is_black_win(x) } else { is_white_win(x) }).unwrap_or(false);
+                            if stm_wins { any_win = true; break; }
+                            if !stm_loses { all_lose = false; }
                         }
-                        let val = if any_win { P_WHITE } else if all_lose { P_BLACK } else { continue };
+                        let val = if any_win { if stm_white { P_WHITE } else { P_BLACK } }
+                                  else if all_lose { if stm_white { P_BLACK } else { P_WHITE } }
+                                  else { continue };
                         atoms[idx >> 2].fetch_or(val << ((idx & 3) * 2), Ordering::Relaxed);
                         local_assigned += 1;
                       }
@@ -657,17 +699,27 @@ pub fn solve_packed(lower: &Tablebase, r: usize, dir: &Path, checkpoint_every: u
 #[derive(Default)]
 pub struct Tablebase {
     phases: Vec<Option<Phase>>, // index wr*5 + br
-    packed: Vec<Option<PackedPhase>>, // index r (symmetric phases)
+    packed: Vec<Option<PackedPhase>>, // index wr*5 + br (2-bit WDL phases)
 }
 
 impl Tablebase {
     pub fn new() -> Self {
-        Tablebase { phases: (0..25).map(|_| None).collect(), packed: (0..5).map(|_| None).collect() }
+        Tablebase { phases: (0..25).map(|_| None).collect(), packed: (0..25).map(|_| None).collect() }
     }
 
     pub fn insert_packed(&mut self, p: PackedPhase) {
-        let r = p.r;
-        self.packed[r] = Some(p);
+        let slot = p.wr * 5 + p.br;
+        self.packed[slot] = Some(p);
+    }
+
+    pub fn get_packed(&self, wr: usize, br: usize) -> Option<&PackedPhase> {
+        self.packed.get(wr * 5 + br).and_then(|p| p.as_ref())
+    }
+
+    /// Is phase (wr, br) answerable (full, WDL-only, packed, or via the mirror)?
+    pub fn has_phase(&self, wr: usize, br: usize) -> bool {
+        self.get(wr, br).is_some() || self.get_packed(wr, br).is_some()
+            || self.get(br, wr).is_some() || self.get_packed(br, wr).is_some()
     }
 
     pub fn insert(&mut self, phase: Phase) {
@@ -681,7 +733,7 @@ impl Tablebase {
 
     pub fn loaded_phases(&self) -> Vec<(usize, usize)> {
         let mut v: Vec<(usize, usize)> = self.phases.iter().flatten().map(|p| (p.wr, p.br)).collect();
-        v.extend(self.packed.iter().flatten().map(|p| (p.r, p.r)));
+        v.extend(self.packed.iter().flatten().map(|p| (p.wr, p.br)));
         v.sort();
         v
     }
@@ -701,10 +753,14 @@ impl Tablebase {
             let v = phase.get(idx);
             return if v == V_INVALID || v == V_UNKNOWN { None } else { Some(v) };
         }
-        if wr == br {
-            if let Some(p) = self.packed.get(wr).and_then(|p| p.as_ref()) {
-                return p.value(bb);
-            }
+        if let Some(p) = self.get_packed(wr, br) {
+            return p.value(bb);
+        }
+        if let Some(p) = self.get_packed(br, wr) {
+            // colour mirror: (a, b) answered from (b, a), value negated
+            return p.value(&color_mirror(bb)).map(|v| {
+                if is_white_win(v) { v_black_win(0) } else if is_black_win(v) { v_white_win(0) } else { v }
+            });
         }
         let mirror_phase = self.get(br, wr)?;
         let m = color_mirror(bb);
@@ -731,9 +787,11 @@ impl Tablebase {
                 }
             }
         }
-        for r in 1..=4 {
-            if dir.join(PackedPhase::file_name(r)).exists() && tb.get(r, r).is_none() {
-                tb.insert_packed(PackedPhase::load(dir, r)?);
+        for wr in 1..=4 {
+            for br in 1..=4 {
+                if dir.join(PackedPhase::file_name(wr, br)).exists() && tb.get(wr, br).is_none() {
+                    tb.insert_packed(PackedPhase::load(dir, wr, br)?);
+                }
             }
         }
         Ok(tb)
@@ -753,9 +811,11 @@ impl Tablebase {
                 }
             }
         }
-        for r in 1..=4 {
-            if dir.join(PackedPhase::file_name(r)).exists() && tb.get(r, r).is_none() {
-                tb.insert_packed(PackedPhase::load(dir, r)?);
+        for wr in 1..=4 {
+            for br in 1..=4 {
+                if dir.join(PackedPhase::file_name(wr, br)).exists() && tb.get(wr, br).is_none() {
+                    tb.insert_packed(PackedPhase::load(dir, wr, br)?);
+                }
             }
         }
         Ok(tb)
@@ -984,7 +1044,7 @@ mod tests {
     /// of valid states the old full enumeration reported (3v3: 30,053,815,328).
     #[test]
     fn test_packed_index_roundtrip() {
-        let p1 = PackedPhase::new(1);
+        let p1 = PackedPhase::new(1, 1);
         let mut seen = std::collections::HashSet::new();
         for idx in 0..p1.num_states() {
             let bb = p1.decode(idx).expect("valid");
@@ -994,12 +1054,61 @@ mod tests {
             assert_eq!(p1.index(&bb), Some(idx), "roundtrip at {}", idx);
             assert!(seen.insert((bb.white_barrels, bb.black_barrels, bb.white_pail, bb.black_pail, bb.awaiting_barrel)), "duplicate state at {}", idx);
         }
-        let p2 = PackedPhase::new(2);
+        let p2 = PackedPhase::new(2, 2);
         for idx in (0..p2.num_states()).step_by(1009) {
             let bb = p2.decode(idx).unwrap();
             assert_eq!(p2.index(&bb), Some(idx));
         }
-        assert_eq!(PackedPhase::new(3).num_states(), 30_053_815_328);
+        assert_eq!(PackedPhase::new(3, 3).num_states(), 30_053_815_328);
+    }
+
+    /// Asymmetric packed phase (both sides to move): index/decode roundtrip,
+    /// WDL agreement with the full 2v1 solve for both sides to move, and 1v2
+    /// answered through the colour mirror of the packed 2v1.
+    #[test]
+    fn test_packed_asymmetric_matches_full_2v1() {
+        let mut tb = Tablebase::new();
+        tb.solve(1, 1, false);
+        let full21 = solve_phase(&tb, 2, 1, false);
+        let dir = std::env::temp_dir().join("tonnesjakk_tb_asym_test");
+        let packed = solve_packed(&tb, 2, 1, &dir, 0, false);
+        assert!(!packed.is_symmetric());
+        let mut n_black = 0;
+        for idx in (0..packed.num_states()).step_by(7) {
+            let bb = packed.decode(idx).unwrap();
+            assert_eq!(packed.index(&bb), Some(idx), "roundtrip at {}", idx);
+            if bb.current_player == Player::Black { n_black += 1; }
+        }
+        assert!(n_black > 1000);
+        let same = |v: u8, p: u8| (is_white_win(v) && is_white_win(p)) || (is_black_win(v) && is_black_win(p)) || (v == V_DRAW && p == V_DRAW);
+        let (mut checked_w, mut checked_b) = (0, 0);
+        for idx in (0..full21.num_states()).step_by(53) {
+            let Some(bb) = full21.decode(idx) else { continue };
+            let v = full21.vals()[idx];
+            if v == V_INVALID { continue; }
+            let p = packed.value(&bb).expect("packed value");
+            assert!(same(v, p), "idx {} stm {:?} full {} packed {}", idx, bb.current_player, v, p);
+            if bb.current_player == Player::White { checked_w += 1 } else { checked_b += 1 }
+        }
+        assert!(checked_w > 10_000 && checked_b > 10_000);
+        // mirror: a table holding the packed 2v1 answers 1v2 positions
+        let mut t2 = Tablebase::new();
+        t2.solve(1, 1, false);
+        t2.insert_packed(packed);
+        let mut direct = Tablebase::new();
+        direct.solve(1, 1, false);
+        direct.solve(1, 2, false);
+        let phase12 = direct.get(1, 2).unwrap();
+        let mut checked = 0;
+        for idx in (0..phase12.num_states()).step_by(101) {
+            let Some(bb) = phase12.decode(idx) else { continue };
+            let d = phase12.vals()[idx];
+            if d == V_INVALID { continue; }
+            let via = t2.value(&bb).expect("mirror lookup");
+            assert!(same(d, via), "mirror mismatch at idx {}", idx);
+            checked += 1;
+        }
+        assert!(checked > 5000);
     }
 
     /// Packed WDL solve of a symmetric phase must agree (win/loss/draw) with
@@ -1010,7 +1119,7 @@ mod tests {
         let tb = Tablebase::new();
         let full = solve_phase(&tb, 1, 1, false);
         let dir = std::env::temp_dir().join("tonnesjakk_tb_test");
-        let packed = solve_packed(&tb, 1, &dir, 0, false);
+        let packed = solve_packed(&tb, 1, 1, &dir, 0, false);
         let mut checked = 0;
         for idx in (0..full.num_states()).step_by(97) {
             let Some(bb) = full.decode(idx) else { continue };
