@@ -566,19 +566,27 @@ pub fn solve_packed(lower: &Tablebase, r: usize, dir: &Path, checkpoint_every: u
                   r, r, n, valid, threads, resumed, t_start.elapsed().as_secs_f64());
     }
 
+    // In-place (Gauss-Seidel) fixpoint: values only ever go UNKNOWN -> decided,
+    // so a state may be set the moment it is determined and read by other
+    // threads mid-pass; every value read is a true fact, the fixpoint is the
+    // same, and no per-pass assignment buffer is needed (collecting
+    // (idx, value) pairs for pass 1 of 3v3 was >100 GB and swapped the
+    // machine to a halt). 2-bit fields share bytes across threads -> atomics.
+    use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+    let atoms: &[AtomicU8] = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const AtomicU8, data.len()) };
     let mut pass = 0usize;
     loop {
         pass += 1;
-        // Read-only snapshot for this pass; collect assignments per thread
-        let results: Vec<Vec<(usize, u8)>> = std::thread::scope(|s| {
+        let assigned = AtomicUsize::new(0);
+        std::thread::scope(|s| {
             let phase = &phase;
-            let snap: &[u8] = &data;
-            let handles: Vec<_> = (0..threads).map(|ci| {
+            let assigned = &assigned;
+            for ci in 0..threads {
                 s.spawn(move || {
                     let lo = ci * chunk_states;
                     let hi = ((ci + 1) * chunk_states).min(n);
-                    let mut out = Vec::new();
-                    let get = |idx: usize| (snap[idx >> 2] >> ((idx & 3) * 2)) & 3;
+                    let get = |idx: usize| (atoms[idx >> 2].load(Ordering::Relaxed) >> ((idx & 3) * 2)) & 3;
+                    let mut local_assigned = 0usize;
                     // Walk pair by pair: decoding a state inside a known pair
                     // is O(1); decode(idx) would binary-search every state.
                     let mut pi = if lo < n { phase.pair_at(lo) } else { 0 };
@@ -614,23 +622,18 @@ pub fn solve_packed(lower: &Tablebase, r: usize, dir: &Path, checkpoint_every: u
                                 _ => { all_lose = false; }
                             }
                         }
-                        if any_win { out.push((idx, P_WHITE)); }
-                        else if all_lose { out.push((idx, P_BLACK)); }
+                        let val = if any_win { P_WHITE } else if all_lose { P_BLACK } else { continue };
+                        atoms[idx >> 2].fetch_or(val << ((idx & 3) * 2), Ordering::Relaxed);
+                        local_assigned += 1;
                       }
                       idx = end;
                       pi += 1;
                     }
-                    out
-                })
-            }).collect();
-            handles.into_iter().map(|h| h.join().unwrap()).collect()
-        });
-        let n_assigned: usize = results.iter().map(|a| a.len()).sum();
-        for a in &results {
-            for &(idx, v) in a {
-                PackedPhase::set(&mut data, idx, v);
+                    assigned.fetch_add(local_assigned, Ordering::Relaxed);
+                });
             }
-        }
+        });
+        let n_assigned = assigned.load(Ordering::Relaxed);
         if verbose {
             eprintln!("  pass {:3}: assigned {:10} ({:.0}s)", pass, n_assigned, t_start.elapsed().as_secs_f64());
         }
