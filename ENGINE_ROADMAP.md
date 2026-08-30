@@ -748,7 +748,14 @@ unchanged. Sanity: from TB-won 3v3 positions the TB engine at 100 ms converts
 39/40 vs a 200 ms opponent (plain engine 37/40, 1 loss); holds 8/8 TB draws.
 **A/B v4 (soft WDL): +25 [+9, +41] @ 100 ms, +32 [+12, +53] @ 200 ms.**
 Rule for later phases: a WDL-only table needs progress guidance from the eval;
-a distance table does not. Archives: `tb_ab_v1_*` (buggy root), `tb_ab_v2_*`
+a distance table does not.
+
+**A/B v5 (all ten phases incl. 4v2/2v4, race-based progress term):
++46 [+31, +61] @ 100 ms (600 games), +47 [+28, +67] @ 200 ms (400 games).**
+Nearly double v4: with ≤ 7 barrels remaining solved, probes fire in the heart
+of the midgame. Termination mix shifts toward no_progress draws (16–20 per
+run) — theoretical draws held by shuffling, as designed. Tablebase ledger:
+v2 +16/+23 (≤ 5 remaining) → v4 +25/+32 (+3v3) → v5 +46/+47 (+4v2). Archives: `tb_ab_v1_*` (buggy root), `tb_ab_v2_*`
 (through 3v2), `tb_ab_v3_*` (3v3 exact), current = `tb_ab_*ms.json`.
 
 RFP ablation for the search re-tune: old constants + `rfp_margin=63` vs old
