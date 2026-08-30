@@ -8,6 +8,10 @@ pub const MAX_HIDDEN1: usize = 512;
 pub const MAX_HIDDEN2: usize = 128;
 /// Dense (relational) feature count when enabled
 pub const HALFPAIL_DENSE: usize = 20;
+/// Dense set v2: the 20 relational features + 8 (race distances, forward jump
+/// availability, forward mobility, no-progress clock, mid-turn flag).
+pub const DENSE_V2: usize = 28;
+pub const MAX_DENSE: usize = 32;
 /// Upper bound on simultaneously active sparse features per perspective:
 /// 4 own barrels + 4 enemy barrels + 2 pails.
 pub const MAX_ACTIVE_FEATURES: usize = 12;
@@ -183,6 +187,61 @@ impl NnueConfig {
         };
         b != a
     }
+}
+
+/// Dense inputs for a given `dense_size` (0, 20 or 28). Sizes above 20 extend
+/// the 20 relational features; all are computed from the board, so training
+/// data (which stores only the first 20) never needs regenerating.
+#[inline]
+pub fn compute_dense(bb: &BitBoard, dense_size: usize) -> [f32; MAX_DENSE] {
+    let mut out = [0.0f32; MAX_DENSE];
+    if dense_size == 0 { return out; }
+    out[..HALFPAIL_DENSE].copy_from_slice(&compute_relational_features(bb));
+    if dense_size <= HALFPAIL_DENSE { return out; }
+    // [20-21] race distance per side (min moves for a lone side to score
+    // everything; the eval term worth +36/+63 Elo), /8 clamped
+    let rt = &*crate::race::RACE_TABLE;
+    out[20] = (rt.side_distance(bb, Player::White) as f32 / 8.0).min(1.0);
+    out[21] = (rt.side_distance(bb, Player::Black) as f32 / 8.0).min(1.0);
+    // [22-23] barrels with a forward jump available; [24-25] barrels with an
+    // empty forward square (per side, /4). Forward = toward the goal row;
+    // jumps go over any piece except the enemy pail and land on an empty
+    // on-board square.
+    let occ = bb.white_barrels | bb.black_barrels | bb.white_pail | bb.black_pail;
+    let n = BOARD_SIZE as i32;
+    for (side, barrels, dir, enemy_pail) in [
+        (0usize, bb.white_barrels, -1i32, bb.black_pail),
+        (1usize, bb.black_barrels, 1i32, bb.white_pail),
+    ] {
+        let mut jumps = 0u32;
+        let mut steps = 0u32;
+        let mut m = barrels;
+        while m != 0 {
+            let sq = m.trailing_zeros() as i32;
+            m &= m - 1;
+            let (r, c) = (sq / n, sq % n);
+            let mut can_jump = false;
+            let mut can_step = false;
+            for dc in -1i32..=1 {
+                let (r1, c1) = (r + dir, c + dc);
+                if r1 < 0 || r1 >= n || c1 < 0 || c1 >= n { continue; }
+                let s1 = 1u64 << (r1 * n + c1);
+                if occ & s1 == 0 { can_step = true; continue; }
+                if enemy_pail & s1 != 0 { continue; }
+                let (r2, c2) = (r + 2 * dir, c + 2 * dc);
+                if r2 < 0 || r2 >= n || c2 < 0 || c2 >= n { continue; }
+                if occ & (1u64 << (r2 * n + c2)) == 0 { can_jump = true; }
+            }
+            jumps += can_jump as u32;
+            steps += can_step as u32;
+        }
+        out[22 + side] = jumps as f32 / 4.0;
+        out[24 + side] = steps as f32 / 4.0;
+    }
+    // [26] no-progress clock (/60, clamped); [27] mid-turn (pail just placed)
+    out[26] = (bb.halfmove_clock as f32 / 60.0).min(1.0);
+    out[27] = if bb.awaiting_barrel { 1.0 } else { 0.0 };
+    out
 }
 
 /// Rebuild a BitBoard from the 164-float training row (144 one-hot piece
@@ -632,8 +691,8 @@ impl SparseNNUE {
         if c.hidden2 > MAX_HIDDEN2 || c.hidden2 % 8 != 0 {
             return Err(format!("hidden2 must be a multiple of 8 and <= {}", MAX_HIDDEN2).into());
         }
-        if c.dense_size != 0 && c.dense_size != HALFPAIL_DENSE {
-            return Err(format!("dense_size must be 0 or {}", HALFPAIL_DENSE).into());
+        if c.dense_size != 0 && c.dense_size != HALFPAIL_DENSE && c.dense_size != DENSE_V2 {
+            return Err(format!("dense_size must be 0, {} or {}", HALFPAIL_DENSE, DENSE_V2).into());
         }
         if c.output_buckets != 1 && c.output_buckets != 25 {
             return Err("output_buckets must be 1 or 25".into());
@@ -771,7 +830,7 @@ impl SparseNNUE {
             input[h1 + i] = acc.black_pre[i].clamp(0, IN_CLIP);
         }
         if dense_size > 0 {
-            let dense = compute_relational_features(bb);
+            let dense = compute_dense(bb, dense_size);
             for k in 0..dense_size {
                 input[2 * h1 + k] = (dense[k] * Q_ACC).round() as i16;
             }
@@ -818,7 +877,7 @@ impl SparseNNUE {
                 }
             }
         }
-        let dense = if dense_size > 0 { compute_relational_features(bb) } else { [0.0f32; HALFPAIL_DENSE] };
+        let dense = compute_dense(bb, dense_size);
         let mut hidden = [0.0f32; MAX_HIDDEN2];
         let fc2_w = &self.fc2_weight[bucket * h2 * fc2_in..(bucket + 1) * h2 * fc2_in];
         for neuron in 0..h2 {
@@ -1065,4 +1124,34 @@ mod tests {
         assert_eq!(d.current_player, bb.current_player);
         assert_eq!(d.white_barrels_off_board, bb.white_barrels_off_board);
     }
+    #[test]
+    fn test_dense_v2_extends_v1() {
+        let bb = BitBoard::new();
+        let d = compute_dense(&bb, DENSE_V2);
+        let v1 = compute_relational_features(&bb);
+        assert_eq!(&d[..HALFPAIL_DENSE], &v1[..]);
+        for k in 0..DENSE_V2 { assert!(d[k] >= -1.0 && d[k] <= 1.0, "feature {} = {}", k, d[k]); }
+        assert_eq!(compute_dense(&bb, 0), [0.0f32; MAX_DENSE]);
+        assert_eq!(&compute_dense(&bb, HALFPAIL_DENSE)[..HALFPAIL_DENSE], &v1[..]);
+        // start position: no jumps (nothing to jump over yet), clock 0, not mid-turn
+        assert_eq!(d[22], 0.0); assert_eq!(d[23], 0.0);
+        assert_eq!(d[26], 0.0); assert_eq!(d[27], 0.0);
+        // race distances are symmetric at the start
+        assert_eq!(d[20], d[21]);
+        // after a few moves the features stay in range and jumps can appear
+        let mut b = bb;
+        let mut rng = 12345u64;
+        let mut saw_jump = false;
+        for _ in 0..40 {
+            let moves = b.generate_moves();
+            if moves.is_empty() || b.check_winner().is_some() { break; }
+            rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17;
+            b.make_move(&moves[(rng % moves.len() as u64) as usize]);
+            let d = compute_dense(&b, DENSE_V2);
+            for k in 0..DENSE_V2 { assert!(d[k] >= -1.0 && d[k] <= 1.0); }
+            if d[22] > 0.0 || d[23] > 0.0 { saw_jump = true; }
+        }
+        assert!(saw_jump, "expected some forward jump availability in a random game");
+    }
+
 }

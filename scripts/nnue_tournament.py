@@ -138,10 +138,21 @@ ROUND7_CANDIDATES = [
     Candidate("plain", True, 20, 64, 16, 25, lam=0.5),    # net-3 config re-run = seed noise floor
 ]
 
+# Round 8: INPUTS. Round 7's only significant result was -28 without the 20
+# engineered features, so richer inputs, not size: dense 28 = the 20 + race
+# distances, forward-jump availability, forward mobility, no-progress clock,
+# mid-turn flag (computed at decode time; no data regeneration). Gate vs net-3.
+ROUND8_CANDIDATES = [
+    Candidate("plain", True, 28, 64, 16, 25, lam=0.5),
+    Candidate("plain", True, 28, 48, 16, 25, lam=0.5),
+    Candidate("plain", True, 28, 96, 16, 25, lam=0.5),
+    Candidate("plain", True, 20, 64, 16, 25, lam=0.5),    # net-3 config re-run = seed noise control
+]
+
 PRESETS = {"round1": DEFAULT_CANDIDATES, "round2": ROUND2_CANDIDATES,
            "round3": ROUND3_CANDIDATES, "round4": ROUND4_CANDIDATES,
            "round5": ROUND5_CANDIDATES, "round6": ROUND6_CANDIDATES,
-           "round7": ROUND7_CANDIDATES}
+           "round7": ROUND7_CANDIDATES, "round8": ROUND8_CANDIDATES}
 
 
 def train(c: Candidate, data: str, out_dir: Path, epochs: int, lr: float, batch: int, log) -> float:
@@ -154,8 +165,8 @@ def train(c: Candidate, data: str, out_dir: Path, epochs: int, lr: float, batch:
            "--loss", c.loss, "--data-fraction", str(c.fraction)]
     if c.mirror:
         cmd.append("--mirror")
-    if c.dense == 0:
-        cmd.append("--no-dense")
+    if c.dense != 20:
+        cmd += ["--dense-size", str(c.dense)]
     if c.dedupe:
         cmd.append("--dedupe")
     t0 = time.time()

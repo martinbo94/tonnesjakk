@@ -11,7 +11,7 @@ Architecture knobs (see `NnueArch`):
   "plain" (no buckets, 144 features)
 - mirror_black: black perspective sees the board flipped vertically so shared
   weights are orientation-consistent across colors
-- dense_size: 0 or 20 relational features appended before FC2
+- dense_size: 0, 20 or 28 dense features appended before FC2 (28 = +race distances, jumps, mobility, clock, mid-turn)
 - hidden1 / hidden2: layer widths (multiples of 8)
 - output_buckets: 1, or 25 = one output head per (white_scored, black_scored)
 
@@ -49,8 +49,8 @@ class NnueArch:
     def __post_init__(self):
         if self.feature_set not in FEATURE_COUNTS:
             raise ValueError(f"unknown feature_set {self.feature_set!r}")
-        if self.dense_size not in (0, DENSE_FEATURES):
-            raise ValueError("dense_size must be 0 or 20")
+        if self.dense_size not in (0, DENSE_FEATURES, 28):
+            raise ValueError("dense_size must be 0, 20 or 28")
         if self.output_buckets not in (1, 25):
             raise ValueError("output_buckets must be 1 or 25")
         if self.hidden1 % 16 != 0 or self.hidden1 <= 0:

@@ -62,8 +62,10 @@ fn decode_sparse_batch(
         let nb = config.active_features(&bb, Player::Black, &mut feats);
         b_idx.extend(feats[..nb].iter().map(|&f| f as i64));
 
-        if dense_size > 0 {
-            dense_flat.extend_from_slice(&row[144..144 + dense_size]);
+        if dense_size == nnue::HALFPAIL_DENSE {
+            dense_flat.extend_from_slice(&row[144..144 + dense_size]); // stored (identical to recomputing)
+        } else if dense_size > 0 {
+            dense_flat.extend_from_slice(&nnue::compute_dense(&bb, dense_size)[..dense_size]);
         }
         buckets.push(config.output_bucket(&bb) as i64);
     }

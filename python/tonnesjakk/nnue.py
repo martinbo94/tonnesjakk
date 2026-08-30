@@ -1166,6 +1166,8 @@ Examples:
                         help="Mirror the board for the black perspective (orientation-consistent shared weights)")
     parser.add_argument("--no-dense", action="store_true",
                         help="Drop the 20 dense relational features")
+    parser.add_argument("--dense-size", type=int, default=None, choices=(0, 20, 28),
+                        help="dense inputs before FC2 (default 20; 28 adds race/jump/mobility/clock features)")
     parser.add_argument("--output-buckets", type=int, default=1, choices=[1, 25],
                         help="Output heads: 1, or 25 keyed on (white_scored, black_scored)")
     parser.add_argument("--dedupe", action="store_true",
@@ -1203,7 +1205,7 @@ Examples:
         resume_from=args.resume_from,
         feature_set=args.feature_set,
         mirror_black=args.mirror,
-        dense_size=0 if args.no_dense else 20,
+        dense_size=0 if args.no_dense else (args.dense_size if args.dense_size is not None else 20),
         output_buckets=args.output_buckets,
         dedupe=args.dedupe,
         noise_prob=args.noise_prob,
