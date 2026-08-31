@@ -5,6 +5,7 @@ pub mod nnue;
 pub mod race;
 pub mod search;
 pub mod tablebase;
+#[cfg(feature = "mcts")]
 pub mod mcts;
 
 // Re-export everything for backward compatibility
@@ -166,13 +167,16 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(decode_sparse_batch, m)?)?;
     m.add("BOARD_SIZE", BOARD_SIZE)?;
     m.add("BARRELS_PER_PLAYER", BARRELS_PER_PLAYER)?;
-    m.add("POLICY_SIZE", mcts::POLICY_SIZE)?;
-    m.add_class::<mcts::MCTSEngine>()?;
-    m.add_class::<mcts::MCTSSearchResult>()?;
-    m.add_class::<mcts::TrainingExample>()?;
-    m.add_class::<mcts::SelfPlayResult>()?;
-    m.add_class::<mcts::EvalMatchResult>()?;
-    m.add_class::<mcts::OnnxSession>()?;
+    #[cfg(feature = "mcts")]
+    {
+        m.add("POLICY_SIZE", mcts::POLICY_SIZE)?;
+        m.add_class::<mcts::MCTSEngine>()?;
+        m.add_class::<mcts::MCTSSearchResult>()?;
+        m.add_class::<mcts::TrainingExample>()?;
+        m.add_class::<mcts::SelfPlayResult>()?;
+        m.add_class::<mcts::EvalMatchResult>()?;
+        m.add_class::<mcts::OnnxSession>()?;
+    }
     Ok(())
 }
 

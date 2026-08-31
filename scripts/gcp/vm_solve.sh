@@ -51,7 +51,7 @@ if [ ! -d /data/tonnesjakk ]; then
 fi
 cd /data/tonnesjakk
 python3 -m venv .venv && source .venv/bin/activate && pip install -q maturin
-maturin develop --release
+maturin develop --release --no-default-features  # no mcts/ort: solver only
 mkdir -p tablebases
 # prerequisites (skip what already exists / survived preemption)
 for f in tb_4v2.p2 tb_3v3.p2; do  # 4v3 scores only into 3v3/4v2; 4v4 only into 4v3 (3v4 via mirror)
