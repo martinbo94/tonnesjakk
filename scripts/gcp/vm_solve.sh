@@ -2,6 +2,36 @@
 # Runs ON the GCP VM. Idempotent: safe to re-run after a spot preemption.
 set -euxo pipefail
 BUCKET=${BUCKET:?set BUCKET=gs://...}
+# All output to a persistent log (survives ssh drops; heartbeat ships it out).
+mkdir -p /data 2>/dev/null || sudo mkdir -p /data
+exec > >(tee -a /data/solve.log) 2>&1
+
+# ── Heartbeat: every 2 min push status JSON + log tail to the bucket, so
+# progress/stuck/failure is visible from anywhere with `gsutil cat`. ──
+heartbeat() {
+  while true; do
+    pid=$(pgrep -f "solve_tablebase_packed" | head -1 || true)
+    cpu=$( [ -n "$pid" ] && ps -o pcpu= -p "$pid" || echo 0 )
+    rss=$( [ -n "$pid" ] && ps -o rss= -p "$pid" || echo 0 )
+    ckpt=$(ls -la /data/tonnesjakk/tablebases/*.partial 2>/dev/null | awk '{print $5, $9}' | tail -1)
+    python3 - <<PY > /tmp/status.json 2>/dev/null || true
+import json, time, os
+print(json.dumps({
+  "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+  "solver_pid": "${pid}", "solver_cpu_pct": "${cpu}".strip(), "solver_rss_kb": "${rss}".strip(),
+  "checkpoint": "${ckpt}",
+  "disk_free_gb": round(__import__("shutil").disk_usage("/data").free / 1e9, 1),
+  "loadavg": open("/proc/loadavg").read().split()[:3],
+}))
+PY
+    gsutil -q cp /tmp/status.json $BUCKET/status/latest.json 2>/dev/null || true
+    tail -40 /data/solve.log > /tmp/log_tail.txt 2>/dev/null || true
+    gsutil -q cp /tmp/log_tail.txt $BUCKET/status/log_tail.txt 2>/dev/null || true
+    sleep 120
+  done
+}
+heartbeat & HB=$!
+trap 'kill $HB 2>/dev/null; echo "EXIT $? at $(date -u +%FT%TZ)" > /tmp/exit.txt; gsutil -q cp /tmp/exit.txt $BUCKET/status/exit.txt 2>/dev/null || true' EXIT
 # Format ONLY if the disk has no filesystem yet — after a spot preemption this
 # script re-runs and must NOT wipe the checkpoints the data disk exists to keep.
 if ! sudo blkid /dev/disk/by-id/google-data >/dev/null 2>&1; then
@@ -41,6 +71,7 @@ print(f'${wr}v${br}: {n:,} states - white {100*w/v:.2f}%, black {100*b/v:.2f}%, 
 }
 solve 4 3
 solve 4 4
+echo "ALL PHASES SOLVED at $(date -u +%FT%TZ)" && gsutil -q cp /data/solve.log $BUCKET/status/solve_complete.log
 # The answer:
 python3 -c "
 from tonnesjakk import Engine, Board

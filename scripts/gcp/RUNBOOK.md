@@ -52,13 +52,19 @@ gcloud compute instances create tb-solver \
   --create-disk=size=700GB,type=pd-balanced,auto-delete=yes,device-name=data \
   --image-family=debian-12 --image-project=debian-cloud --zone=us-central1-a
 
-# 2. on the VM: scripts/gcp/vm_solve.sh does everything
-#    (deps, repo, download tables, solve 4v3 -> 4v4 with checkpoint-every-pass,
-#     stats, zstd, upload results to gs://BUCKET/tb/)
-gcloud compute ssh tb-solver -- 'bash -s' < scripts/gcp/vm_solve.sh
+# 2. launch DETACHED (survives ssh drops): vm_solve.sh does everything
+#    (deps, source tarball, download tables, solve 4v3 -> 4v4 with
+#     checkpoint-every-pass, stats, zstd, upload results) and ships a
+#     heartbeat + log tail to gs://BUCKET/status/ every 2 minutes.
+gcloud compute scp scripts/gcp/vm_solve.sh tb-solver:~ --zone $ZONE
+gcloud compute ssh tb-solver --zone $ZONE -- \
+  "BUCKET=gs://BUCKET nohup bash vm_solve.sh >/tmp/bootstrap.log 2>&1 & disown"
 
-# 3. after a preemption: just re-run step 2 — the solver resumes from the
-#    latest .partial checkpoint on the data disk.
+# 3. poll from anywhere (status JSON age, solver CPU, checkpoint size, log tail;
+#    warns on stale heartbeat / low CPU; exit marker on failure):
+BUCKET=gs://BUCKET ./scripts/gcp/check_solve.sh
+#    after a spot preemption (instance shows TERMINATED/STOPPED):
+BUCKET=gs://BUCKET ./scripts/gcp/check_solve.sh --restart   # start + relaunch; resumes from checkpoint
 
 # 4. locally: download the compressed results (~15-25 GB) and verify
 gsutil -m cp gs://BUCKET/tb/tb_4v3.p2.zst gs://BUCKET/tb/tb_4v4.p2.zst tablebases/
