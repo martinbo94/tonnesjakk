@@ -627,6 +627,26 @@ slice has only 3.8 % duplicates vs ~30 % overall — nearly all duplication was
 in the endgames the tables now own. Round 10 = same candidates trained with
 `--max-scored 1` (positions with ≥ 7 barrels remaining only).
 
+## Search wave 2 (2026-08-31)
+
+- **SPSA pass-2 vector ADOPTED**: +12/+13 (ns) twice, then **+14.2 [+1.4,
+  +27.0]** in a 1200-game confirmation — three consistent samples. New
+  defaults: rfp 77, lmp_base 9, iir_depth 2, lmr_div 95, nmp_boost 170,
+  razor 190/139, hist 829/−486, asp 28.
+- **Countermove heuristic: null.** −0.2 [−10.2, +9.8] over 2000 games
+  (SPRT [0,10] inconclusive at budget). Killers + butterfly + continuation
+  history already cover it. Kept in code behind `use_countermove` (off).
+- **Singular extensions: failed twice.** Margin 50 / depth ≥ 7: SPRT FAIL,
+  −11.8 [−26.7, +2.9] (exclusion-search cost dominates). Margin 120 /
+  depth ≥ 9: SPRT FAIL, −1.6 [−10.9, +7.6] (rare enough to be cheap, no
+  gain). Kept behind `singular_margin`/`singular_depth` (off). At ~30 plies
+  and 100 ms, forced lines are apparently already resolved by depth + TT.
+- TT aging: already existed (generation-based cluster replacement).
+
+Wave yield: **+14 adopted, two clean nulls.** The cheap search ideas are now
+also exhausted at this TC; the engine's remaining headroom is the cloud solve
+(scripts/gcp/RUNBOOK.md) and, at longer TCs, the bigger-net/28-input NNUE line.
+
 ## Round 10 — phase-filtered training (2026-08-30) and the NNUE verdict
 
 Same candidates trained with `--max-scored 1` (positions with ≥ 7 barrels
