@@ -2,18 +2,27 @@
 # Runs ON the GCP VM. Idempotent: safe to re-run after a spot preemption.
 set -euxo pipefail
 BUCKET=${BUCKET:?set BUCKET=gs://...}
-sudo mkfs.ext4 -F /dev/disk/by-id/google-data 2>/dev/null || true
-sudo mkdir -p /data && sudo mount /dev/disk/by-id/google-data /data 2>/dev/null || true
+# Format ONLY if the disk has no filesystem yet — after a spot preemption this
+# script re-runs and must NOT wipe the checkpoints the data disk exists to keep.
+if ! sudo blkid /dev/disk/by-id/google-data >/dev/null 2>&1; then
+  sudo mkfs.ext4 -F /dev/disk/by-id/google-data
+fi
+sudo mkdir -p /data
+mountpoint -q /data || sudo mount /dev/disk/by-id/google-data /data
 sudo chown $USER /data
 sudo apt-get update -qq && sudo apt-get install -y -qq git curl zstd build-essential python3-venv python3-pip
 command -v cargo >/dev/null || (curl -sSf https://sh.rustup.rs | sh -s -- -y); source "$HOME/.cargo/env"
-[ -d /data/tonnesjakk ] || git clone https://github.com/USER/tonnesjakk /data/tonnesjakk
-cd /data/tonnesjakk && git pull
+# Source: private repo -> a tarball in the bucket (uploaded by the runbook's step 0)
+if [ ! -d /data/tonnesjakk ]; then
+  gsutil cp $BUCKET/src/tonnesjakk-src.tar.gz /data/ && mkdir -p /data/tonnesjakk \
+    && tar xzf /data/tonnesjakk-src.tar.gz -C /data/tonnesjakk
+fi
+cd /data/tonnesjakk
 python3 -m venv .venv && source .venv/bin/activate && pip install -q maturin
 maturin develop --release
 mkdir -p tablebases
 # prerequisites (skip what already exists / survived preemption)
-for f in tb_4v2.p2 tb_3v3.p2 tb_4v1.wdl tb_3v2.wdl tb_2v2.wdl tb_3v1.wdl tb_1v3.wdl tb_2v1.wdl tb_1v2.wdl tb_1v1.wdl; do
+for f in tb_4v2.p2 tb_3v3.p2; do  # 4v3 scores only into 3v3/4v2; 4v4 only into 4v3 (3v4 via mirror)
   [ -f tablebases/$f ] || (gsutil cp $BUCKET/tb/$f.zst tablebases/ && zstd -d --rm tablebases/$f.zst)
 done
 solve() {
