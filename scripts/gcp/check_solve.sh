@@ -24,7 +24,7 @@ if gsutil -q stat "$BUCKET/status/latest.json" 2>/dev/null; then
   echo "heartbeat age: ${ts}s"
   if [ "$ts" -gt 600 ] && [ "$state" = "RUNNING" ]; then
     echo "WARNING: VM is RUNNING but the heartbeat is stale (>10 min) — ssh in and check:"
-    echo "  gcloud compute ssh $VM --zone $ZONE -- tail -40 /data/solve.log"
+    echo "  gcloud compute ssh $VM --zone $ZONE -- tail -40 \~/solve.log"
   fi
   cpu=$(echo "$hb" | python3 -c "import json,sys; print(float(json.load(sys.stdin)['solver_cpu_pct'] or 0))")
   if [ "$state" = "RUNNING" ] && python3 -c "exit(0 if $cpu < 500 else 1)"; then

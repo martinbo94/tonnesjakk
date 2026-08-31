@@ -3,8 +3,10 @@
 set -euxo pipefail
 BUCKET=${BUCKET:?set BUCKET=gs://...}
 # All output to a persistent log (survives ssh drops; heartbeat ships it out).
-mkdir -p /data 2>/dev/null || sudo mkdir -p /data
-exec > >(tee -a /data/solve.log) 2>&1
+# NOT under /data: the data disk is mounted over /data later and would shadow
+# an already-open log file there.
+LOG=$HOME/solve.log
+exec > >(tee -a $LOG) 2>&1
 
 # ── Heartbeat: every 2 min push status JSON + log tail to the bucket, so
 # progress/stuck/failure is visible from anywhere with `gsutil cat`. ──
@@ -25,7 +27,7 @@ print(json.dumps({
 }))
 PY
     gsutil -q cp /tmp/status.json $BUCKET/status/latest.json 2>/dev/null || true
-    tail -40 /data/solve.log > /tmp/log_tail.txt 2>/dev/null || true
+    tail -40 $LOG > /tmp/log_tail.txt 2>/dev/null || true
     gsutil -q cp /tmp/log_tail.txt $BUCKET/status/log_tail.txt 2>/dev/null || true
     sleep 120
   done
@@ -71,7 +73,7 @@ print(f'${wr}v${br}: {n:,} states - white {100*w/v:.2f}%, black {100*b/v:.2f}%, 
 }
 solve 4 3
 solve 4 4
-echo "ALL PHASES SOLVED at $(date -u +%FT%TZ)" && gsutil -q cp /data/solve.log $BUCKET/status/solve_complete.log
+echo "ALL PHASES SOLVED at $(date -u +%FT%TZ)" && gsutil -q cp $LOG $BUCKET/status/solve_complete.log
 # The answer:
 python3 -c "
 from tonnesjakk import Engine, Board
