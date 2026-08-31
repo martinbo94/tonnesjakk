@@ -14,7 +14,10 @@ Peak RSS: 4v3 ≈ 115 GB; 4v4 ≈ 400 GB.
 
 ## Machine
 
-- `n2-highmem-128` (128 vCPU, 864 GB), **spot** (~$0.83/h us-central1; on-demand $7.71/h).
+- `n2-highmem-128` (128 vCPU, 864 GB), **spot**. Cheapest spot regions (catalog, 2026-08-31):
+  northamerica-northeast2 **$0.76/h**, us-west8 $0.80, asia-south2 $0.83, europe-west8 $0.93
+  (on-demand $7.71/h us-central1; the org's negotiated ~26% + SUD apply to on-demand only,
+  so spot beats the discounted rate ~7x). Try Toronto first, fall back on stockout.
   The solver checkpoints every pass and resumes from `tb_*.p2.partial`, so
   preemption costs at most one pass. `c3-highmem-88` (704 GB) also fits.
 - Boot disk 50 GB + `pd-balanced` data disk 700 GB (~$56/mo, prorated).
