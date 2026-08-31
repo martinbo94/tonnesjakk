@@ -582,6 +582,11 @@ impl Engine {
     #[setter]
     fn set_use_countermove(&mut self, value: i32) { self.inner.use_countermove = value; }
 
+    #[getter]
+    fn singular_margin(&self) -> i32 { self.inner.singular_margin }
+    #[setter]
+    fn set_singular_margin(&mut self, value: i32) { self.inner.singular_margin = value; }
+
     /// Load NNUE weights from JSON file
     /// After loading, the engine will use NNUE for evaluation instead of heuristics
     fn load_nnue(&mut self, path: &str) -> PyResult<()> {
@@ -871,6 +876,7 @@ pub struct BitBoardEngine {
     pub lmr_hist_bad: i32,     // history below this: one more reduction
     pub iir_depth: i32,        // internal iterative reduction from this depth (no TT move)
     pub use_countermove: i32,  // 0 = off (A/B gate)
+    pub singular_margin: i32,  // 0 = off: singular-extension exclusion margin (cp)
 }
 
 fn build_lmr_table(div_x100: i32) -> [[u8; 64]; 32] {
@@ -894,7 +900,7 @@ impl Default for BitBoardEngine {
 
 impl BitBoardEngine {
     pub fn new() -> Self {
-        let lmr_table = build_lmr_table(101);
+        let lmr_table = build_lmr_table(95);
 
         BitBoardEngine {
             nodes_searched: 0,
@@ -947,24 +953,25 @@ impl BitBoardEngine {
             // (scripts/results/spsa_search_net3.json). Tuned vs previous
             // defaults, same net both sides: +60 [+40,+79] @ 100ms (600 games),
             // +54 [+32,+77] @ 200ms (400 games). Previous values in comments.
-            rfp_margin: 63,  // was 0 (SPRT vs heuristic eval inconclusive at 120)
+            rfp_margin: 77,  // pass-1 63; pass-2 confirmed +14 [+1,+27] over 1200 games
             // LMP: SPRT PASS @ 50ms (+27 [+10,+45]); @ 200ms accepted on CI
             // (+14 [+3,+26] over 1600 games; two independent LTC runs +16/+14).
-            lmp_base: 7,     // was 6
+            lmp_base: 9,     // was 6 (pass 1: 7)
             // qs_mode 2 PASSED both gates: +53 [+28,+78] @ 50ms, +62 [+35,+91]
             // @ 200ms vs legacy; beats qs_mode 1 head-to-head +29 [+11,+47].
             qs_mode: 2,
-            asp_delta: 29,          // was 30
-            razor_base: 198,        // was 200
-            razor_slope: 137,       // was 150
-            nmp_margin: 49,         // was 50
-            nmp_boost_margin: 161,  // was 150
-            fut_scale: 104,         // was 100
-            lmr_div: 101,           // was 100
-            lmr_hist_good: 877,     // was 1000
-            lmr_hist_bad: -559,     // was -500
-            iir_depth: 3,           // was 4
+            asp_delta: 28,          // was 30
+            razor_base: 190,        // was 200
+            razor_slope: 139,       // was 150
+            nmp_margin: 48,         // was 50
+            nmp_boost_margin: 170,  // was 150
+            fut_scale: 101,         // was 100
+            lmr_div: 95,            // was 100
+            lmr_hist_good: 829,     // was 1000
+            lmr_hist_bad: -486,     // was -500
+            iir_depth: 2,           // was 4 (pass 1: 3)
             use_countermove: 0,
+            singular_margin: 0,
         }
     }
 
@@ -1993,6 +2000,65 @@ impl BitBoardEngine {
 
         let sorted_moves = self.order_moves(moves, bb.current_player, depth as usize, tt_move.as_ref());
 
+        // The wrapper pushed this node's hash before calling us.
+        let is_root = self.path_hashes.len() == 1;
+
+        // ═══════════════════════════════════════════════════════════════
+        // SINGULAR EXTENSION (gated: singular_margin == 0 → off)
+        // ═══════════════════════════════════════════════════════════════
+        // If a deep-enough TT bound says the TT move's score cannot even be
+        // approached by ANY alternative in a reduced exclusion search, the TT
+        // move is singular: extend it by one ply. Scores are White-absolute,
+        // so the bound direction depends on who is to move.
+        let mut singular_ext: u8 = 0;
+        if self.singular_margin > 0
+            && depth >= 7
+            && (depth as usize) < MAX_DEPTH - 1
+            && !is_root
+            && !is_pail_position
+        {
+            if let Some((tt_depth, tt_score, tt_flag, Some(tt_mv))) = tt_result {
+                let bound_usable = match tt_flag {
+                    TTFlag::Exact => true,
+                    TTFlag::LowerBound => maximizing,   // floor for the maximizer
+                    TTFlag::UpperBound => !maximizing,  // ceiling for the minimizer
+                };
+                if bound_usable && tt_depth + 2 >= depth && tt_score.abs() < WIN_BOUND {
+                    let sdepth = ((depth - 1) / 2).max(1);
+                    let sb = if maximizing { tt_score - self.singular_margin } else { tt_score + self.singular_margin };
+                    let mut refuted = false;
+                    let saved_prev = self.prev_move;
+                    for mv in &sorted_moves {
+                        if mv.packed == tt_mv.packed { continue; }
+                        let mut child = *bb;
+                        child.make_move(mv);
+                        if let Some(ref net) = self.nnue {
+                            self.dual_acc_stack.push();
+                            net.update(bb, &child, self.dual_acc_stack.current_mut());
+                        }
+                        self.prev_move = Some(*mv);
+                        let cmax = child.current_player == Player::White;
+                        let (sc, _) = if maximizing {
+                            self.minimax(&child, sdepth, sb - 1, sb, cmax)
+                        } else {
+                            self.minimax(&child, sdepth, sb, sb + 1, cmax)
+                        };
+                        if self.nnue.is_some() {
+                            self.dual_acc_stack.pop();
+                        }
+                        if (maximizing && sc >= sb) || (!maximizing && sc <= sb) {
+                            refuted = true;
+                            break;
+                        }
+                    }
+                    self.prev_move = saved_prev;
+                    if !refuted {
+                        singular_ext = 1;
+                    }
+                }
+            }
+        }
+
         let mut best_move = None;
         let mut best_score = if maximizing { i32::MIN + 1 } else { i32::MAX - 1 };
         let mut moves_searched = 0;
@@ -2007,9 +2073,6 @@ impl BitBoardEngine {
         } else {
             usize::MAX
         };
-        // The wrapper pushed this node's hash before calling us.
-        let is_root = self.path_hashes.len() == 1;
-
         for mv in sorted_moves {
             // Move-count / futility skips assume the moves already searched
             // are representative. When every move so far is a proven loss the
@@ -2068,7 +2131,9 @@ impl BitBoardEngine {
                 // ═══════════════════════════════════════════════════════════════
                 // PVS: Første trekk - fullt vindu (Principal Variation)
                 // ═══════════════════════════════════════════════════════════════
-                let (s, _) = self.minimax(&new_bb, depth - 1, alpha, beta, child_maximizing);
+                let ext = if singular_ext > 0
+                    && tt_move.as_ref().map(|m| m.packed) == Some(mv.packed) { 1 } else { 0 };
+                let (s, _) = self.minimax(&new_bb, depth - 1 + ext, alpha, beta, child_maximizing);
                 score = s;
             } else {
                 // ═══════════════════════════════════════════════════════════════

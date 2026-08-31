@@ -55,18 +55,18 @@ EVAL_PARAMS = {
 # 2026-08-27 with net-3 @ 100ms, a=6 c=2: +60/+54 Elo vs the hand-tuned
 # values). Run with --nnue and a time control: pruning trades depth for accuracy.
 SEARCH_PARAMS = {
-    "asp_delta":        (29,   8,   5,  200),
-    "razor_base":       (198, 40,   0,  800),
-    "razor_slope":      (137, 30,   0,  600),
-    "nmp_margin":       (49,  15, -200, 400),
-    "nmp_boost_margin": (161, 30,   0,  800),
-    "fut_scale":        (104, 15,  20,  300),
-    "lmr_div":          (101, 12,  40,  300),
-    "lmr_hist_good":    (877, 200, 0, 5000),
-    "lmr_hist_bad":     (-559, 150, -5000, 0),
-    "lmp_base":         (7,   2,   1,   30),
-    "rfp_margin":       (63,  30,  0,  400),
-    "iir_depth":        (3,   1,   2,   12),
+    "asp_delta":        (28,   8,   5,  200),
+    "razor_base":       (190, 40,   0,  800),
+    "razor_slope":      (139, 30,   0,  600),
+    "nmp_margin":       (48,  15, -200, 400),
+    "nmp_boost_margin": (170, 30,   0,  800),
+    "fut_scale":        (101, 15,  20,  300),
+    "lmr_div":          (95, 12,  40,  300),
+    "lmr_hist_good":    (829, 200, 0, 5000),
+    "lmr_hist_bad":     (-486, 150, -5000, 0),
+    "lmp_base":         (9,   2,   1,   30),
+    "rfp_margin":       (77,  30,  0,  400),
+    "iir_depth":        (2,   1,   2,   12),
 }
 
 PARAMS = EVAL_PARAMS  # selected in main() via --params
