@@ -587,6 +587,11 @@ impl Engine {
     #[setter]
     fn set_singular_margin(&mut self, value: i32) { self.inner.singular_margin = value; }
 
+    #[getter]
+    fn singular_depth(&self) -> i32 { self.inner.singular_depth }
+    #[setter]
+    fn set_singular_depth(&mut self, value: i32) { self.inner.singular_depth = value; }
+
     /// Load NNUE weights from JSON file
     /// After loading, the engine will use NNUE for evaluation instead of heuristics
     fn load_nnue(&mut self, path: &str) -> PyResult<()> {
@@ -877,6 +882,7 @@ pub struct BitBoardEngine {
     pub iir_depth: i32,        // internal iterative reduction from this depth (no TT move)
     pub use_countermove: i32,  // 0 = off (A/B gate)
     pub singular_margin: i32,  // 0 = off: singular-extension exclusion margin (cp)
+    pub singular_depth: i32,   // minimum depth for the singular check
 }
 
 fn build_lmr_table(div_x100: i32) -> [[u8; 64]; 32] {
@@ -972,6 +978,7 @@ impl BitBoardEngine {
             iir_depth: 2,           // was 4 (pass 1: 3)
             use_countermove: 0,
             singular_margin: 0,
+            singular_depth: 7,
         }
     }
 
@@ -2012,7 +2019,7 @@ impl BitBoardEngine {
         // so the bound direction depends on who is to move.
         let mut singular_ext: u8 = 0;
         if self.singular_margin > 0
-            && depth >= 7
+            && depth as i32 >= self.singular_depth
             && (depth as usize) < MAX_DEPTH - 1
             && !is_root
             && !is_pail_position
