@@ -42,7 +42,7 @@ fi
 sudo mkdir -p /data
 mountpoint -q /data || sudo mount /dev/disk/by-id/google-data /data
 sudo chown $USER /data
-sudo apt-get update -qq && sudo apt-get install -y -qq git curl zstd build-essential python3-venv python3-pip
+sudo apt-get update -qq && sudo apt-get install -y -qq git curl zstd build-essential python3-venv python3-pip pkg-config libssl-dev
 command -v cargo >/dev/null || (curl -sSf https://sh.rustup.rs | sh -s -- -y); source "$HOME/.cargo/env"
 # Source: private repo -> a tarball in the bucket (uploaded by the runbook's step 0)
 if [ ! -d /data/tonnesjakk ]; then
