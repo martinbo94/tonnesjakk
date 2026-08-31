@@ -99,6 +99,13 @@ fn solve_tablebase(py: Python, dir: &str, wr: usize, br: usize, verbose: bool) -
     Ok(stats)
 }
 
+/// (states, disjoint_pairs, array_bytes, pair_table_bytes) of a packed phase,
+/// computed without allocating it.
+#[pyfunction]
+fn packed_phase_stats(py: Python, wr: usize, br: usize) -> (u64, u64, u64, u64) {
+    py.allow_threads(|| tablebase::packed_phase_stats(wr, br))
+}
+
 /// Write the 2-bit WDL companion (`tb_{wr}v{br}.wdl`) of a solved full phase.
 #[pyfunction]
 fn repack_tablebase_wdl(py: Python, dir: &str, wr: usize, br: usize) -> PyResult<usize> {
@@ -148,6 +155,7 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(solve_tablebase, m)?)?;
     m.add_function(wrap_pyfunction!(solve_tablebase_packed, m)?)?;
     m.add_function(wrap_pyfunction!(repack_tablebase_wdl, m)?)?;
+    m.add_function(wrap_pyfunction!(packed_phase_stats, m)?)?;
     m.add_class::<Player>()?;
     m.add_class::<Cell>()?;
     m.add_class::<Position>()?;

@@ -415,6 +415,35 @@ fn decode_pails(local: usize, free: u64, f: usize) -> (u64, u64, bool) {
     }
 }
 
+/// State count and memory footprint of a packed phase WITHOUT allocating its
+/// data array (4v4's array alone is ~340 GB). Returns
+/// (states, disjoint_pairs, array_bytes, pair_table_bytes).
+pub fn packed_phase_stats(wr: usize, br: usize) -> (u64, u64, u64, u64) {
+    let symmetric = wr == br;
+    let wcfg = ConfigSpace::new(Player::White, wr);
+    let bcfg = ConfigSpace::new(Player::Black, br);
+    let wc = wcfg.count as usize;
+    let bc = bcfg.count as usize;
+    let wmasks: Vec<u64> = (0..wc).map(|i| wcfg.unrank(i as u64)).collect();
+    let bmasks: Vec<u64> = (0..bc).map(|i| bcfg.unrank(i as u64)).collect();
+    let sides = if symmetric { 1u64 } else { 2 };
+    let mut states = 0u64;
+    let mut pairs = 0u64;
+    for wi in 0..wc {
+        let w = wmasks[wi];
+        for bi in 0..bc {
+            let b = bmasks[bi];
+            if w & b != 0 { continue; }
+            let f = NUM_SQUARES - (w | b).count_ones() as usize;
+            states += sides * pail_combos(f) as u64;
+            pairs += 1;
+        }
+    }
+    let array_bytes = (states + 3) / 4;
+    let pair_table_bytes = (wc as u64 * bc as u64) * 8 + pairs * 12; // pair_offset + pair_start/pair_id
+    (states, pairs, array_bytes, pair_table_bytes)
+}
+
 impl PackedPhase {
     pub fn new(wr: usize, br: usize) -> Self {
         let symmetric = wr == br;
