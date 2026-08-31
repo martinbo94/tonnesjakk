@@ -577,6 +577,11 @@ impl Engine {
     #[setter]
     fn set_iir_depth(&mut self, value: i32) { self.inner.iir_depth = value; }
 
+    #[getter]
+    fn use_countermove(&self) -> i32 { self.inner.use_countermove }
+    #[setter]
+    fn set_use_countermove(&mut self, value: i32) { self.inner.use_countermove = value; }
+
     /// Load NNUE weights from JSON file
     /// After loading, the engine will use NNUE for evaluation instead of heuristics
     fn load_nnue(&mut self, path: &str) -> PyResult<()> {
@@ -765,6 +770,8 @@ pub struct BitBoardEngine {
 
     // Killer moves
     killer_moves: [[Option<BitMove>; 2]; MAX_DEPTH],
+    /// Countermove heuristic: the move that last refuted (prev from, prev to).
+    countermove: [[u32; NUM_SQUARES]; NUM_SQUARES],
 
     // History heuristic: [from_sq][to_sq] -> bonus score
     // Tracks which moves historically cause cutoffs
@@ -863,6 +870,7 @@ pub struct BitBoardEngine {
     pub lmr_hist_good: i32,    // history above this: one less reduction
     pub lmr_hist_bad: i32,     // history below this: one more reduction
     pub iir_depth: i32,        // internal iterative reduction from this depth (no TT move)
+    pub use_countermove: i32,  // 0 = off (A/B gate)
 }
 
 fn build_lmr_table(div_x100: i32) -> [[u8; 64]; 32] {
@@ -897,6 +905,7 @@ impl BitBoardEngine {
             tt: TranspositionTable::new(TT_SIZE),
             eval_cache: EvalCache::new(),
             killer_moves: std::array::from_fn(|_| [None, None]),
+            countermove: [[0u32; NUM_SQUARES]; NUM_SQUARES],
             history: [[0; NUM_SQUARES]; NUM_SQUARES],
             cont_history: [[0i32; NUM_SQUARES]; NUM_SQUARES],
             prev_move: None,
@@ -955,6 +964,7 @@ impl BitBoardEngine {
             lmr_hist_good: 877,     // was 1000
             lmr_hist_bad: -559,     // was -500
             iir_depth: 3,           // was 4
+            use_countermove: 0,
         }
     }
 
@@ -967,6 +977,7 @@ impl BitBoardEngine {
     pub fn clear_history(&mut self) {
         self.history = [[0; NUM_SQUARES]; NUM_SQUARES];
         self.cont_history = [[0i32; NUM_SQUARES]; NUM_SQUARES];
+        self.countermove = [[0u32; NUM_SQUARES]; NUM_SQUARES];
         self.correction_history = [0i32; CORRECTION_TABLE_SIZE];
         self.prev_move = None;
     }
@@ -1335,6 +1346,18 @@ impl BitBoardEngine {
             if let Some(ref k2) = self.killer_moves[depth][1] {
                 if mv.packed == k2.packed {
                     score += 4_000;
+                }
+            }
+        }
+
+        // Countermove: the move that last refuted the previous move
+        // (just below the killers; gated on use_countermove for A/B)
+        if self.use_countermove != 0 && mv.packed != 0 {
+            if let Some(ref pm) = self.prev_move {
+                if let Some(pf) = pm.barrel_from() {
+                    if self.countermove[pf as usize][pm.barrel_to() as usize] == mv.packed {
+                        score += 4_500;
+                    }
                 }
             }
         }
@@ -2124,6 +2147,9 @@ impl BitBoardEngine {
                             self.cont_history[prev_to][curr_to] += bonus;
                             self.cont_history[prev_to][curr_to] =
                                 self.cont_history[prev_to][curr_to].clamp(-32000, 32000);
+                            if let Some(pf) = pm.barrel_from() {
+                                self.countermove[pf as usize][prev_to] = mv.packed;
+                            }
                         }
                     }
                     self.cutoffs += 1;
@@ -2147,6 +2173,9 @@ impl BitBoardEngine {
                             self.cont_history[prev_to][curr_to] += bonus;
                             self.cont_history[prev_to][curr_to] =
                                 self.cont_history[prev_to][curr_to].clamp(-32000, 32000);
+                            if let Some(pf) = pm.barrel_from() {
+                                self.countermove[pf as usize][prev_to] = mv.packed;
+                            }
                         }
                     }
                     self.cutoffs += 1;
