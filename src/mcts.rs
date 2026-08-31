@@ -31,6 +31,21 @@ impl OnnxSession {
     #[new]
     #[pyo3(signature = (path, use_coreml=false))]
     fn new(path: &str, use_coreml: bool) -> PyResult<Self> {
+        // CoreML is a macOS-only execution provider; on other targets the
+        // symbol does not exist in `ort`, so the branch is compiled out and
+        // use_coreml falls through to the CPU session.
+        #[cfg(not(target_os = "macos"))]
+        let use_coreml = false;
+        #[cfg(not(target_os = "macos"))]
+        let session = if use_coreml {
+            unreachable!()
+        } else {
+            ort::session::Session::builder()
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("ONNX session builder error: {e}")))?
+                .commit_from_file(path)
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("ONNX load error: {e}")))?
+        };
+        #[cfg(target_os = "macos")]
         let session = if use_coreml {
             ort::session::Session::builder()
                 .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("ONNX session builder error: {e}")))?
