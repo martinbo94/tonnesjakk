@@ -38,6 +38,9 @@ Budget with margin for a re-run: **$60 spot**.
 ## Steps
 
 ```bash
+# -1. once: a bucket in the same region as the VM
+gsutil mb -l northamerica-northeast2 gs://BUCKET
+
 # 0. locally: upload prerequisites (ingress is free; ~30 GB)
 zstd -3 -T0 tablebases/tb_4v2.p2 tablebases/tb_3v3.p2 tablebases/*.wdl
 gsutil -m cp tablebases/*.zst gs://BUCKET/tb/
