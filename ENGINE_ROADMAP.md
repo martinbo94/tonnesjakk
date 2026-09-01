@@ -775,7 +775,10 @@ a distance table does not.
 Nearly double v4: with ≤ 7 barrels remaining solved, probes fire in the heart
 of the midgame. Termination mix shifts toward no_progress draws (16–20 per
 run) — theoretical draws held by shuffling, as designed. Tablebase ledger:
-v2 +16/+23 (≤ 5 remaining) → v4 +25/+32 (+3v3) → v5 +46/+47 (+4v2). Archives: `tb_ab_v1_*` (buggy root), `tb_ab_v2_*`
+v2 +16/+23 (≤ 5 remaining) → v4 +25/+32 (+3v3) → v5 +46/+47 (+4v2) →
+**v6 +87 [+72, +102] @ 100 ms / +71 [+56, +87] @ 200 ms (+4v3, 2026-09-01)**:
+with ≤ 7 remaining solved, the tablebase answers every position after the
+first score — nearly half of the deployed engine's edge now comes from it. Archives: `tb_ab_v1_*` (buggy root), `tb_ab_v2_*`
 (through 3v2), `tb_ab_v3_*` (3v3 exact), current = `tb_ab_*ms.json`.
 
 RFP ablation for the search re-tune: old constants + `rfp_margin=63` vs old
