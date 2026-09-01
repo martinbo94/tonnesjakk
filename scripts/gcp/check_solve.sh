@@ -10,15 +10,15 @@ VM=${VM:-tb-solver}
 state=$(gcloud compute instances describe "$VM" --zone "$ZONE" --format="value(status)" 2>/dev/null || echo "ABSENT")
 echo "instance: $state"
 
-if gsutil -q stat "$BUCKET/status/exit.txt" 2>/dev/null; then
-  echo "exit marker: $(gsutil cat "$BUCKET/status/exit.txt")"
+if gcloud storage ls "$BUCKET/status/exit.txt" >/dev/null 2>&1; then
+  echo "exit marker: $(gcloud storage cat "$BUCKET/status/exit.txt")"
 fi
-if gsutil -q stat "$BUCKET/status/solve_complete.log" 2>/dev/null; then
+if gcloud storage ls "$BUCKET/status/solve_complete.log" >/dev/null 2>&1; then
   echo "*** SOLVE COMPLETE — full log at $BUCKET/status/solve_complete.log ***"
 fi
 
-if gsutil -q stat "$BUCKET/status/latest.json" 2>/dev/null; then
-  hb=$(gsutil cat "$BUCKET/status/latest.json")
+if gcloud storage ls "$BUCKET/status/latest.json" >/dev/null 2>&1; then
+  hb=$(gcloud storage cat "$BUCKET/status/latest.json")
   echo "heartbeat: $hb"
   ts=$(echo "$hb" | python3 -c "import json,sys,time,calendar; d=json.load(sys.stdin); print(int(time.time()-calendar.timegm(time.strptime(d['ts'],'%Y-%m-%dT%H:%M:%SZ'))))")
   echo "heartbeat age: ${ts}s"
@@ -34,7 +34,7 @@ else
   echo "no heartbeat yet"
 fi
 echo "--- log tail ---"
-gsutil cat "$BUCKET/status/log_tail.txt" 2>/dev/null | tail -15 || echo "(none)"
+gcloud storage cat "$BUCKET/status/log_tail.txt" 2>/dev/null | tail -15 || echo "(none)"
 
 if [ "${1:-}" = "--restart" ] && { [ "$state" = "TERMINATED" ] || [ "$state" = "STOPPED" ]; }; then
   echo "restarting preempted VM and relaunching the solve..."
