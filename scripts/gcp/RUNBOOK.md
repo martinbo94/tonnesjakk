@@ -39,7 +39,7 @@ Budget with margin for a re-run: **$60 spot**.
 
 ```bash
 # -1. once: a bucket in the same region as the VM
-gsutil mb -l northamerica-northeast2 gs://BUCKET
+gcloud storage buckets create --location=northamerica-northeast2 gs://BUCKET
 
 # 0. locally: upload prerequisites (~1.2 GB compressed) and the source tarball
 #    (use gcloud storage, NOT gsutil: gsutil's legacy reauth path expires under
