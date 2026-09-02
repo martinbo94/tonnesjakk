@@ -41,25 +41,34 @@ Budget with margin for a re-run: **$60 spot**.
 # -1. once: a bucket in the same region as the VM
 gsutil mb -l northamerica-northeast2 gs://BUCKET
 
-# 0. locally: upload prerequisites (ingress is free; ~30 GB)
-zstd -3 -T0 tablebases/tb_4v2.p2 tablebases/tb_3v3.p2 tablebases/*.wdl
-gsutil -m cp tablebases/*.zst gs://BUCKET/tb/
+# 0. locally: upload prerequisites (~1.2 GB compressed) and the source tarball
+#    (use gcloud storage, NOT gsutil: gsutil's legacy reauth path expires under
+#     the org session policy and cannot re-auth non-interactively)
+zstd -3 -T0 -k tablebases/tb_4v2.p2 tablebases/tb_3v3.p2
+gcloud storage cp tablebases/tb_4v2.p2.zst tablebases/tb_3v3.p2.zst gs://BUCKET/tb/
+git archive --format=tar.gz -o /tmp/tonnesjakk-src.tar.gz HEAD
+gcloud storage cp /tmp/tonnesjakk-src.tar.gz gs://BUCKET/src/
 
-# 1. create the VM (spot)
+# 1. create the VM (spot). --scopes is REQUIRED (default scopes are storage
+#    read-only and the result upload fails after the solve).
 gcloud compute instances create tb-solver \
   --machine-type=n2-highmem-128 --provisioning-model=SPOT \
   --instance-termination-action=STOP \
+  --scopes=cloud-platform \
+  --boot-disk-size=50GB \
   --create-disk=size=900GB,type=pd-balanced,auto-delete=yes,device-name=data \
-  # >= 2x the biggest phase array: the atomic checkpoint's .tmp and .partial
-  # coexist, plus lower tables and the final save. (A 500GB disk hit 0 free
-  # mid-4v4; pd-balanced resizes online: gcloud compute disks resize + resize2fs.) \
-  --image-family=debian-12 --image-project=debian-cloud --zone=us-central1-a
+  --image-family=debian-12 --image-project=debian-cloud \
+  --zone=northamerica-northeast2-a   # cheapest spot; fall back us-west8-a / us-central1-a
+# data-disk sizing: >= 2x the biggest phase array (the atomic checkpoint's .tmp
+# and .partial coexist) + lower tables + the final save. A 500 GB disk hit
+# 0 free mid-4v4; pd-balanced resizes ONLINE: gcloud compute disks resize +
+# sudo resize2fs /dev/disk/by-id/google-data.
 
-# 2. launch DETACHED (survives ssh drops): vm_solve.sh does everything
-#    (deps, source tarball, download tables, solve 4v3 -> 4v4 with
-#     checkpoint-every-pass, stats, zstd, upload results) and ships a
-#     heartbeat + log tail to gs://BUCKET/status/ every 2 minutes.
-gcloud compute scp scripts/gcp/vm_solve.sh tb-solver:~ --zone $ZONE
+# 2. launch DETACHED (survives ssh drops). vm_solve.sh is idempotent (re-run
+#    after preemption; refuses to double-start a solver) and starts
+#    heartbeat.sh, which ships status JSON + log tail to gs://BUCKET/status/
+#    every 2 minutes independent of the solve's lifecycle.
+gcloud compute scp scripts/gcp/vm_solve.sh scripts/gcp/heartbeat.sh tb-solver:~ --zone $ZONE
 gcloud compute ssh tb-solver --zone $ZONE -- \
   "BUCKET=gs://BUCKET nohup bash vm_solve.sh >/tmp/bootstrap.log 2>&1 & disown"
 
