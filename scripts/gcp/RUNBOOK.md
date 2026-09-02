@@ -49,7 +49,10 @@ gsutil -m cp tablebases/*.zst gs://BUCKET/tb/
 gcloud compute instances create tb-solver \
   --machine-type=n2-highmem-128 --provisioning-model=SPOT \
   --instance-termination-action=STOP \
-  --create-disk=size=700GB,type=pd-balanced,auto-delete=yes,device-name=data \
+  --create-disk=size=900GB,type=pd-balanced,auto-delete=yes,device-name=data \
+  # >= 2x the biggest phase array: the atomic checkpoint's .tmp and .partial
+  # coexist, plus lower tables and the final save. (A 500GB disk hit 0 free
+  # mid-4v4; pd-balanced resizes online: gcloud compute disks resize + resize2fs.) \
   --image-family=debian-12 --image-project=debian-cloud --zone=us-central1-a
 
 # 2. launch DETACHED (survives ssh drops): vm_solve.sh does everything
