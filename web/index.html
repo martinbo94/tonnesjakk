@@ -195,6 +195,8 @@
         .ml-move { cursor: pointer; padding: 1px 5px; border-radius: 3px; }
         .ml-move:hover { background: #3a3a5c; }
         .ml-cur { background: #4a5db0; color: #fff; }
+        .ml-var { color: #9aa7d0; }
+        #movelist { line-height: 1.9; }
         #info-panel h3 {
             margin-bottom: 15px;
             color: #4CAF50;
@@ -944,7 +946,7 @@
                 // Win label: exact "om N" where distance is stored (<=5 barrels),
                 // else "~N" from the race-distance progress proxy in the big phases.
                 const winTag = v => v.dist != null ? ' om ' + v.dist
-                    : (v.progress != null ? ' ~' + Math.round(v.progress % 1e6) : '');
+                    : (v.progress != null ? ' ~' + Math.round(v.progress) : '');
                 const label = v => v.verdict === 'draw' ? 'REMIS'
                     : rel(v) === 'win' ? 'VINN' + winTag(v)
                     : 'TAP' + (v.dist ? ' om ' + v.dist : '');
@@ -975,41 +977,61 @@
             } catch (e) { panel.style.display = 'none'; }
         }
 
-        async function loadHistory() {
+        // ── PGN-style move tree (mainline + variations). The server owns the
+        // tree; here we just render it and navigate by node id (no truncation).
+        let lastTree = null;
+
+        async function loadTree() {
             const panel = document.getElementById('movelist-panel');
-            if (!gameId) { panel.style.display = 'none'; return; }
+            if (!gameId || !exploreMode) { panel.style.display = 'none'; return; }
             try {
-                const data = await api(`/api/history/${gameId}`);
-                if (!data.moves.length) { panel.style.display = 'none'; return; }
+                const t = await api(`/api/tree/${gameId}`);
+                lastTree = t;
+                const root = t.nodes[String(t.root)];
+                if (!root || !root.children.length) { panel.style.display = 'none'; return; }
                 panel.style.display = 'block';
-                // pair into "N. white black" rows (a rare pail sub-move just adds
-                // a second chip to that side's cell)
-                const rows = []; let cur = null;
-                for (const m of data.moves) {
-                    if (m.side === 'white') {
-                        if (!cur || cur.black.length) { cur = { num: rows.length + 1, white: [], black: [] }; rows.push(cur); }
-                        cur.white.push(m);
-                    } else {
-                        if (!cur) { cur = { num: rows.length + 1, white: [], black: [] }; rows.push(cur); }
-                        cur.black.push(m);
-                    }
-                }
-                const chip = m => `<span class="ml-move${m.ply === data.current_ply ? ' ml-cur' : ''}" onclick="gotoPly(${m.ply})">${m.notation}</span>`;
                 const ml = document.getElementById('movelist');
-                ml.innerHTML = rows.map(r =>
-                    `<div class="ml-row"><span class="ml-num">${r.num}.</span>` +
-                    `<span class="ml-cell">${r.white.map(chip).join('')}</span>` +
-                    `<span class="ml-cell">${r.black.map(chip).join('')}</span></div>`).join('');
-                ml.scrollTop = ml.scrollHeight;
+                ml.innerHTML = renderVariation(t.nodes, t.root, 1, false, t.current);
+                const cur = ml.querySelector('.ml-cur');
+                if (cur) cur.scrollIntoView({ block: 'nearest' });
             } catch (e) { panel.style.display = 'none'; }
         }
 
-        async function gotoPly(ply) {
+        function mlChip(id, node, current) {
+            return `<span class="ml-move${id === current ? ' ml-cur' : ''}" onclick="gotoNode(${id})">${node.notation || '…'}</span> `;
+        }
+
+        // Recursive PGN rendering: mainline inline (following children[0]),
+        // sidelines in parentheses. `num` = full-move number of the next move;
+        // `afterBranch` forces an explicit "N…" before a black move after a break.
+        function renderVariation(nodes, nid, num, afterBranch, current) {
+            let html = '';
+            let node = nodes[String(nid)];
+            while (node.children.length) {
+                const kids = node.children;
+                const m = nodes[String(kids[0])];
+                if (m.side === 'white') { html += `<span class="ml-num">${num}.</span> `; afterBranch = false; }
+                else if (afterBranch) { html += `<span class="ml-num">${num}…</span> `; afterBranch = false; }
+                html += mlChip(kids[0], m, current);
+                for (let k = 1; k < kids.length; k++) {
+                    const s = nodes[String(kids[k])];
+                    const head = `<span class="ml-num">${num}${s.side === 'white' ? '.' : '…'}</span> `;
+                    const nextNum = s.side === 'black' ? num + 1 : num;
+                    const cont = renderVariation(nodes, kids[k], nextNum, s.side === 'white', current);
+                    html += `<span class="ml-var">( ${head}${mlChip(kids[k], s, current)}${cont})</span> `;
+                    afterBranch = true;
+                }
+                if (m.side === 'black') num += 1;
+                node = m;
+            }
+            return html;
+        }
+
+        async function gotoNode(id) {
             try {
-                const data = await api(`/api/goto/${gameId}`, 'POST', { ply });
+                const data = await api(`/api/goto-node/${gameId}`, 'POST', { node_id: id });
                 gameState = data.state; validMoves = data.valid_moves;
-                moveHistory = moveHistory.slice(0, ply + 1);
-                resetSelection(); renderBoard(); updateStatus(); loadExplorer(); loadHistory();
+                resetSelection(); renderBoard(); updateStatus(); loadExplorer(); loadTree();
             } catch (e) { alert('Feil: ' + e.message); }
         }
 
@@ -1123,7 +1145,7 @@
         // Update status display
         function updateStatus() {
             setTimeout(loadExplorer, 0);
-            setTimeout(loadHistory, 0);
+            setTimeout(loadTree, 0);
             if (exploreMode && gameState && !gameState.winner) {
                 playerColor = gameState.current_player;   // drive both sides
             }
@@ -1141,7 +1163,7 @@
 
             // Show/hide game replay controls
             const replayCtrl = document.getElementById('game-replay-controls');
-            if (gameState.winner && moveHistory.length > 1) {
+            if (gameState.winner && moveHistory.length > 1 && !exploreMode) {
                 replayCtrl.style.display = 'flex';
                 historyViewIndex = moveHistory.length - 1;  // Start at final position
                 updateGameReplayLabel();
@@ -2077,6 +2099,20 @@
 
         // Keyboard navigation
         document.addEventListener('keydown', (e) => {
+            // Explore mode: step the move tree (parent / mainline child)
+            if (exploreMode && lastTree) {
+                const nodes = lastTree.nodes, cur = String(lastTree.current);
+                if (e.key === 'ArrowLeft') {
+                    const p = nodes[cur].parent;
+                    if (p !== null && p !== undefined) { e.preventDefault(); gotoNode(p); }
+                    return;
+                }
+                if (e.key === 'ArrowRight') {
+                    const ch = nodes[cur].children;
+                    if (ch && ch.length) { e.preventDefault(); gotoNode(ch[0]); }
+                    return;
+                }
+            }
             // Game replay (post-game)
             if (gameState && gameState.winner && moveHistory.length > 1) {
                 switch (e.key) {

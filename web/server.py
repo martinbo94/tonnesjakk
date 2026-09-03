@@ -182,6 +182,7 @@ def new_game(req: NewGameRequest):
             raise HTTPException(status_code=400, detail=f"Failed to load AlphaZero model: {e}")
 
     games[game_id] = game_data
+    _init_tree(game_data)
 
     engine_label = req.engine_type
     if req.engine_type == "alphazero":
@@ -267,9 +268,15 @@ def explore(game_id: str):
         if cd["terminal"]:
             return 0.0
         if cd["dist"] is not None:
-            return float(cd["dist"])            # exact plies to win
-        rd = ex.race_distances(child)           # (white, black) lone-side distance
-        return 1e6 + (rd[0] if mover == "white" else rd[1])
+            return float(cd["dist"])            # exact plies-to-win
+        # Big WDL phase: no stored distance. Estimate plies from the single-agent
+        # race lower bound (2*race - parity), on the SAME scale as exact "om N"
+        # so a genuinely shorter proxy line is not buried under a longer exact
+        # one. It is a lower-bound estimate, hence the "~" in the UI.
+        rd = ex.race_distances(child)
+        rw = rd[0] if mover == "white" else rd[1]
+        wtm = ("white" if "White" in repr(child.current_player) else "black") == mover
+        return float(2 * rw - (1 if wtm else 0))
 
     rows = []
     for m in board.generate_moves():
@@ -370,6 +377,7 @@ def make_move(req: MoveRequest):
 
     board.make_move(matching_move)
     game["board_history"].append(board.copy())
+    _sync_tree(game)
 
     # Returner state etter spillerens trekk (IKKE AI-trekk enna)
     draw = _draw_status(game)
@@ -598,6 +606,89 @@ def _format_move(move) -> str:
     return move_str
 
 
+# ---------------------------------------------------------------------------
+# Move tree (PGN-style: mainline + variations, navigate without truncating)
+# The server owns the tree because the Board snapshots live here; the client
+# renders it and navigates by node id. Nodes are matched by resulting-position
+# hash, so replaying an existing move re-enters its node instead of branching.
+# ---------------------------------------------------------------------------
+
+def _init_tree(game: dict) -> None:
+    b0 = game["board_history"][0]
+    game["tree"] = {
+        "nodes": {0: {"parent": None, "depth": 0, "notation": "", "side": None, "children": []}},
+        "boards": {0: b0.copy()},
+        "current": 0,
+        "next_id": 1,
+    }
+
+
+def _sync_tree(game: dict) -> None:
+    """Fold any snapshots appended to board_history since the current node into
+    the tree (one node per make_move), advancing `current`. New moves branch;
+    replayed moves re-enter the existing child."""
+    tree = game.get("tree")
+    if tree is None:
+        return
+    hist = game["board_history"]
+    node = tree["current"]
+    depth = tree["nodes"][node]["depth"]
+    for i in range(depth + 1, len(hist)):
+        h = hist[i].get_hash()
+        parent = node
+        child = next((c for c in tree["nodes"][parent]["children"]
+                      if tree["boards"][c].get_hash() == h), None)
+        if child is None:
+            nid = tree["next_id"]; tree["next_id"] += 1
+            nm = _derive_move(hist[i - 1], hist[i])
+            tree["nodes"][nid] = {"parent": parent, "depth": i,
+                                  "notation": nm["notation"], "side": nm["side"], "children": []}
+            tree["boards"][nid] = hist[i].copy()
+            tree["nodes"][parent]["children"].append(nid)
+            child = nid
+        node = child
+    tree["current"] = node
+
+
+@app.get("/api/tree/{game_id}")
+def get_tree(game_id: str):
+    if game_id not in games:
+        raise HTTPException(status_code=404, detail="Spill ikke funnet")
+    tree = games[game_id].get("tree")
+    if tree is None:
+        return {"nodes": {}, "current": 0, "root": 0}
+    nodes = {str(nid): {"parent": nd["parent"], "notation": nd["notation"],
+                        "side": nd["side"], "children": nd["children"]}
+             for nid, nd in tree["nodes"].items()}
+    return {"nodes": nodes, "current": tree["current"], "root": 0}
+
+
+class GotoNodeRequest(BaseModel):
+    node_id: int
+
+
+@app.post("/api/goto-node/{game_id}")
+def goto_node(game_id: str, req: GotoNodeRequest):
+    """Set the live board to a tree node's position (no truncation)."""
+    if game_id not in games:
+        raise HTTPException(status_code=404, detail="Spill ikke funnet")
+    game = games[game_id]
+    tree = game.get("tree")
+    if tree is None or req.node_id not in tree["nodes"]:
+        raise HTTPException(status_code=400, detail="node not found")
+    # rebuild board_history along root -> node so future moves branch correctly
+    path = []
+    n = req.node_id
+    while n is not None:
+        path.append(tree["boards"][n])
+        n = tree["nodes"][n]["parent"]
+    path.reverse()
+    game["board_history"] = [b.copy() for b in path]
+    game["board"] = tree["boards"][req.node_id].copy()
+    tree["current"] = req.node_id
+    return {"state": board_to_dict(game["board"]), "valid_moves": get_valid_moves(game["board"])}
+
+
 @app.post("/api/ai-move/{game_id}")
 def ai_move(game_id: str):
     """La AI gjore sitt trekk."""
@@ -629,6 +720,7 @@ def ai_move(game_id: str):
         result["state"] = board_to_dict(board)
         result["valid_moves"] = get_valid_moves(board)
     result["draw"] = _draw_status(game)
+    _sync_tree(game)
 
     return result
 
