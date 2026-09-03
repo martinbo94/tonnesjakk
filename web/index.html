@@ -106,7 +106,23 @@
             padding: 10px;
             border-radius: 10px;
             box-shadow: 0 10px 30px rgba(0,0,0,0.5);
+            position: relative;   /* anchor for the flying-piece animation overlay */
         }
+
+        /* A barrel gliding along its move path (slides over the board, then the
+           real piece is rendered underneath it at the destination). */
+        .flying-piece {
+            position: absolute;
+            width: 46px;
+            height: 46px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            z-index: 30;
+            pointer-events: none;
+            filter: drop-shadow(0 3px 6px rgba(0,0,0,0.55));
+        }
+        .flying-piece svg { width: 100%; height: 100%; }
 
         .cell {
             width: 60px;
@@ -787,7 +803,13 @@
         let selectedBarrelAction = null;  // { type: 'place' } or { type: 'move', from: [r,c] }
         let phase = 'select-pail';  // 'select-pail', 'select-barrel', 'select-dest'
         let skipPail = false;  // User chose to skip pail placement this turn
-        let pendingMove = null;  // { from: [r,c], currentPos: [r,c], pieceVal: 1|-1 } during animation/optimistic render
+
+        // Move animation: while a barrel glides along its path we hide it from
+        // the board (animHide = the origin + destination squares to render empty)
+        // and slide a flying overlay piece over the top. animating blocks input.
+        let animHide = null;    // [[r,c], ...] squares rendered empty during a glide
+        let animating = false;  // true while a glide is in flight
+        let _flyEl = null;      // the flying overlay element
 
         let lastAiMove = null;
 
@@ -876,7 +898,6 @@
         function resetSelection() {
             selectedPailDest = null;
             selectedBarrelAction = null;
-            pendingMove = null;
             if (canPlacePail()) {
                 phase = 'select-pail';
                 skipPail = false;
@@ -1045,18 +1066,22 @@
                     barrel_from: m.barrel_from,
                     barrel_to: m.barrel_to
                 });
+                await glideMove(m);  // slide the barrel over the pre-move board
                 gameState = data.state;
                 validMoves = data.valid_moves;
                 moveHistory.push({ state: JSON.parse(JSON.stringify(data.state)), move: m, player: 'explorer' });
                 resetSelection();
+                commitGlide();
                 renderBoard();
                 updateStatus();
                 if (data.game_over) { loadExplorer(); return; }
                 if (!exploreMode && gameState.current_player !== playerColor) {
                     setStatus('AI tenker...', 'ai-turn');
                     const aiData = await api(`/api/ai-move/${gameId}`, 'POST');
+                    await glideMove(aiData.ai_move);
                     gameState = aiData.state; validMoves = aiData.valid_moves;
                     if (aiData.ai_move) moveHistory.push({ state: JSON.parse(JSON.stringify(aiData.state)), move: aiData.ai_move, player: 'ai' });
+                    commitGlide();
                     renderBoard(); updateStatus();
                 }
                 loadExplorer();
@@ -1071,14 +1096,15 @@
             btn.disabled = true; btn.textContent = 'Motoren tenker...';
             try {
                 const aiData = await api(`/api/ai-move/${gameId}`, 'POST');
+                await glideMove(aiData.ai_move);
                 gameState = aiData.state; validMoves = aiData.valid_moves;
                 if (aiData.ai_move) moveHistory.push({ state: JSON.parse(JSON.stringify(aiData.state)), move: aiData.ai_move, player: 'engine' });
-                resetSelection(); renderBoard(); updateStatus(); loadExplorer();
+                resetSelection(); commitGlide(); renderBoard(); updateStatus(); loadExplorer();
             } catch (e) { alert('Feil: ' + e.message); }
             btn.disabled = false; btn.textContent = '⚡ Motor: spill beste (vinnende) trekk';
         }
 
-        async function makeMove(placePail, isPlacement, barrelFrom, barrelTo) {
+        async function makeMove(placePail, isPlacement, barrelFrom, barrelTo, opts = {}) {
             try {
                 // Steg 1: Utfor spillerens trekk
                 const playerData = await api('/api/move', 'POST', {
@@ -1089,7 +1115,9 @@
                     barrel_to: barrelTo
                 });
 
-                // Oppdater brettet med spillerens trekk UMIDDELBART
+                // Oppdater brettet med spillerens trekk. If the caller already
+                // glided the barrel (animateAndSendMove), the overlay is parked
+                // at the destination — commit it and draw the real position under it.
                 gameState = playerData.state;
                 validMoves = playerData.valid_moves;
 
@@ -1101,6 +1129,7 @@
                 });
 
                 resetSelection();
+                if (opts.humanGlided) commitGlide();
                 renderBoard();
 
                 // Sjekk om spillet er over
@@ -1115,6 +1144,9 @@
                 setStatus('AI tenker...', 'ai-turn');
 
                 const aiData = await api(`/api/ai-move/${gameId}`, 'POST');
+
+                // Glide the AI's reply over the current board before revealing it.
+                await glideMove(aiData.ai_move);
 
                 gameState = aiData.state;
                 validMoves = aiData.valid_moves;
@@ -1132,11 +1164,13 @@
                     });
                 }
 
+                commitGlide();
                 renderBoard();
                 updateStatus();
                 loadExplorer();
             } catch (e) {
                 alert('Feil: ' + e.message);
+                commitGlide();
                 resetSelection();
                 renderBoard();
             }
@@ -1535,29 +1569,89 @@
             );
         }
 
-        // Animate a barrel hopping through its path, then send the move
         function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+        // =====================================================================
+        // MOVE ANIMATION (lichess-style glide)
+        //
+        // A move is applied in three beats so the barrel visibly slides along
+        // its (possibly multi-jump) path before the new position appears:
+        //   1. glideMove(move)  — over the CURRENT board, slide a flying overlay
+        //      from the origin through each landing square. Origin + destination
+        //      are rendered empty (animHide) so nothing duplicates the overlay.
+        //   2. gameState = newState
+        //   3. commitGlide() then renderBoard() — the real piece is drawn at the
+        //      destination exactly under the overlay, which is then removed.
+        // =====================================================================
+
+        // Pixel top-left of a cell's content box within #board (its offsetParent).
+        function cellRect(row, col) {
+            const cell = document.getElementById('board').children[row * BOARD_SIZE + col];
+            return { x: cell.offsetLeft, y: cell.offsetTop, w: cell.offsetWidth, h: cell.offsetHeight };
+        }
+
+        // Slide a flying barrel over the current board along [from, ...path].
+        // Leaves the overlay parked at the destination and animHide set; the
+        // caller assigns the new state, calls commitGlide(), then renderBoard().
+        // Returns true if it animated, false if there was nothing to glide.
+        async function glideMove(move) {
+            if (!move || move.is_pail_only || move.is_barrel_placement) return false;
+            const from = move.barrel_from;
+            if (!from) return false;
+            const path = (move.barrel_path && move.barrel_path.length)
+                ? move.barrel_path
+                : (move.barrel_to ? [move.barrel_to] : []);
+            if (!path.length) return false;
+            const pieceVal = gameState.board[from[0]][from[1]];  // the moving barrel
+            if (!pieceVal) return false;
+
+            const dest = path[path.length - 1];
+            const hops = path.length;  // number of slides
+            // Lively but readable: a touch quicker per hop when there are several.
+            const perHop = hops > 1 ? 130 : 200;
+
+            animating = true;
+            animHide = [from, dest];
+            renderBoard();  // draw board with origin + dest empty
+
+            const board = document.getElementById('board');
+            const fly = document.createElement('div');
+            fly.className = 'flying-piece';
+            fly.innerHTML = PIECE_SVG[pieceVal] || '';
+            const r0 = cellRect(from[0], from[1]);
+            const pad = (r0.w - 46) / 2;  // centre the 46px piece in the cell
+            fly.style.left = (r0.x + pad) + 'px';
+            fly.style.top = (r0.y + pad) + 'px';
+            board.appendChild(fly);
+            _flyEl = fly;
+
+            void fly.offsetWidth;  // flush layout so the first transition animates
+            fly.style.transition = `left ${perHop}ms ease-in-out, top ${perHop}ms ease-in-out`;
+
+            for (const [pr, pc] of path) {
+                const r = cellRect(pr, pc);
+                fly.style.left = (r.x + pad) + 'px';
+                fly.style.top = (r.y + pad) + 'px';
+                await sleep(perHop);
+            }
+            return true;
+        }
+
+        // Remove the flying overlay and stop hiding squares. Clear animHide
+        // BEFORE the caller's renderBoard so the destination piece shows.
+        function commitGlide() {
+            if (_flyEl) { _flyEl.remove(); _flyEl = null; }
+            animHide = null;
+            animating = false;
+        }
 
         async function animateAndSendMove(placePail, from, dest) {
             const move = findMoveForDest(from, dest);
-            const pieceVal = playerColor === 'white' ? 1 : -1;
-
-            if (move && move.barrel_path.length > 1) {
-                // Multi-jump: animate through each intermediate hop
-                for (const pos of move.barrel_path) {
-                    pendingMove = { from, currentPos: pos, pieceVal };
-                    renderBoard();
-                    await sleep(200);
-                }
-            } else {
-                // Single step or single jump: show at destination instantly
-                pendingMove = { from, currentPos: dest, pieceVal };
-                renderBoard();
-            }
-
-            // Send the move (pendingMove stays set as optimistic render until server responds)
+            await glideMove(move || { barrel_from: from, barrel_to: dest });
+            // makeMove finalizes the human glide (commit + render new state) and
+            // then glides the AI's reply.
             setStatus('AI tenker...', 'ai-turn');
-            await makeMove(placePail, false, from, dest);
+            await makeMove(placePail, false, from, dest, { humanGlided: true });
         }
 
         // Handle off-board barrel click (to select for placement)
@@ -1576,7 +1670,7 @@
 
         // Handle cell click on board
         function onCellClick(row, col) {
-            if (pendingMove) return;  // Ignore clicks during animation
+            if (animating) return;  // Ignore clicks during animation
             if (gameState.winner) return;
             if (gameState.current_player !== playerColor) return;
 
@@ -1734,17 +1828,11 @@
                         }
                     }
 
-                    // Add piece — during animation, show barrel at current hop position
+                    // Add piece — during a glide the moving barrel's origin and
+                    // destination are rendered empty; the flying overlay covers them.
                     let val = gameState.board[row][col];
-                    if (pendingMove) {
-                        // Hide barrel at its original position
-                        if (pendingMove.from[0] === row && pendingMove.from[1] === col) {
-                            val = 0;
-                        }
-                        // Show barrel at its current animated position
-                        if (pendingMove.currentPos[0] === row && pendingMove.currentPos[1] === col && val === 0) {
-                            val = pendingMove.pieceVal;
-                        }
+                    if (animHide && animHide.some(s => s[0] === row && s[1] === col)) {
+                        val = 0;
                     }
                     if (val !== 0) {
                         const piece = document.createElement('div');
