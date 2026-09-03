@@ -64,6 +64,24 @@ class NewGameRequest(BaseModel):
     mcts_simulations: int = 300       # for AlphaZero only
 
 
+# ── Tablebase explorer: one shared engine with every solved phase mmap'd.
+# The game is strongly solved, so each legal move gets a PROVEN verdict.
+_EXPLORER = None
+_EXPLORER_PHASES = []
+def _get_explorer():
+    global _EXPLORER, _EXPLORER_PHASES
+    if _EXPLORER is None:
+        _EXPLORER = Engine()
+        tb = Path(__file__).resolve().parent.parent / "tablebases"
+        if tb.is_dir():
+            try:
+                _EXPLORER_PHASES = _EXPLORER.load_tablebases(str(tb))
+                print(f"# Explorer tablebases: {_EXPLORER_PHASES}")
+            except Exception as e:
+                print(f"# Explorer tablebase load failed: {e}")
+    return _EXPLORER
+
+
 def board_to_dict(board: Board) -> dict:
     """Konverter brett til JSON-vennlig dict."""
     arr = board.to_array()
@@ -214,6 +232,47 @@ def get_game(game_id: str):
         "state": board_to_dict(game["board"]),
         "valid_moves": get_valid_moves(game["board"]),
         "player_color": game["player_color"],
+    }
+
+
+@app.get("/api/explore/{game_id}")
+def explore(game_id: str):
+    """Lichess-database-style panel data: the proven tablebase verdict of the
+    current position and of every legal move (verdicts are absolute colors;
+    dist is only meaningful once <= 5 barrels remain — the distance phases)."""
+    if game_id not in games:
+        raise HTTPException(status_code=404, detail="Spill ikke funnet")
+    board = games[game_id]["board"]
+    ex = _get_explorer()
+
+    def probe_dict(b):
+        w = b.check_winner()
+        if w is not None:
+            return {"verdict": "white" if "White" in repr(w) else "black", "dist": 0, "terminal": True}
+        v = ex.tablebase_probe(b)
+        if v is None:
+            return {"verdict": "unknown", "dist": None, "terminal": False}
+        remaining = (4 - b.white_scored) + (4 - b.black_scored)
+        return {"verdict": v[0], "dist": (v[1] if remaining <= 5 else None), "terminal": False}
+
+    rows = []
+    for m in board.generate_moves():
+        child = board.copy()
+        child.make_move(m)
+        d = {
+            "is_pail_only": m.is_pail_only,
+            "place_pail": (m.place_pail.row, m.place_pail.col) if m.place_pail else None,
+            "is_barrel_placement": m.is_barrel_placement,
+            "barrel_from": (m.barrel_from.row, m.barrel_from.col) if m.barrel_from else None,
+            "barrel_to": (m.barrel_to.row, m.barrel_to.col),
+        }
+        d.update(probe_dict(child))
+        rows.append(d)
+    return {
+        "root": probe_dict(board),
+        "mover": "white" if "White" in repr(board.current_player) else "black",
+        "moves": rows,
+        "solved": len(_EXPLORER_PHASES) >= 12,
     }
 
 

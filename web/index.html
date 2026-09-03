@@ -175,6 +175,19 @@
             box-shadow: 0 10px 30px rgba(0,0,0,0.5);
         }
 
+        #explorer { margin-top: 15px; }
+        #explorer h4 { color: #64b5f6; margin-bottom: 6px; }
+        #explorer-root { font-size: 0.85em; color: #aaa; margin-bottom: 6px; }
+        .exp-row { display: flex; align-items: center; gap: 8px; padding: 3px 4px;
+                   border-radius: 4px; cursor: pointer; font-size: 0.85em; }
+        .exp-row:hover { background: #3a3a5c; }
+        .exp-move { min-width: 110px; color: #ddd; font-family: monospace; }
+        .exp-bar { flex: 1; height: 16px; border-radius: 3px; display: flex; align-items: center;
+                   justify-content: center; font-size: 0.75em; font-weight: bold; color: #111; }
+        .exp-win  { background: linear-gradient(#8bc98d, #66bb6a); }
+        .exp-draw { background: linear-gradient(#bdbdbd, #9e9e9e); }
+        .exp-loss { background: linear-gradient(#ef9a9a, #e57373); }
+        #explorer-list { max-height: 300px; overflow-y: auto; }
         #info-panel h3 {
             margin-bottom: 15px;
             color: #4CAF50;
@@ -669,6 +682,19 @@
                 <span id="ai-eval">-</span>
             </div>
 
+            <div class="info-row" style="margin-top:6px;">
+                <label style="display:flex;align-items:center;gap:6px;cursor:pointer;">
+                    <input type="checkbox" id="explore-mode" onchange="onExploreModeChange()">
+                    Utforsk-modus (spill begge sider, ingen AI)
+                </label>
+            </div>
+
+            <div id="explorer" style="display:none;">
+                <h4>⬜ Tablebase — løst spill</h4>
+                <div id="explorer-root">–</div>
+                <div id="explorer-list"></div>
+            </div>
+
             <div id="pail-action" style="margin-top: 15px; display: none;">
                 <button class="skip-pail" onclick="enterPailPlacementMode()">Plasser melkespann (valgfritt)</button>
                 <p style="font-size:0.8em; color:#888; margin-top:5px;">Du kan plassere melkespannet nar som helst</p>
@@ -878,6 +904,83 @@
         }
 
         // Make a move (two-step: player move, then AI move)
+        let exploreMode = false;
+        function onExploreModeChange() {
+            exploreMode = document.getElementById('explore-mode').checked;
+            loadExplorer();
+        }
+
+        function sqName(rc) { return String.fromCharCode(97 + rc[1]) + (6 - rc[0]); }
+        function fmtExpMove(m) {
+            let parts = [];
+            if (m.place_pail) parts.push('🥛' + sqName(m.place_pail));
+            if (m.is_pail_only) return parts[0];
+            if (m.is_barrel_placement) parts.push('+' + sqName(m.barrel_to));
+            else parts.push(sqName(m.barrel_from) + '→' + sqName(m.barrel_to));
+            return parts.join(' ');
+        }
+
+        async function loadExplorer() {
+            const panel = document.getElementById('explorer');
+            if (!gameId) { panel.style.display = 'none'; return; }
+            try {
+                const data = await api(`/api/explore/${gameId}`);
+                if (!data.solved) { panel.style.display = 'none'; return; }
+                panel.style.display = 'block';
+                const mover = data.mover;
+                const rel = v => v.verdict === 'draw' ? 'draw' : (v.verdict === mover ? 'win' : 'loss');
+                const label = v => v.verdict === 'draw' ? 'REMIS'
+                    : (rel(v) === 'win' ? 'VINN' : 'TAP') + (v.dist ? ' om ' + v.dist : '');
+                const rootRel = rel(data.root);
+                document.getElementById('explorer-root').textContent =
+                    (mover === 'white' ? 'Hvit' : 'Svart') + ' i trekket — stillingen er ' +
+                    (data.root.verdict === 'draw' ? 'REMIS' :
+                     (rootRel === 'win' ? 'VUNNET' : 'TAPT') + (data.root.dist ? ' om ' + data.root.dist : '')) +
+                    ' med perfekt spill';
+                const order = { win: 0, draw: 1, loss: 2 };
+                const rows = data.moves.slice().sort((a, b) =>
+                    order[rel(a)] - order[rel(b)] || (a.dist ?? 999) - (b.dist ?? 999));
+                const list = document.getElementById('explorer-list');
+                list.innerHTML = '';
+                for (const m of rows) {
+                    const row = document.createElement('div');
+                    row.className = 'exp-row';
+                    row.innerHTML = `<span class="exp-move">${fmtExpMove(m)}</span>` +
+                        `<span class="exp-bar exp-${rel(m)}">${label(m)}</span>`;
+                    row.onclick = () => playExplorerMove(m);
+                    list.appendChild(row);
+                }
+            } catch (e) { panel.style.display = 'none'; }
+        }
+
+        async function playExplorerMove(m) {
+            try {
+                const data = await api('/api/move', 'POST', {
+                    game_id: gameId,
+                    is_pail_only: m.is_pail_only,
+                    place_pail: m.place_pail,
+                    is_barrel_placement: m.is_barrel_placement,
+                    barrel_from: m.barrel_from,
+                    barrel_to: m.barrel_to
+                });
+                gameState = data.state;
+                validMoves = data.valid_moves;
+                moveHistory.push({ state: JSON.parse(JSON.stringify(data.state)), move: m, player: 'explorer' });
+                resetSelection();
+                renderBoard();
+                updateStatus();
+                if (data.game_over) { loadExplorer(); return; }
+                if (!exploreMode && gameState.current_player !== playerColor) {
+                    setStatus('AI tenker...', 'ai-turn');
+                    const aiData = await api(`/api/ai-move/${gameId}`, 'POST');
+                    gameState = aiData.state; validMoves = aiData.valid_moves;
+                    if (aiData.ai_move) moveHistory.push({ state: JSON.parse(JSON.stringify(aiData.state)), move: aiData.ai_move, player: 'ai' });
+                    renderBoard(); updateStatus();
+                }
+                loadExplorer();
+            } catch (e) { alert('Feil: ' + e.message); }
+        }
+
         async function makeMove(placePail, isPlacement, barrelFrom, barrelTo) {
             try {
                 // Steg 1: Utfor spillerens trekk
@@ -909,6 +1012,8 @@
                     return;
                 }
 
+                if (exploreMode) { loadExplorer(); return; }
+
                 // Steg 2: Vent pa AI
                 setStatus('AI tenker...', 'ai-turn');
 
@@ -932,6 +1037,7 @@
 
                 renderBoard();
                 updateStatus();
+                loadExplorer();
             } catch (e) {
                 alert('Feil: ' + e.message);
                 resetSelection();
@@ -941,6 +1047,7 @@
 
         // Update status display
         function updateStatus() {
+            setTimeout(loadExplorer, 0);
             document.getElementById('move-count').textContent = Math.floor(gameState.move_count / 2) + 1;
             document.getElementById('white-score').textContent = gameState.white_scored || 0;
             document.getElementById('black-score').textContent = gameState.black_scored || 0;
