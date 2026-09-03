@@ -583,6 +583,8 @@
         </div>
 
         <button onclick="startGame()">Start spill</button>
+            <button onclick="startGame(true)" style="margin-top:10px; background:#5c6bc0; border:none; color:#fff; padding:12px 24px; border-radius:6px; font-size:1.05em; cursor:pointer; width:100%;">⬜ Utforsk tablebase (analyse)</button>
+            <p style="font-size:0.8em; color:#888; margin-top:4px;">Spill begge sider og se den bevist beste verdien for hvert trekk</p>
         <div style="margin-top: 20px; border-top: 1px solid #444; padding-top: 20px;">
             <button class="secondary" onclick="openReplayView()">Inspect Games</button>
             <p style="font-size:0.8em; color:#888; margin-top:5px;">Browse and replay test match games</p>
@@ -682,12 +684,6 @@
                 <span id="ai-eval">-</span>
             </div>
 
-            <div class="info-row" style="margin-top:6px;">
-                <label style="display:flex;align-items:center;gap:6px;cursor:pointer;">
-                    <input type="checkbox" id="explore-mode" onchange="onExploreModeChange()">
-                    Utforsk-modus (spill begge sider, ingen AI)
-                </label>
-            </div>
 
             <div id="explorer" style="display:none;">
                 <h4>⬜ Tablebase — løst spill</h4>
@@ -808,15 +804,17 @@
         }
 
         // Start new game
-        async function startGame() {
-            playerColor = document.getElementById('color-select').value;
+        async function startGame(explore = false) {
+            exploreMode = !!explore;
+            playerColor = exploreMode ? 'white' : document.getElementById('color-select').value;
             const depth = parseInt(document.getElementById('depth-select').value);
             const engineType = document.getElementById('engine-select').value;
             const simulations = parseInt(document.getElementById('simulations-select').value);
 
             document.getElementById('start-screen').style.display = 'none';
             document.getElementById('game-container').style.display = 'flex';
-            document.getElementById('your-color').textContent = playerColor === 'white' ? 'Hvit' : 'Svart';
+            document.getElementById('your-color').textContent =
+                exploreMode ? 'Begge sider (utforsk)' : (playerColor === 'white' ? 'Hvit' : 'Svart');
 
             // Populate legend with SVG icons
             document.getElementById('legend-barrel').innerHTML = PIECE_SVG[1];
@@ -824,9 +822,9 @@
 
             try {
                 const body = {
-                    player_color: playerColor,
+                    player_color: 'white',
                     ai_depth: depth,
-                    engine_type: engineType,
+                    engine_type: exploreMode ? 'heuristic' : engineType,
                 };
                 if (engineType === 'alphazero') {
                     body.mcts_simulations = simulations;
@@ -906,10 +904,6 @@
 
         // Make a move (two-step: player move, then AI move)
         let exploreMode = false;
-        function onExploreModeChange() {
-            exploreMode = document.getElementById('explore-mode').checked;
-            loadExplorer();
-        }
 
         function sqName(rc) { return String.fromCharCode(97 + rc[1]) + (6 - rc[0]); }
         function fmtExpMove(m) {
@@ -923,7 +917,7 @@
 
         async function loadExplorer() {
             const panel = document.getElementById('explorer');
-            if (!gameId) { panel.style.display = 'none'; return; }
+            if (!gameId || !exploreMode) { panel.style.display = 'none'; return; }
             try {
                 const data = await api(`/api/explore/${gameId}`);
                 if (!data.solved) { panel.style.display = 'none'; return; }
@@ -1049,6 +1043,9 @@
         // Update status display
         function updateStatus() {
             setTimeout(loadExplorer, 0);
+            if (exploreMode && gameState && !gameState.winner) {
+                playerColor = gameState.current_player;   // drive both sides
+            }
             document.getElementById('move-count').textContent = Math.floor(gameState.move_count / 2) + 1;
             document.getElementById('white-score').textContent = gameState.white_scored || 0;
             document.getElementById('black-score').textContent = gameState.black_scored || 0;
@@ -1073,7 +1070,9 @@
             }
 
             if (gameState.winner) {
-                if (gameState.winner === playerColor) {
+                if (exploreMode) {
+                    setStatus((gameState.winner === 'white' ? 'Hvit' : 'Svart') + ' vant!', 'winner');
+                } else if (gameState.winner === playerColor) {
                     setStatus('DU VANT!', 'winner');
                 } else {
                     setStatus('AI vant!', 'loser');
