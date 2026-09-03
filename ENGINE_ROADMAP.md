@@ -23,9 +23,26 @@ one duplicate solver, a spot VM's disk hitting 0 bytes free mid-run (resized
 online), and nightly org-policy auth expiries — every one caught by the
 heartbeat/watchdog telemetry it justified.
 
-Remaining write-ups: local verification of tb_4v4.p2, the exact first-move
-map (win/draw/loss for every legal opening move), a perfect game with its ply
-count, and on-demand DTW for the initial position if we want "wins in exactly N".
+**Verified locally (2026-09-03):** tb_4v4.p2 downloaded (byte-exact, zstd
+frames OK), `tablebase_probe(initial) = ('white', 0)` reproduced on the Mac,
+one-ply consistency 0/300 violations on random 4v4 positions.
+
+**The first-move map** (all 42 legal openings, exact):
+- **All 6 barrel placements WIN** — the win is robust; any first barrel move
+  keeps it.
+- **All 36 pail placements LOSE.** Placing the pail costs no tempo (the barrel
+  move still follows), yet it loses: the pail in hand is pure option value and
+  on the board a fixed liability. The engines' learned instinct to delay the
+  pail was the theorem all along.
+- No drawing first move exists.
+
+**A perfect game** (both sides table-guided): **White wins in 37 plies**,
+placing its pail on move 13 and scoring the 4th barrel on ply 37 — an upper
+bound on the true DTW of the initial position (exact minimal N = a future
+on-demand search over the won subtree).
+
+VM deleted after verification; artifacts live in gs://tonnesjakk-tb-solve/tb/
+and locally in tablebases/ (all 12 phases, 45+271 GB).
 
 ## Diagnosis (why previous efforts stalled)
 
