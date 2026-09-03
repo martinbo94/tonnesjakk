@@ -859,6 +859,99 @@ impl Tablebase {
     }
 }
 
+/// Exact distance-to-win search from a position, over the solved game.
+/// Bounded AND/OR minimax: white picks among win-preserving moves, black among
+/// all moves; grounded exactly in the distance-bearing phases (<= 5 barrels
+/// remaining) and pruned by the race-table lower bound. `memo` maps
+/// state hash -> (smallest bound proven winnable, largest bound proven not).
+pub fn dtw_can_win(
+    tb: &Tablebase,
+    bb: &BitBoard,
+    bound: i32,
+    memo: &mut std::collections::HashMap<u64, (i32, i32)>,
+    nodes: &mut u64,
+) -> bool {
+    *nodes += 1;
+    if let Some(w) = bb.check_winner() {
+        return w == Player::White;
+    }
+    if bound <= 0 {
+        return false;
+    }
+    let remaining = (4 - bb.white_scored as i32) + (4 - bb.black_scored as i32);
+    if remaining <= 5 {
+        return match tb.value(bb) {
+            Some(v) if is_white_win(v) => (win_dist(v) as i32) <= bound,
+            _ => false,
+        };
+    }
+    let rt = &*crate::race::RACE_TABLE;
+    let rw = rt.side_distance(bb, Player::White) as i32;
+    let white_to_move = bb.current_player == Player::White;
+    let lb = 2 * rw - if white_to_move { 1 } else { 0 };
+    if bound < lb {
+        return false;
+    }
+    let h = bb.hash;
+    if let Some(&(pmin, dmax)) = memo.get(&h) {
+        if pmin <= bound { return true; }
+        if dmax >= bound { return false; }
+    }
+    let mut kids: Vec<(i32, BitBoard)> = Vec::new();
+    for m in bb.generate_moves() {
+        let mut c = *bb;
+        c.make_move(&m);
+        if let Some(w) = c.check_winner() {
+            if w == Player::White {
+                if white_to_move {
+                    let e = memo.entry(h).or_insert((i32::MAX, -1));
+                    e.0 = e.0.min(1);
+                    return true;
+                }
+                kids.push((0, c));
+                continue;
+            } else {
+                if white_to_move { continue; }
+                let e = memo.entry(h).or_insert((i32::MAX, -1));
+                e.1 = e.1.max(bound);
+                return false;
+            }
+        }
+        let crem = (4 - c.white_scored as i32) + (4 - c.black_scored as i32);
+        let key = if crem <= 5 {
+            match tb.value(&c) {
+                Some(v) if is_white_win(v) => win_dist(v) as i32,
+                _ => {
+                    if white_to_move { continue; }   // not win-preserving
+                    let e = memo.entry(h).or_insert((i32::MAX, -1));
+                    e.1 = e.1.max(bound);
+                    return false;                    // black escapes: bug guard (state should be won)
+                }
+            }
+        } else {
+            if white_to_move {
+                match tb.value(&c) {
+                    Some(v) if is_white_win(v) => {}
+                    _ => continue,                   // white only considers win-preserving moves
+                }
+            }
+            let crw = rt.side_distance(&c, Player::White) as i32;
+            2 * crw - if c.current_player == Player::White { 1 } else { 0 }
+        };
+        kids.push((key, c));
+    }
+    let result = if white_to_move {
+        kids.sort_unstable_by_key(|t| t.0);          // most forcing first
+        kids.iter().any(|(_, c)| dtw_can_win(tb, c, bound - 1, memo, nodes))
+    } else {
+        kids.sort_unstable_by_key(|t| -t.0);         // most delaying first
+        kids.iter().all(|(_, c)| dtw_can_win(tb, c, bound - 1, memo, nodes))
+    };
+    let e = memo.entry(h).or_insert((i32::MAX, -1));
+    if result { e.0 = e.0.min(bound); } else { e.1 = e.1.max(bound); }
+    result
+}
+
 /// Result of examining one unknown state at a given pass.
 enum Verdict {
     /// Determined now.

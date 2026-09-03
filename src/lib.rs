@@ -107,6 +107,36 @@ fn packed_phase_stats(py: Python, wr: usize, br: usize) -> (u64, u64, u64, u64) 
     py.allow_threads(|| tablebase::packed_phase_stats(wr, br))
 }
 
+/// Exact DTW of the initial position: iterative deepening over odd bounds
+/// from `start` to `max`. Returns (N, nodes) when a bound is proven winnable,
+/// or (0, nodes) if none within `max`.
+#[pyfunction]
+#[pyo3(signature = (dir, start = 27, max = 45, verbose = true))]
+fn dtw_initial(py: Python, dir: &str, start: i32, max: i32, verbose: bool) -> PyResult<(i32, u64)> {
+    let path = std::path::Path::new(dir);
+    let tb = tablebase::Tablebase::load_dir(path)
+        .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("load tablebases: {}", e)))?;
+    py.allow_threads(move || {
+        let bb = board::BitBoard::new();
+        let mut memo = std::collections::HashMap::new();
+        let mut nodes = 0u64;
+        let mut n = start;
+        while n <= max {
+            let t0 = std::time::Instant::now();
+            let n0 = nodes;
+            let ok = tablebase::dtw_can_win(&tb, &bb, n, &mut memo, &mut nodes);
+            if verbose {
+                eprintln!("N={}: {}  ({} nodes, {:.1}s, memo {})",
+                          n, if ok { "WIN" } else { "not yet" }, nodes - n0,
+                          t0.elapsed().as_secs_f64(), memo.len());
+            }
+            if ok { return Ok((n, nodes)); }
+            n += 2;
+        }
+        Ok((0, nodes))
+    })
+}
+
 /// Write the 2-bit WDL companion (`tb_{wr}v{br}.wdl`) of a solved full phase.
 #[pyfunction]
 fn repack_tablebase_wdl(py: Python, dir: &str, wr: usize, br: usize) -> PyResult<usize> {
@@ -157,6 +187,7 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(solve_tablebase_packed, m)?)?;
     m.add_function(wrap_pyfunction!(repack_tablebase_wdl, m)?)?;
     m.add_function(wrap_pyfunction!(packed_phase_stats, m)?)?;
+    m.add_function(wrap_pyfunction!(dtw_initial, m)?)?;
     m.add_class::<Player>()?;
     m.add_class::<Cell>()?;
     m.add_class::<Position>()?;
