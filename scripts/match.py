@@ -49,6 +49,7 @@ class EngineSpec:
     contempt: int = 0
     weights: dict = field(default_factory=dict)  # weight_* overrides
     tablebases: str = ""      # directory of solved tb_*.bin phases (memory-mapped)
+    blunder: float = 0.0      # P(play a uniform-random legal move instead of best) — weakens the engine
 
     def describe(self) -> str:
         parts = [f"time={self.time_ms}ms" if self.time_ms else f"depth={self.depth}"]
@@ -56,6 +57,8 @@ class EngineSpec:
             parts.append(f"nnue={Path(self.nnue).name}")
         if self.tablebases:
             parts.append(f"tb={self.tablebases}")
+        if self.blunder:
+            parts.append(f"blunder={self.blunder:.0%}")
         if self.contempt:
             parts.append(f"contempt={self.contempt}")
         parts.extend(f"{k}={v}" for k, v in self.weights.items())
@@ -126,7 +129,15 @@ def play_game(engine_w, spec_w, engine_b, spec_b, opening_seed: int, opening_pli
         if result.best_move is None:
             return 0, "stalemate", plies
 
-        board.make_move(result.best_move)
+        # Weakening: with probability `blunder`, discard the engine's move and
+        # play a uniform-random legal one (deterministic per opening_seed via rng).
+        move = result.best_move
+        if spec.blunder > 0.0 and rng.random() < spec.blunder:
+            legal = list(board.generate_moves())
+            if legal:
+                move = rng.choice(legal)
+
+        board.make_move(move)
         plies += 1
 
         h = board.get_hash()
@@ -260,6 +271,8 @@ def main():
         ap.add_argument(f"--nnue-{side}", type=str, default="")
         ap.add_argument(f"--tb-{side}", type=str, default="", help="tablebase directory")
         ap.add_argument(f"--contempt-{side}", type=int, default=0)
+        ap.add_argument(f"--blunder-{side}", type=float, default=0.0,
+                        help="P(random legal move) to weaken this side, 0..1")
         ap.add_argument(f"--set-{side}", action="append",
                         help="weight override, e.g. weight_trapped=40 (repeatable)")
     args = ap.parse_args()
@@ -272,7 +285,7 @@ def main():
         specs[side] = EngineSpec(
             label=g("label"), depth=g("depth"), time_ms=g("time"),
             nnue=g("nnue"), contempt=g("contempt"), weights=parse_sets(g("set")),
-            tablebases=g("tb"),
+            tablebases=g("tb"), blunder=g("blunder"),
         )
 
     n_pairs = max(args.games // 2, 1)

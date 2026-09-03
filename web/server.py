@@ -60,27 +60,74 @@ class NewGameRequest(BaseModel):
     player_color: str = "white"  # "white" eller "black"
     ai_time_ms: int = 200        # time budget per move (iterative deepening)
     ai_depth: int = 6            # fallback depth (used by the analyze endpoint)
+    ai_blunder: float = 0.0      # P(random legal move) — weakens the engine for easy tiers
     # "ml"         = NNUE evaluation + alpha-beta search + solved-endgame tablebases
     # "rule_based" = hand-crafted evaluation + alpha-beta search (no net, no TB)
     engine_type: str = "ml"
 
 
-# ── Tablebase explorer: one shared engine with every solved phase mmap'd.
-# The game is strongly solved, so each legal move gets a PROVEN verdict.
-_EXPLORER = None
-_EXPLORER_PHASES = []
-def _get_explorer():
-    global _EXPLORER, _EXPLORER_PHASES
-    if _EXPLORER is None:
-        _EXPLORER = Engine()
+# ── ONE shared tablebase engine (NNUE + every solved phase), loaded ONCE.
+# The packed big-phase index alone is ~14 GB of RAM (a dense wc×bc pair_offset
+# per phase), so it must never be loaded more than once. The old code built a
+# fresh tablebase engine PER GAME — and `games` is never fully torn down — which
+# multiplied that to tens of GB and hard-crashed the machine. Now the explorer's
+# proven-verdict probes AND "ml" play share this single engine. Access is
+# serialized by _engine_lock because FastAPI runs sync endpoints in a threadpool,
+# so a probe (/api/explore) and a search (/api/ai-move) can otherwise overlap on
+# the same &mut engine.
+_engine_lock = threading.Lock()
+_TB_ENGINE = None
+_TB_PHASES = []
+
+
+def _get_tb_engine():
+    global _TB_ENGINE, _TB_PHASES
+    if _TB_ENGINE is None:
+        _TB_ENGINE = Engine()
+        nnue = Path(__file__).resolve().parent.parent / "models" / "net3_plain_m_d20_64x16_b25_l05.json"
+        if nnue.exists():
+            try:
+                _TB_ENGINE.load_nnue(str(nnue))
+                print(f"# TB engine NNUE: {nnue.name}")
+            except Exception as e:
+                print(f"# NNUE load failed ({e}); handcrafted eval")
         tb = Path(__file__).resolve().parent.parent / "tablebases"
         if tb.is_dir():
             try:
-                _EXPLORER_PHASES = _EXPLORER.load_tablebases(str(tb))
-                print(f"# Explorer tablebases: {_EXPLORER_PHASES}")
+                _TB_PHASES = _TB_ENGINE.load_tablebases(str(tb))
+                print(f"# Tablebases loaded once (~14 GB): {_TB_PHASES}")
             except Exception as e:
-                print(f"# Explorer tablebase load failed: {e}")
-    return _EXPLORER
+                print(f"# Tablebase load failed ({e}); continuing without")
+    return _TB_ENGINE
+
+
+# The explorer probes verdicts on the same shared engine (no second load).
+def _get_explorer():
+    return _get_tb_engine()
+
+
+_RULE_ENGINE = None
+_ANALYSIS_ENGINE = None
+
+
+def _get_rule_engine():
+    """Hand-crafted evaluation only (no net, no tablebases) — cheap."""
+    global _RULE_ENGINE
+    if _RULE_ENGINE is None:
+        _RULE_ENGINE = Engine()
+    return _RULE_ENGINE
+
+
+def _engine_for(game):
+    return _get_tb_engine() if game.get("engine_type") == "ml" else _get_rule_engine()
+
+
+def _get_analysis_engine():
+    """Dedicated engine for the analyze endpoint (separate TT from play)."""
+    global _ANALYSIS_ENGINE
+    if _ANALYSIS_ENGINE is None:
+        _ANALYSIS_ENGINE = Engine()
+    return _ANALYSIS_ENGINE
 
 
 def board_to_dict(board: Board) -> dict:
@@ -140,37 +187,25 @@ def new_game(req: NewGameRequest):
     game_id = str(uuid.uuid4())[:8]
 
     board = Board()
-    engine = Engine()
-    # The "ml" engine = NNUE evaluation + solved-endgame tablebases (the deployed
-    # ~1850-Elo config). The "rule_based" engine deliberately uses neither, so it
-    # plays on the hand-crafted evaluation alone (~1500 Elo at 100 ms).
-    use_ml = req.engine_type == "ml"
-    if use_ml:
-        default_nnue = Path(__file__).resolve().parent.parent / "models" / "net3_plain_m_d20_64x16_b25_l05.json"
-        if default_nnue.exists():
-            try:
-                engine.load_nnue(str(default_nnue))
-                print(f"# Loaded NNUE: {default_nnue.name}")
-            except Exception as e:
-                print(f"# NNUE load failed ({e}); using handcrafted eval")
-        # Solved endgame phases (memory-mapped; +15-25 Elo, perfect draw-holding).
-        tb_dir = Path(__file__).resolve().parent.parent / "tablebases"
-        if tb_dir.is_dir():
-            try:
-                phases = engine.load_tablebases(str(tb_dir))
-                print(f"# Loaded tablebases: {phases}")
-            except Exception as e:
-                print(f"# Tablebase load failed ({e}); continuing without")
-
+    # No per-game engine: "ml"/"rule_based" games share module-level engines
+    # (loaded once) chosen at move time via _engine_for(). This keeps tablebase
+    # and NNUE memory constant regardless of how many games are created.
     game_data = {
         "board": board,
-        "engine": engine,
         "player_color": req.player_color,
         "ai_depth": req.ai_depth,
         "ai_time_ms": max(10, int(req.ai_time_ms)),
         "engine_type": req.engine_type,
+        "blunder_rate": max(0.0, min(1.0, float(req.ai_blunder))),
         "board_history": [board.copy()],
     }
+
+    # Bound memory: evict the oldest games so the dict can't grow without limit
+    # (each game holds board history + a move tree). Dict preserves insertion order.
+    MAX_GAMES = 24
+    while len(games) >= MAX_GAMES:
+        oldest = next(iter(games))
+        games.pop(oldest, None)
 
     games[game_id] = game_data
     _init_tree(game_data)
@@ -266,26 +301,29 @@ def explore(game_id: str):
         wtm = ("white" if "White" in repr(child.current_player) else "black") == mover
         return float(2 * rw - (1 if wtm else 0))
 
-    rows = []
-    for m in board.generate_moves():
-        child = board.copy()
-        child.make_move(m)
-        d = {
-            "is_pail_only": m.is_pail_only,
-            "place_pail": (m.place_pail.row, m.place_pail.col) if m.place_pail else None,
-            "is_barrel_placement": m.is_barrel_placement,
-            "barrel_from": (m.barrel_from.row, m.barrel_from.col) if m.barrel_from else None,
-            "barrel_to": (m.barrel_to.row, m.barrel_to.col),
-            "barrel_path": [(p.row, p.col) for p in m.barrel_path],
-        }
-        d.update(probe_dict(child))
-        d["progress"] = progress(child, d)
-        rows.append(d)
+    # Serialize probes: the shared tb engine is also used by /api/ai-move.
+    with _engine_lock:
+        rows = []
+        for m in board.generate_moves():
+            child = board.copy()
+            child.make_move(m)
+            d = {
+                "is_pail_only": m.is_pail_only,
+                "place_pail": (m.place_pail.row, m.place_pail.col) if m.place_pail else None,
+                "is_barrel_placement": m.is_barrel_placement,
+                "barrel_from": (m.barrel_from.row, m.barrel_from.col) if m.barrel_from else None,
+                "barrel_to": (m.barrel_to.row, m.barrel_to.col),
+                "barrel_path": [(p.row, p.col) for p in m.barrel_path],
+            }
+            d.update(probe_dict(child))
+            d["progress"] = progress(child, d)
+            rows.append(d)
+        root = probe_dict(board)
     return {
-        "root": probe_dict(board),
+        "root": root,
         "mover": "white" if "White" in repr(board.current_player) else "black",
         "moves": rows,
-        "solved": len(_EXPLORER_PHASES) >= 12,
+        "solved": len(_TB_PHASES) >= 12,
     }
 
 
@@ -297,7 +335,6 @@ def make_move(req: MoveRequest):
 
     game = games[req.game_id]
     board = game["board"]
-    engine = game["engine"]
 
     # Finn matchende trekk
     moves = board.generate_moves()
@@ -475,21 +512,30 @@ def _do_ai_move(game: dict) -> Optional[dict]:
         # Heuristic: alpha-beta decides the whole turn, including whether to
         # spend the pail (an optional sub-move). If search picks a pail
         # placement, the AI is still to move — search again for the barrel.
-        engine = game["engine"]
+        engine = _engine_for(game)
         pail_pos = None
         barrel_move = None
         last_result = None
         total_nodes = 0
         time_ms = game.get("ai_time_ms", 200)
+        blunder = game.get("blunder_rate", 0.0)
 
         for _ in range(2):  # at most: pail sub-move + barrel move
-            engine.set_game_history(_recent_hashes(game))
-            # Time-based iterative deepening (the difficulty knob). Both engines
-            # share this loop; only their evaluators (NNUE+TB vs hand-crafted) differ.
-            ai_result = engine.search_timed(board, time_ms)
+            # Serialize engine use: the shared tb engine is also used by /api/explore.
+            with _engine_lock:
+                engine.set_game_history(_recent_hashes(game))
+                # Time-based iterative deepening (the difficulty knob). Both engines
+                # share this loop; only their evaluators (NNUE+TB vs hand-crafted) differ.
+                ai_result = engine.search_timed(board, time_ms)
             if ai_result.best_move is None:
                 break
             move = ai_result.best_move
+            # Weakening (easy tiers): sometimes discard the best move for a random
+            # legal one. The reported score still reflects the engine's real view.
+            if blunder > 0.0 and random.random() < blunder:
+                legal = list(board.generate_moves())
+                if legal:
+                    move = random.choice(legal)
             move_str = _format_move(move) if not move.is_pail_only else \
                 f"pail_only({move.place_pail.row},{move.place_pail.col})"
             last_result = ai_result
@@ -755,10 +801,9 @@ def _run_analysis(game_id: str, position_index: int, analysis_id: int):
 
     board = board_history[position_index].copy()
 
-    # Create or reuse a dedicated analysis engine (separate TT from game engine)
-    if "analysis_engine" not in game:
-        game["analysis_engine"] = Engine()
-    engine = game["analysis_engine"]
+    # Shared dedicated analysis engine (separate TT from the play engines, and
+    # not stored per-game so it can't leak). Cleared before each analysis.
+    engine = _get_analysis_engine()
     engine.clear_tt()
 
     print(f"[analysis] start pos={position_index} id={analysis_id}")

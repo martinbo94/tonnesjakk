@@ -59,12 +59,13 @@ class PlayerDef:
     time_ms: int = 100
     nnue: str = ""
     tablebases: str = ""
+    blunder: float = 0.0
     weights: dict = field(default_factory=dict)
 
     def spec(self) -> EngineSpec:
         return EngineSpec(label=self.label, depth=self.depth, time_ms=self.time_ms,
                           nnue=self.nnue, tablebases=self.tablebases,
-                          weights=dict(self.weights))
+                          blunder=self.blunder, weights=dict(self.weights))
 
 
 PLAYERS = [
@@ -74,9 +75,17 @@ PLAYERS = [
     PlayerDef("net1-100ms", nnue=NET1),                             # first promoted net (2026-08-25)
     PlayerDef("net1b-100ms", nnue=NET1B),
     PlayerDef("net2-100ms", nnue=NET2),
+    PlayerDef("net1b-200ms", nnue=NET1B, time_ms=200),  # time-doubling yardstick
     PlayerDef("net3-100ms-oldsearch", nnue=NET3, weights=OLD_SEARCH),
     PlayerDef("net3-100ms", nnue=NET3),
     PlayerDef("net3-tb-100ms", nnue=NET3, tablebases=TB),           # the deployed engine
+    # Easy tiers for the web "difficulty" picker: the rule-based (heuristic)
+    # engine slowed down, and progressively blunder-prone versions of it. All
+    # play on the hand-crafted eval (no net, no TB) — the web "Regelbasert" side.
+    PlayerDef("heur-50ms", time_ms=50),
+    PlayerDef("heur-blunder15", blunder=0.15),
+    PlayerDef("heur-blunder30", blunder=0.30),
+    PlayerDef("heur-blunder50", blunder=0.50),
 ]
 
 _state = {}
