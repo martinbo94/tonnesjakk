@@ -4,6 +4,29 @@ Strategy adopted 2026-08-20 after reviewing the AlphaZero (23 runs) and NNUE
 efforts: **make the classical engine sound and measurable first, then attach a
 properly trained NNUE. No MCTS at play time.**
 
+## ⬜ TØNNESJAKK IS SOLVED: WHITE WINS (2026-09-03)
+
+`tablebase_probe(initial position) = ('white', 0)`: **the first player has a
+forced win** under the adopted rules (threefold repetition and 60-ply
+no-progress = draw). Strong solution — every one of the ~1.54 T stored states
+(~3.1 T answerable via the colour mirror) carries a proven win/draw/loss.
+
+Final phase, 4v4 (solved on the GCP spot VM, 49 h, 20 passes to fixpoint):
+**1,084,932,923,723 states — side to move wins 59.18 %, loses 35.05 %,
+draws 5.77 %.** Draw share by phase: 3v3 0.52 % → 4v2 2.9 % → 4v3 4.0 % →
+4v4 5.8 % (draws grow with material; the initial position is not one of them).
+
+Artifacts: gs://tonnesjakk-tb-solve/tb/ (all four big phases, zstd; 41.5 GiB)
++ solve_complete.log. Total cloud cost ≈ $48 vs the $60 approval. The solve
+survived: three Linux-only build failures, two self-inflicted process kills,
+one duplicate solver, a spot VM's disk hitting 0 bytes free mid-run (resized
+online), and nightly org-policy auth expiries — every one caught by the
+heartbeat/watchdog telemetry it justified.
+
+Remaining write-ups: local verification of tb_4v4.p2, the exact first-move
+map (win/draw/loss for every legal opening move), a perfect game with its ply
+count, and on-demand DTW for the initial position if we want "wins in exactly N".
+
 ## Diagnosis (why previous efforts stalled)
 
 1. **The game had no draw rules in the engine.** Barrels move backward, so
