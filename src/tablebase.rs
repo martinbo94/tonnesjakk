@@ -859,6 +859,21 @@ impl Tablebase {
     }
 }
 
+/// DTW memo policy: shallow subtrees are cheap to recompute and vastly
+/// outnumber deep ones, so only bounds >= DTW_MEMO_MIN_BOUND are stored, and a
+/// hard entry cap bounds RAM — an uncapped run reached ~70 GB and froze the
+/// machine (each entry ~48 B; 150M ~= 8 GB).
+const DTW_MEMO_MIN_BOUND: i32 = 6;
+const DTW_MEMO_MAX_ENTRIES: usize = 150_000_000;
+
+#[inline]
+fn dtw_store(memo: &mut std::collections::HashMap<u64, (i32, i32)>, h: u64, bound: i32, won: bool) {
+    if bound < DTW_MEMO_MIN_BOUND { return; }
+    if memo.len() >= DTW_MEMO_MAX_ENTRIES && !memo.contains_key(&h) { return; }
+    let e = memo.entry(h).or_insert((i32::MAX, -1));
+    if won { e.0 = e.0.min(bound); } else { e.1 = e.1.max(bound); }
+}
+
 /// Exact distance-to-win search from a position, over the solved game.
 /// Bounded AND/OR minimax: white picks among win-preserving moves, black among
 /// all moves; grounded exactly in the distance-bearing phases (<= 5 barrels
@@ -903,17 +918,11 @@ pub fn dtw_can_win(
         c.make_move(&m);
         if let Some(w) = c.check_winner() {
             if w == Player::White {
-                if white_to_move {
-                    let e = memo.entry(h).or_insert((i32::MAX, -1));
-                    e.0 = e.0.min(1);
-                    return true;
-                }
+                if white_to_move { return true; }
                 kids.push((0, c));
                 continue;
             } else {
                 if white_to_move { continue; }
-                let e = memo.entry(h).or_insert((i32::MAX, -1));
-                e.1 = e.1.max(bound);
                 return false;
             }
         }
@@ -923,8 +932,6 @@ pub fn dtw_can_win(
                 Some(v) if is_white_win(v) => win_dist(v) as i32,
                 _ => {
                     if white_to_move { continue; }   // not win-preserving
-                    let e = memo.entry(h).or_insert((i32::MAX, -1));
-                    e.1 = e.1.max(bound);
                     return false;                    // black escapes: bug guard (state should be won)
                 }
             }
@@ -947,8 +954,7 @@ pub fn dtw_can_win(
         kids.sort_unstable_by_key(|t| -t.0);         // most delaying first
         kids.iter().all(|(_, c)| dtw_can_win(tb, c, bound - 1, memo, nodes))
     };
-    let e = memo.entry(h).or_insert((i32::MAX, -1));
-    if result { e.0 = e.0.min(bound); } else { e.1 = e.1.max(bound); }
+    dtw_store(memo, h, bound, result);
     result
 }
 
