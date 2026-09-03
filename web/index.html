@@ -688,6 +688,8 @@
             <div id="explorer" style="display:none;">
                 <h4>⬜ Tablebase — løst spill</h4>
                 <div id="explorer-root">–</div>
+                <button id="convert-btn" onclick="playEngineMove()" style="margin:4px 0 8px; width:100%; background:#43a047; border:none; color:#fff; padding:8px; border-radius:5px; cursor:pointer; font-size:0.85em;">⚡ Motor: spill beste (vinnende) trekk</button>
+                <p style="font-size:0.75em; color:#888; margin:-4px 0 6px;">Alle grønne trekk holder seieren, men bare de som <em>gjør framgang</em> unngår sjakktrekk-loop. Motoren kan avstanden — klikk for å se den score.</p>
                 <div id="explorer-list"></div>
             </div>
 
@@ -974,6 +976,21 @@
                 }
                 loadExplorer();
             } catch (e) { alert('Feil: ' + e.message); }
+        }
+
+        // Let the tablebase-aware engine make one move (a progress-making,
+        // repetition-avoiding winning move) — so you can watch the win convert.
+        async function playEngineMove() {
+            if (!gameId || gameState.winner) return;
+            const btn = document.getElementById('convert-btn');
+            btn.disabled = true; btn.textContent = 'Motoren tenker...';
+            try {
+                const aiData = await api(`/api/ai-move/${gameId}`, 'POST');
+                gameState = aiData.state; validMoves = aiData.valid_moves;
+                if (aiData.ai_move) moveHistory.push({ state: JSON.parse(JSON.stringify(aiData.state)), move: aiData.ai_move, player: 'engine' });
+                resetSelection(); renderBoard(); updateStatus(); loadExplorer();
+            } catch (e) { alert('Feil: ' + e.message); }
+            btn.disabled = false; btn.textContent = '⚡ Motor: spill beste (vinnende) trekk';
         }
 
         async function makeMove(placePail, isPlacement, barrelFrom, barrelTo) {
