@@ -188,6 +188,13 @@
         .exp-draw { background: linear-gradient(#bdbdbd, #9e9e9e); }
         .exp-loss { background: linear-gradient(#ef9a9a, #e57373); }
         #explorer-list { max-height: 300px; overflow-y: auto; }
+        #movelist { max-height: 220px; overflow-y: auto; font-family: monospace; font-size: 0.85em; }
+        .ml-row { display: flex; gap: 6px; align-items: baseline; padding: 1px 0; }
+        .ml-num { color: #888; min-width: 26px; text-align: right; }
+        .ml-cell { flex: 1; display: flex; gap: 6px; flex-wrap: wrap; }
+        .ml-move { cursor: pointer; padding: 1px 5px; border-radius: 3px; }
+        .ml-move:hover { background: #3a3a5c; }
+        .ml-cur { background: #4a5db0; color: #fff; }
         #info-panel h3 {
             margin-bottom: 15px;
             color: #4CAF50;
@@ -693,6 +700,11 @@
                 <div id="explorer-list"></div>
             </div>
 
+            <div id="movelist-panel" style="display:none; margin-top:12px;">
+                <h4 style="color:#64b5f6; margin-bottom:6px;">Trekk</h4>
+                <div id="movelist"></div>
+            </div>
+
             <div id="pail-action" style="margin-top: 15px; display: none;">
                 <button class="skip-pail" onclick="enterPailPlacementMode()">Plasser melkespann (valgfritt)</button>
                 <p style="font-size:0.8em; color:#888; margin-top:5px;">Du kan plassere melkespannet nar som helst</p>
@@ -926,28 +938,76 @@
                 panel.style.display = 'block';
                 const mover = data.mover;
                 const rel = v => v.verdict === 'draw' ? 'draw' : (v.verdict === mover ? 'win' : 'loss');
+                // Win label: exact "om N" where distance is stored (<=5 barrels),
+                // else "~N" from the race-distance progress proxy in the big phases.
+                const winTag = v => v.dist != null ? ' om ' + v.dist
+                    : (v.progress != null ? ' ~' + Math.round(v.progress % 1e6) : '');
                 const label = v => v.verdict === 'draw' ? 'REMIS'
-                    : (rel(v) === 'win' ? 'VINN' : 'TAP') + (v.dist ? ' om ' + v.dist : '');
+                    : rel(v) === 'win' ? 'VINN' + winTag(v)
+                    : 'TAP' + (v.dist ? ' om ' + v.dist : '');
                 const rootRel = rel(data.root);
                 document.getElementById('explorer-root').textContent =
                     (mover === 'white' ? 'Hvit' : 'Svart') + ' i trekket — stillingen er ' +
                     (data.root.verdict === 'draw' ? 'REMIS' :
                      (rootRel === 'win' ? 'VUNNET' : 'TAPT') + (data.root.dist ? ' om ' + data.root.dist : '')) +
                     ' med perfekt spill';
+                // Winning moves first, sorted by progress (shortest win path on
+                // top); then draws; then losses. The top green move is the one
+                // that makes the most progress toward scoring.
                 const order = { win: 0, draw: 1, loss: 2 };
                 const rows = data.moves.slice().sort((a, b) =>
-                    order[rel(a)] - order[rel(b)] || (a.dist ?? 999) - (b.dist ?? 999));
+                    order[rel(a)] - order[rel(b)] ||
+                    ((a.progress ?? 9e9) - (b.progress ?? 9e9)));
                 const list = document.getElementById('explorer-list');
                 list.innerHTML = '';
-                for (const m of rows) {
+                rows.forEach((m, i) => {
                     const row = document.createElement('div');
                     row.className = 'exp-row';
-                    row.innerHTML = `<span class="exp-move">${fmtExpMove(m)}</span>` +
+                    const best = (rel(m) === 'win' && i === 0) ? '★ ' : '';
+                    row.innerHTML = `<span class="exp-move">${best}${fmtExpMove(m)}</span>` +
                         `<span class="exp-bar exp-${rel(m)}">${label(m)}</span>`;
                     row.onclick = () => playExplorerMove(m);
                     list.appendChild(row);
-                }
+                });
             } catch (e) { panel.style.display = 'none'; }
+        }
+
+        async function loadHistory() {
+            const panel = document.getElementById('movelist-panel');
+            if (!gameId) { panel.style.display = 'none'; return; }
+            try {
+                const data = await api(`/api/history/${gameId}`);
+                if (!data.moves.length) { panel.style.display = 'none'; return; }
+                panel.style.display = 'block';
+                // pair into "N. white black" rows (a rare pail sub-move just adds
+                // a second chip to that side's cell)
+                const rows = []; let cur = null;
+                for (const m of data.moves) {
+                    if (m.side === 'white') {
+                        if (!cur || cur.black.length) { cur = { num: rows.length + 1, white: [], black: [] }; rows.push(cur); }
+                        cur.white.push(m);
+                    } else {
+                        if (!cur) { cur = { num: rows.length + 1, white: [], black: [] }; rows.push(cur); }
+                        cur.black.push(m);
+                    }
+                }
+                const chip = m => `<span class="ml-move${m.ply === data.current_ply ? ' ml-cur' : ''}" onclick="gotoPly(${m.ply})">${m.notation}</span>`;
+                const ml = document.getElementById('movelist');
+                ml.innerHTML = rows.map(r =>
+                    `<div class="ml-row"><span class="ml-num">${r.num}.</span>` +
+                    `<span class="ml-cell">${r.white.map(chip).join('')}</span>` +
+                    `<span class="ml-cell">${r.black.map(chip).join('')}</span></div>`).join('');
+                ml.scrollTop = ml.scrollHeight;
+            } catch (e) { panel.style.display = 'none'; }
+        }
+
+        async function gotoPly(ply) {
+            try {
+                const data = await api(`/api/goto/${gameId}`, 'POST', { ply });
+                gameState = data.state; validMoves = data.valid_moves;
+                moveHistory = moveHistory.slice(0, ply + 1);
+                resetSelection(); renderBoard(); updateStatus(); loadExplorer(); loadHistory();
+            } catch (e) { alert('Feil: ' + e.message); }
         }
 
         async function playExplorerMove(m) {
@@ -1060,6 +1120,7 @@
         // Update status display
         function updateStatus() {
             setTimeout(loadExplorer, 0);
+            setTimeout(loadHistory, 0);
             if (exploreMode && gameState && !gameState.winner) {
                 playerColor = gameState.current_player;   // drive both sides
             }

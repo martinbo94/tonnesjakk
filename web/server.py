@@ -255,6 +255,22 @@ def explore(game_id: str):
         remaining = (4 - b.white_scored) + (4 - b.black_scored)
         return {"verdict": v[0], "dist": (v[1] if remaining <= 5 else None), "terminal": False}
 
+    mover = "white" if "White" in repr(board.current_player) else "black"
+
+    def progress(child, cd):
+        """Lower = closer to the mover's win, so winning moves sort shortest-
+        path first. The big phases are WDL-only (no distance), so there the
+        mover's single-agent race distance to the child is the progress proxy;
+        exact distance-to-win is used wherever it is stored (<= 5 barrels)."""
+        if cd["verdict"] != mover:
+            return None
+        if cd["terminal"]:
+            return 0.0
+        if cd["dist"] is not None:
+            return float(cd["dist"])            # exact plies to win
+        rd = ex.race_distances(child)           # (white, black) lone-side distance
+        return 1e6 + (rd[0] if mover == "white" else rd[1])
+
     rows = []
     for m in board.generate_moves():
         child = board.copy()
@@ -267,6 +283,7 @@ def explore(game_id: str):
             "barrel_to": (m.barrel_to.row, m.barrel_to.col),
         }
         d.update(probe_dict(child))
+        d["progress"] = progress(child, d)
         rows.append(d)
     return {
         "root": probe_dict(board),
@@ -511,6 +528,62 @@ def _do_ai_move(game: dict) -> Optional[dict]:
             }
 
     return None
+
+
+def _sqrc(row: int, col: int) -> str:
+    return f"{chr(97 + col)}{6 - row}"
+
+
+def _derive_move(before, after) -> dict:
+    """Notation for the make_move that turned `before` into `after`, by diffing
+    the two board snapshots — so the move log rides on board_history and needs
+    no bookkeeping at the (several) make_move call sites."""
+    is_white = "White" in repr(before.current_player)
+    pl = Player.White if is_white else Player.Black
+    bb = {(p.row, p.col) for p in before.find_barrels(pl)}
+    ab = {(p.row, p.col) for p in after.find_barrels(pl)}
+    gone, new = bb - ab, ab - bb
+    before_pail, after_pail = before.find_pail(pl), after.find_pail(pl)
+    scored = (after.white_scored - before.white_scored) if is_white else (after.black_scored - before.black_scored)
+    parts = []
+    if before_pail is None and after_pail is not None:
+        parts.append(f"🥛{_sqrc(after_pail.row, after_pail.col)}")
+    if len(gone) == 1 and len(new) == 1:
+        (fr, ft), (tr, tc) = next(iter(gone)), next(iter(new))
+        parts.append(f"{_sqrc(fr, ft)}→{_sqrc(tr, tc)}")
+    elif len(new) == 1 and not gone:
+        tr, tc = next(iter(new)); parts.append(f"+{_sqrc(tr, tc)}")
+    elif len(gone) == 1 and not new and scored > 0:
+        fr, fc = next(iter(gone)); parts.append(f"{_sqrc(fr, fc)}✓")
+    return {"side": "white" if is_white else "black", "notation": " ".join(parts) or "…"}
+
+
+@app.get("/api/history/{game_id}")
+def get_history(game_id: str):
+    if game_id not in games:
+        raise HTTPException(status_code=404, detail="Spill ikke funnet")
+    hist = games[game_id].get("board_history", [])
+    moves = [dict(ply=i + 1, **_derive_move(hist[i], hist[i + 1])) for i in range(len(hist) - 1)]
+    return {"moves": moves, "current_ply": len(hist) - 1}
+
+
+class GotoRequest(BaseModel):
+    ply: int
+
+
+@app.post("/api/goto/{game_id}")
+def goto(game_id: str, req: GotoRequest):
+    """Jump the live game back to the position after `ply` moves (ply 0 = start),
+    truncating history so you can explore a different line from there."""
+    if game_id not in games:
+        raise HTTPException(status_code=404, detail="Spill ikke funnet")
+    game = games[game_id]
+    hist = game.get("board_history", [])
+    if req.ply < 0 or req.ply >= len(hist):
+        raise HTTPException(status_code=400, detail="ply out of range")
+    game["board"] = hist[req.ply].copy()
+    game["board_history"] = hist[: req.ply + 1]
+    return {"state": board_to_dict(game["board"]), "valid_moves": get_valid_moves(game["board"])}
 
 
 def _format_move(move) -> str:
