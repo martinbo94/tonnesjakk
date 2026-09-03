@@ -281,6 +281,7 @@ def explore(game_id: str):
             "is_barrel_placement": m.is_barrel_placement,
             "barrel_from": (m.barrel_from.row, m.barrel_from.col) if m.barrel_from else None,
             "barrel_to": (m.barrel_to.row, m.barrel_to.col),
+            "barrel_path": [(p.row, p.col) for p in m.barrel_path],
         }
         d.update(probe_dict(child))
         d["progress"] = progress(child, d)

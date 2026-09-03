@@ -925,6 +925,9 @@
             if (m.place_pail) parts.push('🥛' + sqName(m.place_pail));
             if (m.is_pail_only) return parts[0];
             if (m.is_barrel_placement) parts.push('+' + sqName(m.barrel_to));
+            else if (m.barrel_path && m.barrel_path.length > 1)
+                // jump chain: show every landing so winding multi-jumps read correctly
+                parts.push(sqName(m.barrel_from) + '×' + m.barrel_path.map(sqName).join('×'));
             else parts.push(sqName(m.barrel_from) + '→' + sqName(m.barrel_to));
             return parts.join(' ');
         }
