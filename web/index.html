@@ -124,6 +124,30 @@
         }
         .flying-piece svg { width: 100%; height: 100%; }
 
+        /* Estimated-difficulty badge on the start screen */
+        .difficulty-badge {
+            margin: 6px 0 14px;
+            padding: 10px 14px;
+            border-radius: 8px;
+            border-left: 4px solid #5c6bc0;
+            background: rgba(92, 107, 192, 0.12);
+        }
+        .difficulty-badge .db-row {
+            display: flex;
+            align-items: baseline;
+            justify-content: space-between;
+            gap: 10px;
+        }
+        .difficulty-badge .db-tier { font-weight: 700; font-size: 1.05em; }
+        .difficulty-badge .db-elo { color: #b9c0e8; font-variant-numeric: tabular-nums; }
+        .difficulty-badge .db-hint { color: #9aa0b8; font-size: 0.82em; margin-top: 3px; }
+        /* Tier accent colours (easy → expert) */
+        .difficulty-badge.d1 { border-left-color: #66bb6a; background: rgba(102,187,106,0.12); }
+        .difficulty-badge.d2 { border-left-color: #9ccc65; background: rgba(156,204,101,0.12); }
+        .difficulty-badge.d3 { border-left-color: #ffca28; background: rgba(255,202,40,0.12); }
+        .difficulty-badge.d4 { border-left-color: #ff7043; background: rgba(255,112,67,0.12); }
+        .difficulty-badge.d5 { border-left-color: #ef5350; background: rgba(239,83,80,0.13); }
+
         .cell {
             width: 60px;
             height: 60px;
@@ -581,31 +605,26 @@
 
         <div class="option-group">
             <label>AI-motor:</label>
-            <select id="engine-select" onchange="onEngineTypeChange()">
-                <option value="heuristic" selected>Heuristikk (alpha-beta)</option>
-                <option value="alphazero">AlphaZero (MCTS + nettverk)</option>
+            <select id="engine-select" onchange="updateDifficultyBadge()">
+                <option value="ml" selected>ML nettverk + søk</option>
+                <option value="rule_based">Regelbasert evaluering + søk</option>
             </select>
         </div>
 
-        <div class="option-group" id="depth-group">
-            <label>AI-vanskelighetsgrad:</label>
-            <select id="depth-select">
-                <option value="3">Lett (dybde 3)</option>
-                <option value="5">Medium (dybde 5)</option>
-                <option value="6" selected>Vanskelig (dybde 6)</option>
-                <option value="7">Ekspert (dybde 7)</option>
+        <div class="option-group" id="time-group">
+            <label>Betenkningstid per trekk:</label>
+            <select id="time-select" onchange="updateDifficultyBadge()">
+                <option value="50">50 ms — lynrask</option>
+                <option value="100">100 ms — rask</option>
+                <option value="200" selected>200 ms — normal</option>
+                <option value="500">500 ms — grundig</option>
+                <option value="1000">1000 ms — dyp</option>
+                <option value="2000">2000 ms — maksimal</option>
             </select>
         </div>
 
-        <div class="option-group" id="simulations-group" style="display:none;">
-            <label>MCTS simuleringer:</label>
-            <select id="simulations-select">
-                <option value="100">100 (rask)</option>
-                <option value="200">200</option>
-                <option value="300" selected>300 (standard)</option>
-                <option value="400">400 (sterk)</option>
-            </select>
-        </div>
+        <!-- Live estimated difficulty for the selected engine + time -->
+        <div id="difficulty-badge" class="difficulty-badge"></div>
 
         <button onclick="startGame()">Start spill</button>
             <button onclick="startGame(true)" style="margin-top:10px; background:#5c6bc0; border:none; color:#fff; padding:12px 24px; border-radius:6px; font-size:1.05em; cursor:pointer; width:100%;">⬜ Utforsk tablebase (analyse)</button>
@@ -832,22 +851,56 @@
             return res.json();
         }
 
-        // Toggle engine-specific options
-        function onEngineTypeChange() {
-            const engineType = document.getElementById('engine-select').value;
-            document.getElementById('depth-group').style.display =
-                engineType === 'heuristic' ? '' : 'none';
-            document.getElementById('simulations-group').style.display =
-                engineType === 'alphazero' ? '' : 'none';
+        // --- Difficulty / Elo estimation -----------------------------------
+        // Playing strength anchored on the repo's measured rating lists:
+        //   RATINGS.md      heur-100ms = 1500, net3-tb-100ms = 1850, heur-d4 = 1058
+        //   TIME_SCALING.md net3+tb barely gains with time (~+15 Elo/doubling, noisy)
+        // The rule-based eval is cheap, so it converts time into search depth
+        // faster and is the more time-sensitive engine; the ML(+tablebase) engine
+        // is near its knowledge ceiling and plateaus. Points between anchors are
+        // linearly interpolated — 100 ms is measured, the rest are estimates.
+        const ELO_ANCHORS = {
+            ml:         [[50, 1845], [100, 1850], [200, 1890], [500, 1905], [1000, 1918], [2000, 1930]],
+            rule_based: [[50, 1330], [100, 1500], [200, 1570], [500, 1620], [1000, 1655], [2000, 1685]],
+        };
+        function estimateElo(engine, timeMs) {
+            const pts = ELO_ANCHORS[engine] || ELO_ANCHORS.ml;
+            if (timeMs <= pts[0][0]) return pts[0][1];
+            if (timeMs >= pts[pts.length - 1][0]) return pts[pts.length - 1][1];
+            for (let i = 0; i < pts.length - 1; i++) {
+                const [t0, e0] = pts[i], [t1, e1] = pts[i + 1];
+                if (timeMs >= t0 && timeMs <= t1) {
+                    return Math.round(e0 + (e1 - e0) * (timeMs - t0) / (t1 - t0));
+                }
+            }
+            return pts[pts.length - 1][1];
+        }
+        function difficultyTier(elo) {
+            if (elo < 1350) return { word: 'Lett',      cls: 'd1', hint: 'En avslappet motstander — til å slå med litt planlegging.' };
+            if (elo < 1550) return { word: 'Middels',   cls: 'd2', hint: 'Spiller solid og straffer åpenbare feil.' };
+            if (elo < 1750) return { word: 'Sterk',     cls: 'd3', hint: 'Krever nøyaktig spill for å slå.' };
+            if (elo < 1880) return { word: 'Vanskelig', cls: 'd4', hint: 'Nær toppnivå — feil blir sjelden tilgitt.' };
+            return               { word: 'Ekspert',   cls: 'd5', hint: 'Spiller tilnærmet perfekt (spillet er løst).' };
+        }
+        function updateDifficultyBadge() {
+            const engine = document.getElementById('engine-select').value;
+            const timeMs = parseInt(document.getElementById('time-select').value);
+            const elo = estimateElo(engine, timeMs);
+            const tier = difficultyTier(elo);
+            const el = document.getElementById('difficulty-badge');
+            el.className = 'difficulty-badge ' + tier.cls;
+            el.innerHTML =
+                `<div class="db-row"><span class="db-tier">Vanskelighetsgrad: ${tier.word}</span>` +
+                `<span class="db-elo">~${elo} Elo</span></div>` +
+                `<div class="db-hint">${tier.hint}</div>`;
         }
 
         // Start new game
         async function startGame(explore = false) {
             exploreMode = !!explore;
             playerColor = exploreMode ? 'white' : document.getElementById('color-select').value;
-            const depth = parseInt(document.getElementById('depth-select').value);
             const engineType = document.getElementById('engine-select').value;
-            const simulations = parseInt(document.getElementById('simulations-select').value);
+            const timeMs = parseInt(document.getElementById('time-select').value);
 
             document.getElementById('start-screen').style.display = 'none';
             document.getElementById('game-container').style.display = 'flex';
@@ -861,12 +914,10 @@
             try {
                 const body = {
                     player_color: 'white',
-                    ai_depth: depth,
-                    engine_type: exploreMode ? 'heuristic' : engineType,
+                    // Explore mode uses the full-strength engine at a modest budget.
+                    engine_type: exploreMode ? 'ml' : engineType,
+                    ai_time_ms: exploreMode ? 200 : timeMs,
                 };
-                if (engineType === 'alphazero') {
-                    body.mcts_simulations = simulations;
-                }
                 const data = await api('/api/new-game', 'POST', body);
 
                 gameId = data.game_id;
@@ -1049,11 +1100,19 @@
         }
 
         async function gotoNode(id) {
+            const myToken = ++navToken;
+            const oldBoard = gameState ? gameState.board : null;
             try {
                 const data = await api(`/api/goto-node/${gameId}`, 'POST', { node_id: id });
+                if (myToken !== navToken) return;  // a newer navigation superseded us
+                // Animate only a clean single-barrel step (forward or backward);
+                // bigger jumps just snap. Fast (~90 ms) and abortable for rapid arrows.
+                const diff = oldBoard ? barrelMoveDiff(oldBoard, data.state.board) : null;
+                if (diff) await glideNav(diff.from, diff.to, diff.color, myToken);
+                if (myToken !== navToken) return;  // superseded mid-glide
                 gameState = data.state; validMoves = data.valid_moves;
-                resetSelection(); renderBoard(); updateStatus(); loadExplorer(); loadTree();
-            } catch (e) { alert('Feil: ' + e.message); }
+                resetSelection(); commitGlide(); renderBoard(); updateStatus(); loadExplorer(); loadTree();
+            } catch (e) { commitGlide(); alert('Feil: ' + e.message); }
         }
 
         async function playExplorerMove(m) {
@@ -1590,27 +1649,15 @@
             return { x: cell.offsetLeft, y: cell.offsetTop, w: cell.offsetWidth, h: cell.offsetHeight };
         }
 
-        // Slide a flying barrel over the current board along [from, ...path].
-        // Leaves the overlay parked at the destination and animHide set; the
-        // caller assigns the new state, calls commitGlide(), then renderBoard().
-        // Returns true if it animated, false if there was nothing to glide.
-        async function glideMove(move) {
-            if (!move || move.is_pail_only || move.is_barrel_placement) return false;
-            const from = move.barrel_from;
-            if (!from) return false;
-            const path = (move.barrel_path && move.barrel_path.length)
-                ? move.barrel_path
-                : (move.barrel_to ? [move.barrel_to] : []);
-            if (!path.length) return false;
-            const pieceVal = gameState.board[from[0]][from[1]];  // the moving barrel
-            if (!pieceVal) return false;
-
-            const dest = path[path.length - 1];
-            const hops = path.length;  // number of slides
-            // Lively but readable: a touch quicker per hop when there are several.
-            const perHop = hops > 1 ? 130 : 200;
-
+        // Core slide: render the board with `from` + destination empty, drop a
+        // flying overlay at `from` and transition it through `path` at perHop ms
+        // each. Leaves the overlay parked at the destination and animHide set;
+        // the caller assigns the new state, calls commitGlide(), then renderBoard().
+        // `shouldAbort()` (optional) lets a caller cancel between hops (nav uses it).
+        async function slideOverlay(from, path, pieceVal, perHop, shouldAbort) {
+            if (_flyEl) { _flyEl.remove(); _flyEl = null; }  // drop any orphan overlay
             animating = true;
+            const dest = path[path.length - 1];
             animHide = [from, dest];
             renderBoard();  // draw board with origin + dest empty
 
@@ -1629,12 +1676,53 @@
             fly.style.transition = `left ${perHop}ms ease-in-out, top ${perHop}ms ease-in-out`;
 
             for (const [pr, pc] of path) {
+                if (shouldAbort && shouldAbort()) return;
                 const r = cellRect(pr, pc);
                 fly.style.left = (r.x + pad) + 'px';
                 fly.style.top = (r.y + pad) + 'px';
                 await sleep(perHop);
             }
+        }
+
+        // Slide a flying barrel over the current board along a move's path.
+        // Returns true if it animated, false if there was nothing to glide.
+        async function glideMove(move) {
+            if (!move || move.is_pail_only || move.is_barrel_placement) return false;
+            const from = move.barrel_from;
+            if (!from) return false;
+            const path = (move.barrel_path && move.barrel_path.length)
+                ? move.barrel_path
+                : (move.barrel_to ? [move.barrel_to] : []);
+            if (!path.length) return false;
+            const pieceVal = gameState.board[from[0]][from[1]];  // the moving barrel
+            if (!pieceVal) return false;
+            // Lively but readable: a touch quicker per hop when there are several.
+            await slideOverlay(from, path, pieceVal, path.length > 1 ? 130 : 200);
             return true;
+        }
+
+        // Which single barrel moved between two board snapshots (endpoints only).
+        // Returns {from,to,color} for a clean one-barrel move, else null (placement,
+        // pail-only, scoring, or a multi-ply jump — those just render instantly).
+        function barrelMoveDiff(oldB, newB) {
+            const gone = [], appeared = [];
+            for (let r = 0; r < BOARD_SIZE; r++) for (let c = 0; c < BOARD_SIZE; c++) {
+                const o = oldB[r][c], n = newB[r][c];
+                if (Math.abs(o) === 1 && n !== o) gone.push([r, c, o]);
+                if (Math.abs(n) === 1 && n !== o) appeared.push([r, c, n]);
+            }
+            if (gone.length === 1 && appeared.length === 1 && gone[0][2] === appeared[0][2]) {
+                return { from: [gone[0][0], gone[0][1]], to: [appeared[0][0], appeared[0][1]], color: gone[0][2] };
+            }
+            return null;
+        }
+
+        // Fast, interruptible glide used for back/forward navigation. A newer
+        // navigation bumps navToken, which aborts any in-flight nav glide so
+        // rapid arrow presses keep pace instead of queuing up.
+        let navToken = 0;
+        async function glideNav(from, to, color, myToken) {
+            await slideOverlay(from, [to], color, 90, () => myToken !== navToken);
         }
 
         // Remove the flying overlay and stop hiding squares. Clear animHide
@@ -2246,6 +2334,9 @@
                     break;
             }
         });
+
+        // Show the estimated difficulty for the default engine + time on load.
+        updateDifficultyBadge();
     </script>
 </body>
 </html>

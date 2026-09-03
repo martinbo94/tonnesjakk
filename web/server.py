@@ -58,10 +58,11 @@ class MoveRequest(BaseModel):
 
 class NewGameRequest(BaseModel):
     player_color: str = "white"  # "white" eller "black"
-    ai_depth: int = 6
-    engine_type: str = "heuristic"   # "heuristic" | "alphazero"
-    model_path: Optional[str] = None  # for AlphaZero
-    mcts_simulations: int = 300       # for AlphaZero only
+    ai_time_ms: int = 200        # time budget per move (iterative deepening)
+    ai_depth: int = 6            # fallback depth (used by the analyze endpoint)
+    # "ml"         = NNUE evaluation + alpha-beta search + solved-endgame tablebases
+    # "rule_based" = hand-crafted evaluation + alpha-beta search (no net, no TB)
+    engine_type: str = "ml"
 
 
 # ── Tablebase explorer: one shared engine with every solved phase mmap'd.
@@ -140,57 +141,43 @@ def new_game(req: NewGameRequest):
 
     board = Board()
     engine = Engine()
-    # Strongest available evaluator: the current best NNUE (models/), if present.
-    default_nnue = Path(__file__).resolve().parent.parent / "models" / "net3_plain_m_d20_64x16_b25_l05.json"
-    if req.engine_type == "heuristic" and default_nnue.exists():
-        try:
-            engine.load_nnue(str(default_nnue))
-            print(f"# Loaded NNUE: {default_nnue.name}")
-        except Exception as e:
-            print(f"# NNUE load failed ({e}); using handcrafted eval")
-    # Solved endgame phases (memory-mapped; +15-25 Elo, perfect draw-holding).
-    tb_dir = Path(__file__).resolve().parent.parent / "tablebases"
-    if req.engine_type == "heuristic" and tb_dir.is_dir():
-        try:
-            phases = engine.load_tablebases(str(tb_dir))
-            print(f"# Loaded tablebases: {phases}")
-        except Exception as e:
-            print(f"# Tablebase load failed ({e}); continuing without")
+    # The "ml" engine = NNUE evaluation + solved-endgame tablebases (the deployed
+    # ~1850-Elo config). The "rule_based" engine deliberately uses neither, so it
+    # plays on the hand-crafted evaluation alone (~1500 Elo at 100 ms).
+    use_ml = req.engine_type == "ml"
+    if use_ml:
+        default_nnue = Path(__file__).resolve().parent.parent / "models" / "net3_plain_m_d20_64x16_b25_l05.json"
+        if default_nnue.exists():
+            try:
+                engine.load_nnue(str(default_nnue))
+                print(f"# Loaded NNUE: {default_nnue.name}")
+            except Exception as e:
+                print(f"# NNUE load failed ({e}); using handcrafted eval")
+        # Solved endgame phases (memory-mapped; +15-25 Elo, perfect draw-holding).
+        tb_dir = Path(__file__).resolve().parent.parent / "tablebases"
+        if tb_dir.is_dir():
+            try:
+                phases = engine.load_tablebases(str(tb_dir))
+                print(f"# Loaded tablebases: {phases}")
+            except Exception as e:
+                print(f"# Tablebase load failed ({e}); continuing without")
 
     game_data = {
         "board": board,
         "engine": engine,
         "player_color": req.player_color,
         "ai_depth": req.ai_depth,
+        "ai_time_ms": max(10, int(req.ai_time_ms)),
         "engine_type": req.engine_type,
         "board_history": [board.copy()],
     }
 
-    # Set up AlphaZero if requested
-    if req.engine_type == "alphazero":
-        model_path = req.model_path
-        if not model_path:
-            # Default model path
-            model_path = str(Path(__file__).resolve().parent.parent / "alphazero_v19" / "best_model.pt")
-        try:
-            eval_fn = _load_alphazero_eval(model_path)
-            mcts_engine = MCTSEngine(req.mcts_simulations, 1.4)
-            game_data["eval_fn"] = eval_fn
-            game_data["mcts_engine"] = mcts_engine
-            game_data["mcts_simulations"] = req.mcts_simulations
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Failed to load AlphaZero model: {e}")
-
     games[game_id] = game_data
     _init_tree(game_data)
 
-    engine_label = req.engine_type
-    if req.engine_type == "alphazero":
-        engine_label += f" ({req.mcts_simulations} sims)"
-
     print(f"\n{'#'*50}")
     print(f"# NYTT SPILL: {game_id}")
-    print(f"# Spiller: {req.player_color}, Engine: {engine_label}, Dybde: {req.ai_depth}")
+    print(f"# Spiller: {req.player_color}, Engine: {req.engine_type}, Tid/trekk: {game_data['ai_time_ms']} ms")
     print(f"{'#'*50}\n")
 
     result = {
@@ -493,10 +480,13 @@ def _do_ai_move(game: dict) -> Optional[dict]:
         barrel_move = None
         last_result = None
         total_nodes = 0
+        time_ms = game.get("ai_time_ms", 200)
 
         for _ in range(2):  # at most: pail sub-move + barrel move
             engine.set_game_history(_recent_hashes(game))
-            ai_result = engine.search(board, game["ai_depth"])
+            # Time-based iterative deepening (the difficulty knob). Both engines
+            # share this loop; only their evaluators (NNUE+TB vs hand-crafted) differ.
+            ai_result = engine.search_timed(board, time_ms)
             if ai_result.best_move is None:
                 break
             move = ai_result.best_move
