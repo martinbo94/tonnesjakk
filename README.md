@@ -1,6 +1,12 @@
 # Tonnesjakk AI
 
-An AI engine for **Tonnesjakk** ("barrel chess"), a Norwegian board game from TV2's *Farmen Kjendis*. Built as a Rust/Python hybrid with a game tree search engine and a neural network evaluation function trained through self-play.
+An AI engine for **Tonnesjakk** ("barrel chess"), a Norwegian board game from TV2's *Farmen Kjendis*. Built as a Rust/Python hybrid with a game tree search engine, a neural network evaluation function trained through self-play, and endgame tablebases.
+
+> ### ⬜ The game is solved — first player wins.
+>
+> As of 2026-09-03 Tonnesjakk is **strongly solved** under the adopted draw rules: every one of the ~1.5 trillion legal states carries a proven win/draw/loss, and `tablebase_probe(initial position)` returns **White wins**. From the opening, **all six barrel placements win; placing the pail on move 1 (any of the 36 squares) loses; no first move draws.** A perfect game runs 37 plies. See [The Complete Solve](#the-complete-solve) below and [`ENGINE_ROADMAP.md`](ENGINE_ROADMAP.md) for the full story.
+>
+> The playing engine (net-3 NNUE + twice-tuned search + tablebases) is **~1850 Elo** vs a 1500 heuristic anchor and 1058 for the old depth-4 baseline — see [`RATINGS.md`](RATINGS.md).
 
 ## The Game
 
@@ -10,9 +16,30 @@ Tonnesjakk is played on a 6x6 board. Two players (white and black) each have **4
 - Barrels start off the board and are placed from your own back row
 - Barrels move one square in any direction (orthogonal or diagonal — 8 directions total)
 - Barrels can **jump over** adjacent pieces, landing on the empty square behind them (like checkers)
-- Each player gets one **pail** per game — a piece that can be placed anywhere on the board as a permanent blocker
+- Each player gets one **pail** per game — a piece that can be placed on any empty square as a permanent blocker. Placing it is an optional sub-move on any of your turns, made *before* your barrel move
+- **Draw rules**: threefold repetition of a position is a draw, as is 60 consecutive plies without progress (no barrel placement, pail placement, or scoring)
 
 The game is deceptively tactical: barrel chains create jump sequences, the pail can block key lanes, and the 6x6 board means every move matters.
+
+## The Complete Solve
+
+Tonnesjakk is now **strongly solved** — the value of every legal position is known. This was done with **retrograde endgame tablebases**, one material phase at a time. A phase is `(white barrels remaining, black barrels remaining)`; scoring is irreversible, so phases form a DAG and small phases are solved first, then looked up when a move scores.
+
+| Coverage | States | On disk |
+|---|---|---|
+| ≤ 5 barrels remaining (exact distance-to-win, 1 byte/state) | ~0.9 B | small |
+| 3v3, 4v1, 4v2 (2-bit win/draw/loss, valid-only packed) | ~80 B | ~14 GB |
+| 4v3 / 3v4 (2-bit WDL) | 367 B | 92 GB |
+| **4v4** (2-bit WDL, white-to-move only) | **1.085 T** | 271 GB |
+| **Total** | **~1.5 T** (~3.1 T answerable via colour mirror) | ~363 GB (41.5 GB zstd) |
+
+Key results and techniques:
+- **Result:** side to move wins 59.18% / loses 35.05% / draws 5.77% in 4v4; draw share grows with material (0.5% in 3v3 → 5.8% in 4v4), and the initial position is a clean White win.
+- **Storage:** valid-only combinatorial indexing (skips illegal states → 4v4 is 271 GB not 340+), colour-symmetry halving, and a 2-bit WDL format for the big phases (distance would need ~1 TB for 4v4 alone).
+- **Solver:** in-place atomic Gauss-Seidel retrograde with resumable per-pass checkpoints; the 4v4 fixpoint took 49 h on a single GCP spot VM (~$48 all-in). The full runbook and scripts are in [`scripts/gcp/`](scripts/gcp/RUNBOOK.md).
+- **In play:** the engine memory-maps the tablebases (`Engine.load_tablebases(dir)`) and probes them in search — worth **+25 Elo** at ≤6-barrel coverage and **+87 Elo** once ≤7 (after the first score) is covered. WDL-only wins are scored with a race-distance progress term so they convert without shuffling into a draw.
+
+The web UI includes a **tablebase explorer** (lichess-database style): every legal move shows its proven verdict, winning moves are sorted shortest-path-first, and you can step through a perfectly-played line. See [Play via Web UI](#play-via-web-ui).
 
 ## How It Works
 
@@ -58,9 +85,13 @@ A small neural network trained on millions of self-play positions. More on this 
 
 [NNUE](https://www.chessprogramming.org/NNUE) (Efficiently Updatable Neural Network) is a technique pioneered in Shogi engines and adopted by Stockfish in 2020. The key insight: a small neural network can be dramatically faster than a large one if you design it so the first layer only needs **incremental updates** when a move is made.
 
-### Architecture: HalfPail NNUE
+### Architecture: a generic SparseNNUE
 
-The current NNUE uses a **dual-perspective** architecture inspired by Stockfish's HalfKP. Instead of encoding the board as a flat feature vector, it uses the pail position as a "bucket" to specialize the network:
+The engine's evaluator is a **generic `SparseNNUE`** (`src/nnue.rs`, trained via `python/tonnesjakk/nnue_arch.py`) parameterized by a config: feature set (`halfpail` or `plain`), black-perspective mirroring, dense-feature count (0/20/28), hidden-layer sizes, and 1 or 25 output "buckets" keyed on the scored-barrel counts. This let us run a **tournament over architectures on one shared dataset** (see [`ENGINE_ROADMAP.md`](ENGINE_ROADMAP.md)) rather than commit to one design.
+
+**The deployed net (net-3)** is a `plain`-feature, mirrored, dense-20, **64×16**, 25-bucket net — deliberately *small*, because at a fixed 100 ms the cheaper eval searches deeper and depth beats a marginally better evaluation. Five tournament rounds showed size, width, data volume, and label quality all plateau within ~±15 Elo of net-3; the big gains this project came from **search tuning (+60/+54 Elo)** and **tablebases (+87 Elo)**, not the net.
+
+The **HalfPail** feature set below is the dual-perspective design (inspired by Stockfish's HalfKP) that seeded the line; it lost to the `plain` piece-plane feature set on real data but the mechanics (incremental updates, SIMD, sparse embedding) are identical for both:
 
 ```
 Sparse features (3996 per perspective)
@@ -210,14 +241,15 @@ python -m tonnesjakk.alphazero --evaluate alphazero_resnet/best_model.pt --games
 └───────────────────────┬──────────────────────────────┘
                         │ PyO3
 ┌───────────────────────▼──────────────────────────────┐
-│         Rust Core (src/ — 4 modules + lib.rs)        │
+│              Rust Core (src/ + lib.rs)               │
 │                                                      │
-│  board.rs    Board, BitBoard, moves, Zobrist hashing │
-│  nnue.rs     IncrementalNNUE, QuantizedNNUE,         │
-│              HalfPailNNUE, EvalCache                 │
-│  search.rs   BitBoardEngine, TT, Engine (Python API) │
-│  mcts.rs     MCTSEngine with batched NN eval         │
-│  lib.rs      Module glue, re-exports, pymodule       │
+│  board.rs      Board, BitBoard, moves, Zobrist       │
+│  race.rs       Single-agent race-distance table      │
+│  nnue.rs       Generic SparseNNUE + EvalCache        │
+│  search.rs     Alpha-beta engine, TT, tablebase probe│
+│  tablebase.rs  Retrograde solver + packed WDL tables │
+│  mcts.rs       MCTSEngine with batched NN eval       │
+│  lib.rs        pymodule, data decoder, solve entry   │
 └──────────────────────────────────────────────────────┘
                         │ PyO3
 ┌───────────────────────▼──────────────────────────────┐
@@ -230,7 +262,7 @@ python -m tonnesjakk.alphazero --evaluate alphazero_resnet/best_model.pt --games
 └──────────────────────────────────────────────────────┘
 ```
 
-The Rust engine (~5,600 lines across 4 modules) handles everything performance-critical: board representation, move generation, search, NNUE inference, and MCTS tree search. Python handles neural network training and the web UI. The two communicate through [PyO3](https://pyo3.rs/) bindings, compiled with [maturin](https://github.com/PyO3/maturin).
+The Rust core handles everything performance-critical: board representation, move generation, search, NNUE inference, MCTS, and the retrograde tablebase solver. Python handles neural network training and the web UI. The two communicate through [PyO3](https://pyo3.rs/) bindings, compiled with [maturin](https://github.com/PyO3/maturin).
 
 ### Board Representation: Bitboards
 
@@ -268,7 +300,10 @@ python server.py
 # Open http://localhost:8000
 ```
 
-After a game ends, use the arrow keys to step through moves. Each position is automatically analyzed by the engine with progressive deepening — the best move is highlighted on the board (cyan from-square, green to-square) and the eval/depth/nodes update live.
+The start screen offers two modes:
+
+- **Play a game** — human vs the engine (heuristic+NNUE+tablebases, or AlphaZero). After a game ends, step through moves with the arrow keys; each position is analyzed with progressive deepening, the best move highlighted on the board (cyan from-square, green to-square), eval/depth/nodes live.
+- **Explore tablebase** — a lichess-database-style solved-game browser (requires the `tablebases/` directory present). Every legal move shows its **proven** verdict (WIN/DRAW/LOSS), winning moves are sorted shortest-path-first with the distance-to-win, jump chains render their full path (`c1×a3×a1×c3`), a clickable move log lets you jump back to any position, and a one-click engine converter plays the actual winning move. You drive both sides — no numbers here are statistics, they are theorems.
 
 ### Use from Python
 
@@ -277,7 +312,7 @@ from tonnesjakk import Board, Engine
 
 board = Board()
 engine = Engine()
-engine.load_nnue("nnue_halfpail/nnue_weights.json")
+engine.load_nnue("runs/best/nnue_weights.json")  # optional; heuristic eval otherwise
 
 result = engine.search(board, depth=7)
 print(f"Best move: {result.best_move}, Score: {result.score}")
@@ -286,63 +321,117 @@ board.make_move(result.best_move)
 
 ### Train a New NNUE
 
+One dataset serves every architecture: positions are stored as full board
+state (144 one-hot piece planes + 20 relational features) with two labels
+(search score, game outcome), and each architecture derives its own sparse
+features at training time via the Rust decoder — the same code the engine
+evaluates with.
+
 ```bash
-# Generate self-play data (streaming mode, 8 parallel workers)
-python -m tonnesjakk.nnue --games 250000 --depth 7 --lambda 1.0 --workers 8 --save-data training_d7.bin --save-every 5000
+# Generate self-play data (checkpointed every 1000 games, resumable — rerun the same command)
+python -m tonnesjakk.nnue --generate-only --games 150000 --depth 8 --random-moves 6 --workers 4 \
+    --save-data training_gen1_d8.bin --save-every 1000
 
-# Train HalfPail NNUE on existing data
-python -m tonnesjakk.nnue --load-data training_consolidator_d9.bin --epochs 50 --halfpail
+# Train an architecture on existing data (runs on Apple Silicon GPU via MPS, or CUDA)
+python -m tonnesjakk.nnue --load-data training_gen1_d8.bin --feature-set plain --mirror \
+    --output-buckets 25 --arch 256 32 --epochs 50 --lambda 0.8 --output runs/plain_m_256
 
-# Compare NNUE vs heuristic (time-limited, more realistic)
-python scripts/test_model.py nnue_halfpail/nnue_weights.json --time-ms 200 --games 50
-
-# Compare at fixed depth
-python -m tonnesjakk.nnue --compare nnue_halfpail/nnue_weights.json heuristic --compare-games 50 --depth 5
+# Measure strength — always at equal TIME, with the match harness
+python scripts/match.py --time-a 100 --time-b 100 --nnue-a runs/plain_m_256/nnue_weights.json \
+    --games 400 --sprt 0 10
 ```
 
-## Performance
+Architecture knobs: `--feature-set halfpail|plain`, `--mirror` (black perspective
+sees a flipped board), `--no-dense`, `--output-buckets 1|25` (heads keyed on
+scored counts), `--arch H1 H2`, `--lambda` (search-score vs outcome blend).
 
-On a modern CPU (single-threaded):
+### Measuring changes
 
-| Metric | Heuristic eval | HalfPail NNUE |
-|--------|---------------|---------------|
-| Nodes/sec | ~500K | ~54K (undertrained) |
-| Typical depth in 1s | 10-12 | 5-7 |
-
-The HalfPail NNUE is currently undertrained (5 epochs). Poor eval quality causes inefficient pruning, which reduces effective NPS. Extended training should improve both eval quality and search efficiency simultaneously.
+Every engine change is gated by `scripts/match.py`: paired random openings
+played with both colors, real draw rules, fixed time or depth, Elo with 95% CI
+over pairs, and an SPRT stop rule (`--sprt 0 10` gainer, `--sprt -5 0`
+simplification). Pruning/search changes must also pass at a slower time
+control. Eval weights are tuned with `scripts/spsa_tune.py`. Rationale, the
+measurement log, and the roadmap live in `ENGINE_ROADMAP.md`.
 
 ## Project Structure
 
 ```
 tonnesjakk/
 ├── src/
-│   ├── board.rs                  # Board, BitBoard, moves, Zobrist (~1600 lines)
-│   ├── nnue.rs                   # NNUE variants + EvalCache (~1860 lines)
-│   ├── search.rs                 # Alpha-beta engine + TT (~1700 lines)
-│   ├── mcts.rs                   # MCTS with batched NN eval (~1550 lines)
-│   └── lib.rs                    # Module glue, re-exports, pymodule (~490 lines)
+│   ├── board.rs                  # Board, BitBoard, moves, draw clock, Zobrist
+│   ├── race.rs                   # Single-agent race distance table (eval term)
+│   ├── nnue.rs                   # Generic SparseNNUE evaluator + EvalCache
+│   ├── search.rs                 # Alpha-beta engine, TT, draw rules, tablebase probe, Engine API
+│   ├── tablebase.rs              # Retrograde solver, packed 2-bit WDL tables, DTW search
+│   ├── mcts.rs                   # MCTS with batched NN eval (AlphaZero line)
+│   └── lib.rs                    # pymodule, training-data decoder, solve entry points, tests
 ├── python/tonnesjakk/
-│   ├── nnue.py                   # Supervised NNUE training pipeline
+│   ├── nnue.py                   # Self-play data generation + training CLI
+│   ├── nnue_arch.py              # NnueArch, SparseNNUE model, trainer, JSON export
 │   ├── alphazero.py              # AlphaZero self-play training
-│   ├── mcts.py                   # Python MCTS (reference impl)
-│   ├── utils.py                  # Shared helpers (ELO, device, etc.)
+│   ├── utils.py                  # Shared helpers (device detection, etc.)
 │   └── __init__.py               # Python package init
 ├── web/
-│   ├── server.py                 # FastAPI web backend + post-game analysis API
-│   └── index.html                # Game UI with post-game engine analysis overlay
+│   ├── server.py                 # FastAPI backend: play, post-game analysis, tablebase explorer
+│   └── index.html                # Game UI + solved-game explorer (verdicts, move log, converter)
+├── models/                       # Promoted NNUEs (deployed net + frozen ladder rungs)
+├── tablebases/                   # Solved endgame phases (gitignored; ~363 GB)
 ├── scripts/
+│   ├── match.py                  # Match harness: paired openings, Elo CI, SPRT
+│   ├── spsa_tune.py              # SPSA tuning of eval weights AND search knobs
+│   ├── nnue_tournament.py        # Architecture tournament (rounds 1–10)
+│   ├── ladder.py                 # Cross-generation strength ladder
+│   ├── rating_tournament.py      # ML-Elo round-robin → RATINGS.md
+│   ├── tc_scaling.py             # Time-control scaling study → TIME_SCALING.md
 │   ├── train_alphazero.py        # Chunked AlphaZero training runner
-│   ├── test_model.py             # Time-based model comparison
-│   ├── bench_engine.py           # Engine speed benchmarks
-│   └── diagnose_wdl.py           # Per-move NNUE diagnostic tool
-├── nnue_halfpail/
-│   ├── nnue_weights.json         # Trained HalfPail NNUE weights
-│   └── nnue_model.pt             # PyTorch model checkpoint
-├── ENGINE_IMPROVEMENTS.md        # Search optimization roadmap
-├── CLAUDE.md                     # AI assistant project context
+│   ├── gcp/                      # Cloud tablebase-solve runbook + VM scripts
+│   └── bench_engine.py, inspect_model.py, watch_game.py
+├── ENGINE_ROADMAP.md             # Strategy, measurement log, research, the full solve
+├── RATINGS.md                    # Cross-generation Elo list (auto-generated)
+├── TIME_SCALING.md               # Elo vs time-per-move study (auto-generated)
+├── ALPHAZERO_RUNS.md             # History of the AlphaZero experiments
 ├── Cargo.toml                    # Rust dependencies
 └── pyproject.toml                # Python/maturin build config
 ```
+
+## Heuristic Tuning: What Worked and What Didn't
+
+The heuristic evaluation weights are tuned with SPSA (`scripts/spsa_tune.py`) and
+validated with `scripts/match.py`; the current defaults live in
+`BitBoardEngine::new` (`src/search.rs`) with their validation results, and the
+full log is in `ENGINE_ROADMAP.md`. The largest single eval term is the
+single-agent **race distance table** (`src/race.rs`, `weight_race`): exact
+min-moves for a lone side to score all remaining barrels, jump chains
+included — +36 Elo at depth 5 and +63 at depth 7 over the previous eval.
+
+**Historical hand-tuned configuration** (2026-02, before SPSA and the race term):
+
+| Weight | Value | Description |
+|--------|-------|-------------|
+| progress | 80 | Per-row advancement bonus |
+| center_pail | 15 | Pail centrality bonus |
+| blocking | 20 | Pail blocking enemy barrels |
+| scored | 700 | Per barrel scored |
+| threat | 150 | Barrels at dist==1 from goal |
+| threat2 | 100 | Barrels at dist==2 from goal |
+| mobility | 12 | Forward empty squares per barrel |
+| passed | 80 | Barrels with clear column path to goal |
+| jump | 60 | Forward jumps available per barrel |
+
+**Ideas that were tested and rejected:**
+
+| Feature | What it does | Result | Why it failed |
+|---------|-------------|--------|---------------|
+| **Scoring threat extension** (`ext_threat`) | +1 ply search extension when a barrel reaches dist==1 from goal (analogous to check extension in chess) | 50.6% over 500 games vs baseline — no measurable benefit | The engine already handles threats well at depth 7. The existing threat/threat2 eval terms and good move ordering (goal-reaching moves scored high) make the extra search depth redundant. |
+| **Jump-to-score eval** (`weight_jump_score`) | Bonus per barrel that can chain-jump to the goal row in one turn, using DFS over the jump tables | Harmful at all values tested: 50% at weight=100, down to 35% at weight=120 | The DFS doesn't account for the barrel vacating its start square during the chain (reports false positives). The existing `jump` weight (single forward jump) already captures most tactical value with less noise. |
+| **Tempo bonus** (side to move) | Flat bonus for the side to move | −12 Elo [−38, +13] at 20 | Search parity already accounts for tempo. |
+| **Pail-in-hand scalar** | Static option-value bonus for an unplaced pail | +4 / +1 Elo at 30 / 80 (null) | Search prices the option within its horizon (matches the Quoridor literature); belongs in NNUE features, not a scalar. |
+| **Straggler ordering** | Prefer advancing the hindmost barrel among near-equal moves | −20 Elo [−47, +8] | Existing ordering (forward distance, history) already dominates. |
+| **Pail placement filter** | Only search pail squares within 2 steps of a barrel | −2 Elo [−32, +27] at fixed time | Pail moves were already ordered late and LMR-reduced; no speed to recover. |
+| **Killer persistence across iterations** | Keep killers between iterative-deepening depths | +1 Elo in 2000 games | Aspiration re-searches within an iteration already reuse them where it matters. |
+
+These features are not included in the engine. Each was implemented behind a flag, tested with the match harness, and removed.
 
 ## Technologies
 
@@ -359,4 +448,4 @@ MIT
 
 ---
 
-*Inspired by [Stockfish](https://stockfishchess.org/), [Shogi NNUE](https://www.chessprogramming.org/NNUE), and TV2's Farmen Kjendis*
+*Inspired by [Stockfish](https://stockfishchess.org/), [Shogi NNUE](https://www.chessprogramming.org/NNUE), [Syzygy tablebases](https://www.chessprogramming.org/Syzygy_Bases), the [Chinese-checkers solve](https://webdocs.cs.ualberta.ca/~nathanst/papers/chinesecheckers.pdf) (Sturtevant), and TV2's Farmen Kjendis*

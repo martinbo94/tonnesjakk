@@ -106,7 +106,47 @@
             padding: 10px;
             border-radius: 10px;
             box-shadow: 0 10px 30px rgba(0,0,0,0.5);
+            position: relative;   /* anchor for the flying-piece animation overlay */
         }
+
+        /* A barrel gliding along its move path (slides over the board, then the
+           real piece is rendered underneath it at the destination). */
+        .flying-piece {
+            position: absolute;
+            width: 46px;
+            height: 46px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            z-index: 30;
+            pointer-events: none;
+            filter: drop-shadow(0 3px 6px rgba(0,0,0,0.55));
+        }
+        .flying-piece svg { width: 100%; height: 100%; }
+
+        /* Estimated-difficulty badge on the start screen */
+        .difficulty-badge {
+            margin: 6px 0 14px;
+            padding: 10px 14px;
+            border-radius: 8px;
+            border-left: 4px solid #5c6bc0;
+            background: rgba(92, 107, 192, 0.12);
+        }
+        .difficulty-badge .db-row {
+            display: flex;
+            align-items: baseline;
+            justify-content: space-between;
+            gap: 10px;
+        }
+        .difficulty-badge .db-tier { font-weight: 700; font-size: 1.05em; }
+        .difficulty-badge .db-elo { color: #b9c0e8; font-variant-numeric: tabular-nums; }
+        .difficulty-badge .db-hint { color: #9aa0b8; font-size: 0.82em; margin-top: 3px; }
+        /* Tier accent colours (easy → expert) */
+        .difficulty-badge.d1 { border-left-color: #66bb6a; background: rgba(102,187,106,0.12); }
+        .difficulty-badge.d2 { border-left-color: #9ccc65; background: rgba(156,204,101,0.12); }
+        .difficulty-badge.d3 { border-left-color: #ffca28; background: rgba(255,202,40,0.12); }
+        .difficulty-badge.d4 { border-left-color: #ff7043; background: rgba(255,112,67,0.12); }
+        .difficulty-badge.d5 { border-left-color: #ef5350; background: rgba(239,83,80,0.13); }
 
         .cell {
             width: 60px;
@@ -175,6 +215,28 @@
             box-shadow: 0 10px 30px rgba(0,0,0,0.5);
         }
 
+        #explorer { margin-top: 15px; }
+        #explorer h4 { color: #64b5f6; margin-bottom: 6px; }
+        #explorer-root { font-size: 0.85em; color: #aaa; margin-bottom: 6px; }
+        .exp-row { display: flex; align-items: center; gap: 8px; padding: 3px 4px;
+                   border-radius: 4px; cursor: pointer; font-size: 0.85em; }
+        .exp-row:hover { background: #3a3a5c; }
+        .exp-move { min-width: 110px; color: #ddd; font-family: monospace; }
+        .exp-bar { flex: 1; height: 16px; border-radius: 3px; display: flex; align-items: center;
+                   justify-content: center; font-size: 0.75em; font-weight: bold; color: #111; }
+        .exp-win  { background: linear-gradient(#8bc98d, #66bb6a); }
+        .exp-draw { background: linear-gradient(#bdbdbd, #9e9e9e); }
+        .exp-loss { background: linear-gradient(#ef9a9a, #e57373); }
+        #explorer-list { max-height: 300px; overflow-y: auto; }
+        #movelist { max-height: 220px; overflow-y: auto; font-family: monospace; font-size: 0.85em; }
+        .ml-row { display: flex; gap: 6px; align-items: baseline; padding: 1px 0; }
+        .ml-num { color: #888; min-width: 26px; text-align: right; }
+        .ml-cell { flex: 1; display: flex; gap: 6px; flex-wrap: wrap; }
+        .ml-move { cursor: pointer; padding: 1px 5px; border-radius: 3px; }
+        .ml-move:hover { background: #3a3a5c; }
+        .ml-cur { background: #4a5db0; color: #fff; }
+        .ml-var { color: #9aa7d0; }
+        #movelist { line-height: 1.9; }
         #info-panel h3 {
             margin-bottom: 15px;
             color: #4CAF50;
@@ -543,33 +605,30 @@
 
         <div class="option-group">
             <label>AI-motor:</label>
-            <select id="engine-select" onchange="onEngineTypeChange()">
-                <option value="heuristic" selected>Heuristikk (alpha-beta)</option>
-                <option value="alphazero">AlphaZero (MCTS + nettverk)</option>
+            <select id="engine-select" onchange="updateDifficultyBadge()">
+                <option value="ml" selected>ML nettverk + søk</option>
+                <option value="rule_based">Regelbasert evaluering + søk</option>
             </select>
         </div>
 
-        <div class="option-group" id="depth-group">
-            <label>AI-vanskelighetsgrad:</label>
-            <select id="depth-select">
-                <option value="3">Lett (dybde 3)</option>
-                <option value="5">Medium (dybde 5)</option>
-                <option value="6" selected>Vanskelig (dybde 6)</option>
-                <option value="7">Ekspert (dybde 7)</option>
+        <div class="option-group" id="time-group">
+            <label>Betenkningstid per trekk:</label>
+            <select id="time-select" onchange="updateDifficultyBadge()">
+                <option value="50">50 ms — lynrask</option>
+                <option value="100">100 ms — rask</option>
+                <option value="200" selected>200 ms — normal</option>
+                <option value="500">500 ms — grundig</option>
+                <option value="1000">1000 ms — dyp</option>
+                <option value="2000">2000 ms — maksimal</option>
             </select>
         </div>
 
-        <div class="option-group" id="simulations-group" style="display:none;">
-            <label>MCTS simuleringer:</label>
-            <select id="simulations-select">
-                <option value="100">100 (rask)</option>
-                <option value="200">200</option>
-                <option value="400" selected>400 (standard)</option>
-                <option value="800">800 (sterk)</option>
-            </select>
-        </div>
+        <!-- Live estimated difficulty for the selected engine + time -->
+        <div id="difficulty-badge" class="difficulty-badge"></div>
 
         <button onclick="startGame()">Start spill</button>
+            <button onclick="startGame(true)" style="margin-top:10px; background:#5c6bc0; border:none; color:#fff; padding:12px 24px; border-radius:6px; font-size:1.05em; cursor:pointer; width:100%;">⬜ Utforsk tablebase (analyse)</button>
+            <p style="font-size:0.8em; color:#888; margin-top:4px;">Spill begge sider og se den bevist beste verdien for hvert trekk</p>
         <div style="margin-top: 20px; border-top: 1px solid #444; padding-top: 20px;">
             <button class="secondary" onclick="openReplayView()">Inspect Games</button>
             <p style="font-size:0.8em; color:#888; margin-top:5px;">Browse and replay test match games</p>
@@ -669,6 +728,20 @@
                 <span id="ai-eval">-</span>
             </div>
 
+
+            <div id="explorer" style="display:none;">
+                <h4>⬜ Tablebase — løst spill</h4>
+                <div id="explorer-root">–</div>
+                <button id="convert-btn" onclick="playEngineMove()" style="margin:4px 0 8px; width:100%; background:#43a047; border:none; color:#fff; padding:8px; border-radius:5px; cursor:pointer; font-size:0.85em;">⚡ Motor: spill beste (vinnende) trekk</button>
+                <p style="font-size:0.75em; color:#888; margin:-4px 0 6px;">Alle grønne trekk holder seieren, men bare de som <em>gjør framgang</em> unngår sjakktrekk-loop. Motoren kan avstanden — klikk for å se den score.</p>
+                <div id="explorer-list"></div>
+            </div>
+
+            <div id="movelist-panel" style="display:none; margin-top:12px;">
+                <h4 style="color:#64b5f6; margin-bottom:6px;">Trekk</h4>
+                <div id="movelist"></div>
+            </div>
+
             <div id="pail-action" style="margin-top: 15px; display: none;">
                 <button class="skip-pail" onclick="enterPailPlacementMode()">Plasser melkespann (valgfritt)</button>
                 <p style="font-size:0.8em; color:#888; margin-top:5px;">Du kan plassere melkespannet nar som helst</p>
@@ -749,7 +822,13 @@
         let selectedBarrelAction = null;  // { type: 'place' } or { type: 'move', from: [r,c] }
         let phase = 'select-pail';  // 'select-pail', 'select-barrel', 'select-dest'
         let skipPail = false;  // User chose to skip pail placement this turn
-        let pendingMove = null;  // { from: [r,c], currentPos: [r,c], pieceVal: 1|-1 } during animation/optimistic render
+
+        // Move animation: while a barrel glides along its path we hide it from
+        // the board (animHide = the origin + destination squares to render empty)
+        // and slide a flying overlay piece over the top. animating blocks input.
+        let animHide = null;    // [[r,c], ...] squares rendered empty during a glide
+        let animating = false;  // true while a glide is in flight
+        let _flyEl = null;      // the flying overlay element
 
         let lastAiMove = null;
 
@@ -772,25 +851,61 @@
             return res.json();
         }
 
-        // Toggle engine-specific options
-        function onEngineTypeChange() {
-            const engineType = document.getElementById('engine-select').value;
-            document.getElementById('depth-group').style.display =
-                engineType === 'heuristic' ? '' : 'none';
-            document.getElementById('simulations-group').style.display =
-                engineType === 'alphazero' ? '' : 'none';
+        // --- Difficulty / Elo estimation -----------------------------------
+        // Playing strength anchored on the repo's measured rating lists:
+        //   RATINGS.md      heur-100ms = 1500, net3-tb-100ms = 1850, heur-d4 = 1058
+        //   TIME_SCALING.md net3+tb barely gains with time (~+15 Elo/doubling, noisy)
+        // The rule-based eval is cheap, so it converts time into search depth
+        // faster and is the more time-sensitive engine; the ML(+tablebase) engine
+        // is near its knowledge ceiling and plateaus. Points between anchors are
+        // linearly interpolated — 100 ms is measured, the rest are estimates.
+        const ELO_ANCHORS = {
+            ml:         [[50, 1845], [100, 1850], [200, 1890], [500, 1905], [1000, 1918], [2000, 1930]],
+            rule_based: [[50, 1330], [100, 1500], [200, 1570], [500, 1620], [1000, 1655], [2000, 1685]],
+        };
+        function estimateElo(engine, timeMs) {
+            const pts = ELO_ANCHORS[engine] || ELO_ANCHORS.ml;
+            if (timeMs <= pts[0][0]) return pts[0][1];
+            if (timeMs >= pts[pts.length - 1][0]) return pts[pts.length - 1][1];
+            for (let i = 0; i < pts.length - 1; i++) {
+                const [t0, e0] = pts[i], [t1, e1] = pts[i + 1];
+                if (timeMs >= t0 && timeMs <= t1) {
+                    return Math.round(e0 + (e1 - e0) * (timeMs - t0) / (t1 - t0));
+                }
+            }
+            return pts[pts.length - 1][1];
+        }
+        function difficultyTier(elo) {
+            if (elo < 1350) return { word: 'Lett',      cls: 'd1', hint: 'En avslappet motstander — til å slå med litt planlegging.' };
+            if (elo < 1550) return { word: 'Middels',   cls: 'd2', hint: 'Spiller solid og straffer åpenbare feil.' };
+            if (elo < 1750) return { word: 'Sterk',     cls: 'd3', hint: 'Krever nøyaktig spill for å slå.' };
+            if (elo < 1880) return { word: 'Vanskelig', cls: 'd4', hint: 'Nær toppnivå — feil blir sjelden tilgitt.' };
+            return               { word: 'Ekspert',   cls: 'd5', hint: 'Spiller tilnærmet perfekt (spillet er løst).' };
+        }
+        function updateDifficultyBadge() {
+            const engine = document.getElementById('engine-select').value;
+            const timeMs = parseInt(document.getElementById('time-select').value);
+            const elo = estimateElo(engine, timeMs);
+            const tier = difficultyTier(elo);
+            const el = document.getElementById('difficulty-badge');
+            el.className = 'difficulty-badge ' + tier.cls;
+            el.innerHTML =
+                `<div class="db-row"><span class="db-tier">Vanskelighetsgrad: ${tier.word}</span>` +
+                `<span class="db-elo">~${elo} Elo</span></div>` +
+                `<div class="db-hint">${tier.hint}</div>`;
         }
 
         // Start new game
-        async function startGame() {
-            playerColor = document.getElementById('color-select').value;
-            const depth = parseInt(document.getElementById('depth-select').value);
+        async function startGame(explore = false) {
+            exploreMode = !!explore;
+            playerColor = exploreMode ? 'white' : document.getElementById('color-select').value;
             const engineType = document.getElementById('engine-select').value;
-            const simulations = parseInt(document.getElementById('simulations-select').value);
+            const timeMs = parseInt(document.getElementById('time-select').value);
 
             document.getElementById('start-screen').style.display = 'none';
             document.getElementById('game-container').style.display = 'flex';
-            document.getElementById('your-color').textContent = playerColor === 'white' ? 'Hvit' : 'Svart';
+            document.getElementById('your-color').textContent =
+                exploreMode ? 'Begge sider (utforsk)' : (playerColor === 'white' ? 'Hvit' : 'Svart');
 
             // Populate legend with SVG icons
             document.getElementById('legend-barrel').innerHTML = PIECE_SVG[1];
@@ -798,13 +913,11 @@
 
             try {
                 const body = {
-                    player_color: playerColor,
-                    ai_depth: depth,
-                    engine_type: engineType,
+                    player_color: 'white',
+                    // Explore mode uses the full-strength engine at a modest budget.
+                    engine_type: exploreMode ? 'ml' : engineType,
+                    ai_time_ms: exploreMode ? 200 : timeMs,
                 };
-                if (engineType === 'alphazero') {
-                    body.mcts_simulations = simulations;
-                }
                 const data = await api('/api/new-game', 'POST', body);
 
                 gameId = data.game_id;
@@ -823,6 +936,7 @@
 
                 resetSelection();
                 renderBoard();
+                loadExplorer();
                 updateStatus();
             } catch (e) {
                 alert('Feil ved oppstart: ' + e.message);
@@ -835,7 +949,6 @@
         function resetSelection() {
             selectedPailDest = null;
             selectedBarrelAction = null;
-            pendingMove = null;
             if (canPlacePail()) {
                 phase = 'select-pail';
                 skipPail = false;
@@ -878,7 +991,179 @@
         }
 
         // Make a move (two-step: player move, then AI move)
-        async function makeMove(placePail, isPlacement, barrelFrom, barrelTo) {
+        let exploreMode = false;
+
+        function sqName(rc) { return String.fromCharCode(97 + rc[1]) + (6 - rc[0]); }
+        function fmtExpMove(m) {
+            let parts = [];
+            if (m.place_pail) parts.push('🥛' + sqName(m.place_pail));
+            if (m.is_pail_only) return parts[0];
+            if (m.is_barrel_placement) parts.push('+' + sqName(m.barrel_to));
+            else if (m.barrel_path && m.barrel_path.length > 1)
+                // jump chain: show every landing so winding multi-jumps read correctly
+                parts.push(sqName(m.barrel_from) + '×' + m.barrel_path.map(sqName).join('×'));
+            else parts.push(sqName(m.barrel_from) + '→' + sqName(m.barrel_to));
+            return parts.join(' ');
+        }
+
+        async function loadExplorer() {
+            const panel = document.getElementById('explorer');
+            if (!gameId || !exploreMode) { panel.style.display = 'none'; return; }
+            try {
+                const data = await api(`/api/explore/${gameId}`);
+                if (!data.solved) { panel.style.display = 'none'; return; }
+                panel.style.display = 'block';
+                const mover = data.mover;
+                const rel = v => v.verdict === 'draw' ? 'draw' : (v.verdict === mover ? 'win' : 'loss');
+                // Win label: exact "om N" where distance is stored (<=5 barrels),
+                // else "~N" from the race-distance progress proxy in the big phases.
+                const winTag = v => v.dist != null ? ' om ' + v.dist
+                    : (v.progress != null ? ' ~' + Math.round(v.progress) : '');
+                const label = v => v.verdict === 'draw' ? 'REMIS'
+                    : rel(v) === 'win' ? 'VINN' + winTag(v)
+                    : 'TAP' + (v.dist ? ' om ' + v.dist : '');
+                const rootRel = rel(data.root);
+                document.getElementById('explorer-root').textContent =
+                    (mover === 'white' ? 'Hvit' : 'Svart') + ' i trekket — stillingen er ' +
+                    (data.root.verdict === 'draw' ? 'REMIS' :
+                     (rootRel === 'win' ? 'VUNNET' : 'TAPT') + (data.root.dist ? ' om ' + data.root.dist : '')) +
+                    ' med perfekt spill';
+                // Winning moves first, sorted by progress (shortest win path on
+                // top); then draws; then losses. The top green move is the one
+                // that makes the most progress toward scoring.
+                const order = { win: 0, draw: 1, loss: 2 };
+                const rows = data.moves.slice().sort((a, b) =>
+                    order[rel(a)] - order[rel(b)] ||
+                    ((a.progress ?? 9e9) - (b.progress ?? 9e9)));
+                const list = document.getElementById('explorer-list');
+                list.innerHTML = '';
+                rows.forEach((m, i) => {
+                    const row = document.createElement('div');
+                    row.className = 'exp-row';
+                    const best = (rel(m) === 'win' && i === 0) ? '★ ' : '';
+                    row.innerHTML = `<span class="exp-move">${best}${fmtExpMove(m)}</span>` +
+                        `<span class="exp-bar exp-${rel(m)}">${label(m)}</span>`;
+                    row.onclick = () => playExplorerMove(m);
+                    list.appendChild(row);
+                });
+            } catch (e) { panel.style.display = 'none'; }
+        }
+
+        // ── PGN-style move tree (mainline + variations). The server owns the
+        // tree; here we just render it and navigate by node id (no truncation).
+        let lastTree = null;
+
+        async function loadTree() {
+            const panel = document.getElementById('movelist-panel');
+            if (!gameId || !exploreMode) { panel.style.display = 'none'; return; }
+            try {
+                const t = await api(`/api/tree/${gameId}`);
+                lastTree = t;
+                const root = t.nodes[String(t.root)];
+                if (!root || !root.children.length) { panel.style.display = 'none'; return; }
+                panel.style.display = 'block';
+                const ml = document.getElementById('movelist');
+                ml.innerHTML = renderVariation(t.nodes, t.root, 1, false, t.current);
+                const cur = ml.querySelector('.ml-cur');
+                if (cur) cur.scrollIntoView({ block: 'nearest' });
+            } catch (e) { panel.style.display = 'none'; }
+        }
+
+        function mlChip(id, node, current) {
+            return `<span class="ml-move${id === current ? ' ml-cur' : ''}" onclick="gotoNode(${id})">${node.notation || '…'}</span> `;
+        }
+
+        // Recursive PGN rendering: mainline inline (following children[0]),
+        // sidelines in parentheses. `num` = full-move number of the next move;
+        // `afterBranch` forces an explicit "N…" before a black move after a break.
+        function renderVariation(nodes, nid, num, afterBranch, current) {
+            let html = '';
+            let node = nodes[String(nid)];
+            while (node.children.length) {
+                const kids = node.children;
+                const m = nodes[String(kids[0])];
+                if (m.side === 'white') { html += `<span class="ml-num">${num}.</span> `; afterBranch = false; }
+                else if (afterBranch) { html += `<span class="ml-num">${num}…</span> `; afterBranch = false; }
+                html += mlChip(kids[0], m, current);
+                for (let k = 1; k < kids.length; k++) {
+                    const s = nodes[String(kids[k])];
+                    const head = `<span class="ml-num">${num}${s.side === 'white' ? '.' : '…'}</span> `;
+                    const nextNum = s.side === 'black' ? num + 1 : num;
+                    const cont = renderVariation(nodes, kids[k], nextNum, s.side === 'white', current);
+                    html += `<span class="ml-var">( ${head}${mlChip(kids[k], s, current)}${cont})</span> `;
+                    afterBranch = true;
+                }
+                if (m.side === 'black') num += 1;
+                node = m;
+            }
+            return html;
+        }
+
+        async function gotoNode(id) {
+            const myToken = ++navToken;
+            const oldBoard = gameState ? gameState.board : null;
+            try {
+                const data = await api(`/api/goto-node/${gameId}`, 'POST', { node_id: id });
+                if (myToken !== navToken) return;  // a newer navigation superseded us
+                // Animate only a clean single-barrel step (forward or backward);
+                // bigger jumps just snap. Fast (~90 ms) and abortable for rapid arrows.
+                const diff = oldBoard ? barrelMoveDiff(oldBoard, data.state.board) : null;
+                if (diff) await glideNav(diff.from, diff.to, diff.color, myToken);
+                if (myToken !== navToken) return;  // superseded mid-glide
+                gameState = data.state; validMoves = data.valid_moves;
+                resetSelection(); commitGlide(); renderBoard(); updateStatus(); loadExplorer(); loadTree();
+            } catch (e) { commitGlide(); alert('Feil: ' + e.message); }
+        }
+
+        async function playExplorerMove(m) {
+            try {
+                const data = await api('/api/move', 'POST', {
+                    game_id: gameId,
+                    is_pail_only: m.is_pail_only,
+                    place_pail: m.place_pail,
+                    is_barrel_placement: m.is_barrel_placement,
+                    barrel_from: m.barrel_from,
+                    barrel_to: m.barrel_to
+                });
+                await glideMove(m);  // slide the barrel over the pre-move board
+                gameState = data.state;
+                validMoves = data.valid_moves;
+                moveHistory.push({ state: JSON.parse(JSON.stringify(data.state)), move: m, player: 'explorer' });
+                resetSelection();
+                commitGlide();
+                renderBoard();
+                updateStatus();
+                if (data.game_over) { loadExplorer(); return; }
+                if (!exploreMode && gameState.current_player !== playerColor) {
+                    setStatus('AI tenker...', 'ai-turn');
+                    const aiData = await api(`/api/ai-move/${gameId}`, 'POST');
+                    await glideMove(aiData.ai_move);
+                    gameState = aiData.state; validMoves = aiData.valid_moves;
+                    if (aiData.ai_move) moveHistory.push({ state: JSON.parse(JSON.stringify(aiData.state)), move: aiData.ai_move, player: 'ai' });
+                    commitGlide();
+                    renderBoard(); updateStatus();
+                }
+                loadExplorer();
+            } catch (e) { alert('Feil: ' + e.message); }
+        }
+
+        // Let the tablebase-aware engine make one move (a progress-making,
+        // repetition-avoiding winning move) — so you can watch the win convert.
+        async function playEngineMove() {
+            if (!gameId || gameState.winner) return;
+            const btn = document.getElementById('convert-btn');
+            btn.disabled = true; btn.textContent = 'Motoren tenker...';
+            try {
+                const aiData = await api(`/api/ai-move/${gameId}`, 'POST');
+                await glideMove(aiData.ai_move);
+                gameState = aiData.state; validMoves = aiData.valid_moves;
+                if (aiData.ai_move) moveHistory.push({ state: JSON.parse(JSON.stringify(aiData.state)), move: aiData.ai_move, player: 'engine' });
+                resetSelection(); commitGlide(); renderBoard(); updateStatus(); loadExplorer();
+            } catch (e) { alert('Feil: ' + e.message); }
+            btn.disabled = false; btn.textContent = '⚡ Motor: spill beste (vinnende) trekk';
+        }
+
+        async function makeMove(placePail, isPlacement, barrelFrom, barrelTo, opts = {}) {
             try {
                 // Steg 1: Utfor spillerens trekk
                 const playerData = await api('/api/move', 'POST', {
@@ -889,7 +1174,9 @@
                     barrel_to: barrelTo
                 });
 
-                // Oppdater brettet med spillerens trekk UMIDDELBART
+                // Oppdater brettet med spillerens trekk. If the caller already
+                // glided the barrel (animateAndSendMove), the overlay is parked
+                // at the destination — commit it and draw the real position under it.
                 gameState = playerData.state;
                 validMoves = playerData.valid_moves;
 
@@ -901,6 +1188,7 @@
                 });
 
                 resetSelection();
+                if (opts.humanGlided) commitGlide();
                 renderBoard();
 
                 // Sjekk om spillet er over
@@ -909,10 +1197,15 @@
                     return;
                 }
 
+                if (exploreMode) { loadExplorer(); return; }
+
                 // Steg 2: Vent pa AI
                 setStatus('AI tenker...', 'ai-turn');
 
                 const aiData = await api(`/api/ai-move/${gameId}`, 'POST');
+
+                // Glide the AI's reply over the current board before revealing it.
+                await glideMove(aiData.ai_move);
 
                 gameState = aiData.state;
                 validMoves = aiData.valid_moves;
@@ -930,10 +1223,13 @@
                     });
                 }
 
+                commitGlide();
                 renderBoard();
                 updateStatus();
+                loadExplorer();
             } catch (e) {
                 alert('Feil: ' + e.message);
+                commitGlide();
                 resetSelection();
                 renderBoard();
             }
@@ -941,6 +1237,11 @@
 
         // Update status display
         function updateStatus() {
+            setTimeout(loadExplorer, 0);
+            setTimeout(loadTree, 0);
+            if (exploreMode && gameState && !gameState.winner) {
+                playerColor = gameState.current_player;   // drive both sides
+            }
             document.getElementById('move-count').textContent = Math.floor(gameState.move_count / 2) + 1;
             document.getElementById('white-score').textContent = gameState.white_scored || 0;
             document.getElementById('black-score').textContent = gameState.black_scored || 0;
@@ -955,7 +1256,7 @@
 
             // Show/hide game replay controls
             const replayCtrl = document.getElementById('game-replay-controls');
-            if (gameState.winner && moveHistory.length > 1) {
+            if (gameState.winner && moveHistory.length > 1 && !exploreMode) {
                 replayCtrl.style.display = 'flex';
                 historyViewIndex = moveHistory.length - 1;  // Start at final position
                 updateGameReplayLabel();
@@ -965,7 +1266,9 @@
             }
 
             if (gameState.winner) {
-                if (gameState.winner === playerColor) {
+                if (exploreMode) {
+                    setStatus((gameState.winner === 'white' ? 'Hvit' : 'Svart') + ' vant!', 'winner');
+                } else if (gameState.winner === playerColor) {
                     setStatus('DU VANT!', 'winner');
                 } else {
                     setStatus('AI vant!', 'loser');
@@ -1325,29 +1628,118 @@
             );
         }
 
-        // Animate a barrel hopping through its path, then send the move
         function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+        // =====================================================================
+        // MOVE ANIMATION (lichess-style glide)
+        //
+        // A move is applied in three beats so the barrel visibly slides along
+        // its (possibly multi-jump) path before the new position appears:
+        //   1. glideMove(move)  — over the CURRENT board, slide a flying overlay
+        //      from the origin through each landing square. Origin + destination
+        //      are rendered empty (animHide) so nothing duplicates the overlay.
+        //   2. gameState = newState
+        //   3. commitGlide() then renderBoard() — the real piece is drawn at the
+        //      destination exactly under the overlay, which is then removed.
+        // =====================================================================
+
+        // Pixel top-left of a cell's content box within #board (its offsetParent).
+        function cellRect(row, col) {
+            const cell = document.getElementById('board').children[row * BOARD_SIZE + col];
+            return { x: cell.offsetLeft, y: cell.offsetTop, w: cell.offsetWidth, h: cell.offsetHeight };
+        }
+
+        // Core slide: render the board with `from` + destination empty, drop a
+        // flying overlay at `from` and transition it through `path` at perHop ms
+        // each. Leaves the overlay parked at the destination and animHide set;
+        // the caller assigns the new state, calls commitGlide(), then renderBoard().
+        // `shouldAbort()` (optional) lets a caller cancel between hops (nav uses it).
+        async function slideOverlay(from, path, pieceVal, perHop, shouldAbort) {
+            if (_flyEl) { _flyEl.remove(); _flyEl = null; }  // drop any orphan overlay
+            animating = true;
+            const dest = path[path.length - 1];
+            animHide = [from, dest];
+            renderBoard();  // draw board with origin + dest empty
+
+            const board = document.getElementById('board');
+            const fly = document.createElement('div');
+            fly.className = 'flying-piece';
+            fly.innerHTML = PIECE_SVG[pieceVal] || '';
+            const r0 = cellRect(from[0], from[1]);
+            const pad = (r0.w - 46) / 2;  // centre the 46px piece in the cell
+            fly.style.left = (r0.x + pad) + 'px';
+            fly.style.top = (r0.y + pad) + 'px';
+            board.appendChild(fly);
+            _flyEl = fly;
+
+            void fly.offsetWidth;  // flush layout so the first transition animates
+            fly.style.transition = `left ${perHop}ms ease-in-out, top ${perHop}ms ease-in-out`;
+
+            for (const [pr, pc] of path) {
+                if (shouldAbort && shouldAbort()) return;
+                const r = cellRect(pr, pc);
+                fly.style.left = (r.x + pad) + 'px';
+                fly.style.top = (r.y + pad) + 'px';
+                await sleep(perHop);
+            }
+        }
+
+        // Slide a flying barrel over the current board along a move's path.
+        // Returns true if it animated, false if there was nothing to glide.
+        async function glideMove(move) {
+            if (!move || move.is_pail_only || move.is_barrel_placement) return false;
+            const from = move.barrel_from;
+            if (!from) return false;
+            const path = (move.barrel_path && move.barrel_path.length)
+                ? move.barrel_path
+                : (move.barrel_to ? [move.barrel_to] : []);
+            if (!path.length) return false;
+            const pieceVal = gameState.board[from[0]][from[1]];  // the moving barrel
+            if (!pieceVal) return false;
+            // Lively but readable: a touch quicker per hop when there are several.
+            await slideOverlay(from, path, pieceVal, path.length > 1 ? 130 : 200);
+            return true;
+        }
+
+        // Which single barrel moved between two board snapshots (endpoints only).
+        // Returns {from,to,color} for a clean one-barrel move, else null (placement,
+        // pail-only, scoring, or a multi-ply jump — those just render instantly).
+        function barrelMoveDiff(oldB, newB) {
+            const gone = [], appeared = [];
+            for (let r = 0; r < BOARD_SIZE; r++) for (let c = 0; c < BOARD_SIZE; c++) {
+                const o = oldB[r][c], n = newB[r][c];
+                if (Math.abs(o) === 1 && n !== o) gone.push([r, c, o]);
+                if (Math.abs(n) === 1 && n !== o) appeared.push([r, c, n]);
+            }
+            if (gone.length === 1 && appeared.length === 1 && gone[0][2] === appeared[0][2]) {
+                return { from: [gone[0][0], gone[0][1]], to: [appeared[0][0], appeared[0][1]], color: gone[0][2] };
+            }
+            return null;
+        }
+
+        // Fast, interruptible glide used for back/forward navigation. A newer
+        // navigation bumps navToken, which aborts any in-flight nav glide so
+        // rapid arrow presses keep pace instead of queuing up.
+        let navToken = 0;
+        async function glideNav(from, to, color, myToken) {
+            await slideOverlay(from, [to], color, 90, () => myToken !== navToken);
+        }
+
+        // Remove the flying overlay and stop hiding squares. Clear animHide
+        // BEFORE the caller's renderBoard so the destination piece shows.
+        function commitGlide() {
+            if (_flyEl) { _flyEl.remove(); _flyEl = null; }
+            animHide = null;
+            animating = false;
+        }
 
         async function animateAndSendMove(placePail, from, dest) {
             const move = findMoveForDest(from, dest);
-            const pieceVal = playerColor === 'white' ? 1 : -1;
-
-            if (move && move.barrel_path.length > 1) {
-                // Multi-jump: animate through each intermediate hop
-                for (const pos of move.barrel_path) {
-                    pendingMove = { from, currentPos: pos, pieceVal };
-                    renderBoard();
-                    await sleep(200);
-                }
-            } else {
-                // Single step or single jump: show at destination instantly
-                pendingMove = { from, currentPos: dest, pieceVal };
-                renderBoard();
-            }
-
-            // Send the move (pendingMove stays set as optimistic render until server responds)
+            await glideMove(move || { barrel_from: from, barrel_to: dest });
+            // makeMove finalizes the human glide (commit + render new state) and
+            // then glides the AI's reply.
             setStatus('AI tenker...', 'ai-turn');
-            await makeMove(placePail, false, from, dest);
+            await makeMove(placePail, false, from, dest, { humanGlided: true });
         }
 
         // Handle off-board barrel click (to select for placement)
@@ -1366,7 +1758,7 @@
 
         // Handle cell click on board
         function onCellClick(row, col) {
-            if (pendingMove) return;  // Ignore clicks during animation
+            if (animating) return;  // Ignore clicks during animation
             if (gameState.winner) return;
             if (gameState.current_player !== playerColor) return;
 
@@ -1377,9 +1769,23 @@
 
                 if (isValid) {
                     selectedPailDest = [row, col];
-                    phase = 'select-barrel';
-                    renderBoard();
-                    updateStatus();
+                    // Send pail-only sub-move to server immediately
+                    (async () => {
+                        try {
+                            const data = await api('/api/move', 'POST', {
+                                game_id: gameId,
+                                is_pail_only: true,
+                                place_pail: [row, col],
+                            });
+                            gameState = data.state;
+                            validMoves = data.valid_moves;
+                            phase = 'select-barrel';
+                            renderBoard();
+                            updateStatus();
+                        } catch (e) {
+                            alert('Feil: ' + e.message);
+                        }
+                    })();
                 }
             }
             else if (phase === 'select-barrel') {
@@ -1510,17 +1916,11 @@
                         }
                     }
 
-                    // Add piece — during animation, show barrel at current hop position
+                    // Add piece — during a glide the moving barrel's origin and
+                    // destination are rendered empty; the flying overlay covers them.
                     let val = gameState.board[row][col];
-                    if (pendingMove) {
-                        // Hide barrel at its original position
-                        if (pendingMove.from[0] === row && pendingMove.from[1] === col) {
-                            val = 0;
-                        }
-                        // Show barrel at its current animated position
-                        if (pendingMove.currentPos[0] === row && pendingMove.currentPos[1] === col && val === 0) {
-                            val = pendingMove.pieceVal;
-                        }
+                    if (animHide && animHide.some(s => s[0] === row && s[1] === col)) {
+                        val = 0;
                     }
                     if (val !== 0) {
                         const piece = document.createElement('div');
@@ -1875,6 +2275,20 @@
 
         // Keyboard navigation
         document.addEventListener('keydown', (e) => {
+            // Explore mode: step the move tree (parent / mainline child)
+            if (exploreMode && lastTree) {
+                const nodes = lastTree.nodes, cur = String(lastTree.current);
+                if (e.key === 'ArrowLeft') {
+                    const p = nodes[cur].parent;
+                    if (p !== null && p !== undefined) { e.preventDefault(); gotoNode(p); }
+                    return;
+                }
+                if (e.key === 'ArrowRight') {
+                    const ch = nodes[cur].children;
+                    if (ch && ch.length) { e.preventDefault(); gotoNode(ch[0]); }
+                    return;
+                }
+            }
             // Game replay (post-game)
             if (gameState && gameState.winner && moveHistory.length > 1) {
                 switch (e.key) {
@@ -1920,6 +2334,9 @@
                     break;
             }
         });
+
+        // Show the estimated difficulty for the default engine + time on load.
+        updateDifficultyBadge();
     </script>
 </body>
 </html>

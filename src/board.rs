@@ -238,6 +238,10 @@ pub struct BitBoard {
     pub white_scored: u8,
     pub black_scored: u8,
     pub awaiting_barrel: bool,  // True after pail sub-move, before barrel sub-move
+    // Plies since the last irreversible event (barrel placement, pail
+    // placement, or scoring). Analog of chess's 50-move counter: when it
+    // reaches the no-progress limit the game is a draw.
+    pub halfmove_clock: u16,
 }
 
 /// Informasjon for å angre et trekk
@@ -258,6 +262,7 @@ pub struct UndoInfo {
     pub awaiting_barrel: bool,
     pub current_player: Player,
     pub move_count: u32,
+    pub halfmove_clock: u16,
 }
 
 /// Kompakt representasjon av et trekk for bitboard (32 bits)
@@ -412,6 +417,8 @@ impl BitBoard {
                 hash ^= ZOBRIST.pieces[row][col][piece_idx];
             }
         }
+        hash ^= ZOBRIST.off_board[0][BARRELS_PER_PLAYER];
+        hash ^= ZOBRIST.off_board[1][BARRELS_PER_PLAYER];
 
         BitBoard {
             white_barrels: 0,
@@ -429,6 +436,7 @@ impl BitBoard {
             white_scored: 0,
             black_scored: 0,
             awaiting_barrel: false,
+            halfmove_clock: 0,
         }
     }
 
@@ -450,6 +458,7 @@ impl BitBoard {
             white_scored: board.white_scored,
             black_scored: board.black_scored,
             awaiting_barrel: board.awaiting_barrel,
+            halfmove_clock: board.halfmove_clock,
         };
 
         for row in 0..BOARD_SIZE {
@@ -482,6 +491,7 @@ impl BitBoard {
         board.white_scored = self.white_scored;
         board.black_scored = self.black_scored;
         board.awaiting_barrel = self.awaiting_barrel;
+        board.halfmove_clock = self.halfmove_clock;
 
         // Sett celler fra bitboards
         let mut bb = self.white_barrels;
@@ -579,6 +589,7 @@ impl BitBoard {
             awaiting_barrel: self.awaiting_barrel,
             current_player: self.current_player,
             move_count: self.move_count,
+            halfmove_clock: self.halfmove_clock,
         }
     }
 
@@ -600,14 +611,17 @@ impl BitBoard {
         self.awaiting_barrel = undo.awaiting_barrel;
         self.current_player = undo.current_player;
         self.move_count = undo.move_count;
+        self.halfmove_clock = undo.halfmove_clock;
     }
 
     /// Generer alle lovlige trekk (bitboard-versjon)
     ///
-    /// Three-phase sub-move system:
-    /// Phase 1: !pail_placed && !awaiting_barrel → pail-only moves (any empty square)
-    /// Phase 2: awaiting_barrel → barrel placement/move only (no pail in move)
-    /// Phase 3: pail already placed → existing barrel logic
+    /// Sub-move system:
+    /// - The pail may be placed ONCE per game, on any of your turns, as an
+    ///   optional sub-move BEFORE the barrel move. Placing it sets
+    ///   awaiting_barrel; the barrel move then completes the turn.
+    /// - awaiting_barrel → barrel placement/move only (turn must be completed)
+    /// - otherwise → barrel moves, plus pail placements if still in hand
     pub fn generate_moves(&self) -> Vec<BitMove> {
         let player = self.current_player;
 
@@ -616,21 +630,19 @@ impl BitBoard {
             Player::Black => self.black_pail_placed,
         };
 
-        // Phase 1: Pail-only sub-move
+        let mut moves = Vec::with_capacity(96);
+
+        // Optional pail sub-move (any empty square)
         if !pail_placed && !self.awaiting_barrel {
-            let mut moves = Vec::with_capacity(36);
-            let empty = self.empty();
-            let mut e = empty;
+            let mut e = self.empty();
             while e != 0 {
                 let sq = e.trailing_zeros() as u8;
                 moves.push(BitMove::new_pail_placement(sq));
                 e &= e - 1;
             }
-            return moves;
         }
 
-        // Phase 2 (awaiting_barrel) / Phase 3 (normal): barrel moves only, no pail component
-        let mut moves = Vec::with_capacity(64);
+        // Barrel moves (always available; completes the turn)
         let barrels_off = match player {
             Player::White => self.white_barrels_off_board,
             Player::Black => self.black_barrels_off_board,
@@ -809,6 +821,7 @@ impl BitBoard {
             self.occupied |= pail_bit;
             self.awaiting_barrel = true;
             self.hash ^= ZOBRIST.awaiting_barrel;
+            self.halfmove_clock = 0; // pail placement is irreversible
             // Do NOT switch player or increment move_count
             return undo;
         }
@@ -832,11 +845,20 @@ impl BitBoard {
         };
 
         if mv.is_placement() {
-            // Plasser ny tønne
+            // Plasser ny tønne (irreversibelt: nullstill klokke + oppdater off-board hash)
             match player {
-                Player::White => self.white_barrels_off_board -= 1,
-                Player::Black => self.black_barrels_off_board -= 1,
+                Player::White => {
+                    self.hash ^= ZOBRIST.off_board[0][self.white_barrels_off_board as usize];
+                    self.white_barrels_off_board -= 1;
+                    self.hash ^= ZOBRIST.off_board[0][self.white_barrels_off_board as usize];
+                }
+                Player::Black => {
+                    self.hash ^= ZOBRIST.off_board[1][self.black_barrels_off_board as usize];
+                    self.black_barrels_off_board -= 1;
+                    self.hash ^= ZOBRIST.off_board[1][self.black_barrels_off_board as usize];
+                }
             }
+            self.halfmove_clock = 0;
 
             // Sjekk om den scorer med en gang
             if to_row == goal_row {
@@ -874,6 +896,7 @@ impl BitBoard {
                     Player::White => self.white_scored += 1,
                     Player::Black => self.black_scored += 1,
                 }
+                self.halfmove_clock = 0; // scoring is irreversible
             } else {
                 match player {
                     Player::White => self.white_barrels |= to_bit,
@@ -882,6 +905,7 @@ impl BitBoard {
                 self.occupied |= to_bit;
                 self.hash ^= ZOBRIST.pieces[to_row][to_col][ZobristKeys::piece_index(Cell::Empty)];
                 self.hash ^= ZOBRIST.pieces[to_row][to_col][ZobristKeys::piece_index(barrel_cell)];
+                self.halfmove_clock += 1; // reversible barrel move
             }
         }
 
@@ -952,6 +976,12 @@ struct ZobristKeys {
     pieces: [[[u64; 5]; BOARD_SIZE]; BOARD_SIZE], // [row][col][piece_type]
     player_to_move: u64,
     awaiting_barrel: u64,  // Toggled when awaiting_barrel changes
+    // Off-board barrel counts: [player][count 0..=4].
+    // Without these, a position with N barrels on board + K scored hashes
+    // identically to N on board + K still in hand — different states
+    // (in-hand barrels can re-enter). Scored count is implied by
+    // (on-board, off-board), so hashing off-board alone is sufficient.
+    off_board: [[u64; BARRELS_PER_PLAYER + 1]; 2],
 }
 
 impl ZobristKeys {
@@ -974,10 +1004,20 @@ impl ZobristKeys {
             }
         }
 
+        let player_to_move = next_random();
+        let awaiting_barrel = next_random();
+        let mut off_board = [[0u64; BARRELS_PER_PLAYER + 1]; 2];
+        for player in 0..2 {
+            for count in 0..=BARRELS_PER_PLAYER {
+                off_board[player][count] = next_random();
+            }
+        }
+
         ZobristKeys {
             pieces,
-            player_to_move: next_random(),
-            awaiting_barrel: next_random(),
+            player_to_move,
+            awaiting_barrel,
+            off_board,
         }
     }
 
@@ -994,6 +1034,12 @@ impl ZobristKeys {
 
 // Global Zobrist keys (initialisert én gang)
 static ZOBRIST: std::sync::LazyLock<ZobristKeys> = std::sync::LazyLock::new(ZobristKeys::new);
+
+/// Test-only accessor for off-board Zobrist keys.
+#[cfg(test)]
+pub(crate) fn zobrist_off_board_key(player: usize, count: usize) -> u64 {
+    ZOBRIST.off_board[player][count]
+}
 
 /// Representerer en spiller
 #[pyclass]
@@ -1230,6 +1276,8 @@ pub struct Board {
     pub(crate) black_scored: u8,  // Antall svarte tønner som har nådd mål (fjernet fra brettet)
     #[pyo3(get)]
     pub(crate) awaiting_barrel: bool,  // True after pail sub-move, before barrel sub-move
+    #[pyo3(get)]
+    pub(crate) halfmove_clock: u16,  // Plies since last irreversible event (placement/pail/score)
 }
 
 #[pymethods]
@@ -1250,6 +1298,8 @@ impl Board {
                 hash ^= ZOBRIST.pieces[row][col][piece_idx];
             }
         }
+        hash ^= ZOBRIST.off_board[0][BARRELS_PER_PLAYER];
+        hash ^= ZOBRIST.off_board[1][BARRELS_PER_PLAYER];
 
         Board {
             cells,
@@ -1263,6 +1313,7 @@ impl Board {
             white_scored: 0,
             black_scored: 0,
             awaiting_barrel: false,
+            halfmove_clock: 0,
         }
     }
 
@@ -1364,10 +1415,11 @@ impl Board {
     }
 
     /// Generer alle lovlige trekk for nåværende spiller
-    /// Three-phase sub-move system:
-    /// Phase 1: !pail_placed && !awaiting_barrel → pail-only moves
-    /// Phase 2: awaiting_barrel → barrel moves only
-    /// Phase 3: pail already placed → barrel moves only
+    /// Sub-move system:
+    /// - Pail may be placed ONCE per game, on any of your turns, as an
+    ///   optional sub-move BEFORE the barrel move (sets awaiting_barrel).
+    /// - awaiting_barrel → barrel moves only (turn must be completed)
+    /// - otherwise → barrel moves, plus pail placements if still in hand
     pub(crate) fn generate_moves(&self) -> Vec<Move> {
         let player = self.current_player;
 
@@ -1376,9 +1428,10 @@ impl Board {
             Player::Black => self.black_pail_placed,
         };
 
-        // Phase 1: Pail-only sub-move
+        let mut moves = Vec::new();
+
+        // Optional pail sub-move (any empty square)
         if !pail_placed && !self.awaiting_barrel {
-            let mut moves = Vec::new();
             for row in 0..BOARD_SIZE {
                 for col in 0..BOARD_SIZE {
                     if self.cells[row][col] == Cell::Empty {
@@ -1387,11 +1440,7 @@ impl Board {
                     }
                 }
             }
-            return moves;
         }
-
-        // Phase 2 (awaiting_barrel) / Phase 3 (normal): barrel moves only
-        let mut moves = Vec::new();
         let barrels_off = match player {
             Player::White => self.white_barrels_off_board,
             Player::Black => self.black_barrels_off_board,
@@ -1444,6 +1493,7 @@ impl Board {
             }
             self.awaiting_barrel = true;
             self.hash ^= ZOBRIST.awaiting_barrel;
+            self.halfmove_clock = 0; // pail placement is irreversible
             // Do NOT switch player or increment move_count
             return true;
         }
@@ -1464,11 +1514,20 @@ impl Board {
         let goal_row = self.goal_row(player);
 
         if mv.is_barrel_placement {
-            // Plasser ny tønne fra utenfor brettet
+            // Plasser ny tønne fra utenfor brettet (irreversibelt)
             match player {
-                Player::White => self.white_barrels_off_board -= 1,
-                Player::Black => self.black_barrels_off_board -= 1,
+                Player::White => {
+                    self.hash ^= ZOBRIST.off_board[0][self.white_barrels_off_board as usize];
+                    self.white_barrels_off_board -= 1;
+                    self.hash ^= ZOBRIST.off_board[0][self.white_barrels_off_board as usize];
+                }
+                Player::Black => {
+                    self.hash ^= ZOBRIST.off_board[1][self.black_barrels_off_board as usize];
+                    self.black_barrels_off_board -= 1;
+                    self.hash ^= ZOBRIST.off_board[1][self.black_barrels_off_board as usize];
+                }
             }
+            self.halfmove_clock = 0;
 
             if barrel_to.0 == goal_row {
                 match player {
@@ -1494,10 +1553,12 @@ impl Board {
                     Player::White => self.white_scored += 1,
                     Player::Black => self.black_scored += 1,
                 }
+                self.halfmove_clock = 0; // scoring is irreversible
             } else {
                 self.hash ^= ZOBRIST.pieces[barrel_to.0][barrel_to.1][ZobristKeys::piece_index(Cell::Empty)];
                 self.hash ^= ZOBRIST.pieces[barrel_to.0][barrel_to.1][ZobristKeys::piece_index(barrel_cell)];
                 self.cells[barrel_to.0][barrel_to.1] = barrel_cell;
+                self.halfmove_clock += 1; // reversible barrel move
             }
         }
 

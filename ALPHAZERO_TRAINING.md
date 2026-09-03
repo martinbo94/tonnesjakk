@@ -207,6 +207,75 @@ If eval shows 0W-0D-20L after 50+ chunks (~150 iterations, ~15k games):
 5. **Reduce exploration**: Lower `temp_moves` from 15 to 8-10 for stronger
    self-play sooner (currently hardcoded in game loops).
 
+## Value Target Blending (v8/v9)
+
+Standard AlphaZero uses only the game outcome (+1/-1) as the value target. This is
+problematic for tonnesjakk because barrels can move backwards, leading to indecisive
+self-play games (~60-70% draws) that give near-zero value signal.
+
+**Solution**: Blend the game outcome with the per-position heuristic search score:
+
+```
+value_target = lambda * game_outcome + (1 - lambda) * search_score
+```
+
+This is the same approach Stockfish NNUE uses (lambda=0.85), and is a simpler form
+of the temporal consistency idea from Zhao et al. 2022. It provides dense, per-position
+signal rather than sparse game-outcome signal.
+
+- `--value-blend-lambda 0.5` — 50% outcome + 50% heuristic eval (default)
+- `--value-blend-lambda 1.0` — pure game outcome (original AlphaZero)
+
+## Game Adjudication (v8/v9)
+
+End self-play games early when the heuristic eval indicates a decisive advantage.
+Reduces aimless wandering that generates low-quality training data.
+
+- `--adjudication-threshold 0.4` — adjudicate at ~254cp (tanh scale)
+- `--adjudication-min-moves 30` — don't adjudicate before move 30
+- `--max-moves 50` — hard cap on game length (was 80)
+
+**Accuracy analysis** (from random positions, played out with depth-5 heuristic):
+
+| Threshold | ~Centipawns | Accuracy (decisive games) |
+|-----------|-------------|--------------------------|
+| 0.3 | 186cp | 87% |
+| 0.4 | 254cp | 90% |
+| 0.5 | 330cp | 94% |
+| 0.6 | 416cp | 95% |
+
+Adjudication uses static eval (depth 0) which is essentially free. Depth-3 eval
+would add ~28s/iteration overhead — not worth the marginal accuracy gain.
+
+## Training Run Results
+
+### v7 (baseline, no blending/adjudication)
+- 314 iterations, value loss plateaued at 0.22
+- search_score_mae stuck at ~0.6
+- Best eval: 4W-0D-16L vs depth 4 (ELO -241)
+- ~30% draws in self-play, straggler iterations up to 960s
+
+### v8 (value blending lambda=0.5, adjudication threshold=0.6, max_moves=80)
+- 234 iterations, value loss reached 0.077 (vs v7's 0.22)
+- Best eval: 4W-1D-15L vs depth 4 (ELO -215)
+- Straggler problem: some iterations 960-1020s due to max_moves=80
+- Draw rate ~55%, down from v7's ~65%
+
+### v9 (value blending lambda=0.5, adjudication threshold=0.4, max_moves=50)
+- 224+ iterations (ongoing), value loss reached 0.077
+- Best eval: **6W-0D-14L vs depth 4 (ELO -147)** at iteration ~108
+- Zero straggler iterations — max_moves=50 fixed the long game problem
+- Draw rate dropped to 43-52% in mid-training
+- Eval shows consistent 1-5 wins from chunk 30 onward
+- Best result across all training runs so far
+
+### Key takeaways
+- Value blending halved the value loss (0.22 → 0.077) — the value head actually learns
+- Lower adjudication threshold (0.4 vs 0.6) + lower max_moves (50 vs 80) improved
+  both speed (no stragglers) and eval results
+- The network still peaks early and draw rate creeps up — may need further
+  investigation (exploration decay, learning rate, or reward shaping)
+
 ## Research Findings Summary
 
 | Technique | Source | Effect | Default |
@@ -258,3 +327,64 @@ If eval shows 0W-0D-20L after 50+ chunks (~150 iterations, ~15k games):
 
 - Uiterwijk. "Perfectly Solving Domineering Boards." 2024.
   (Oracle Connect Four series for small-board game insights)
+
+---
+
+## Diagnostic Investigation: v16 vs v9 (2026-03-15)
+
+### Setup
+Ran `scripts/diagnose_training.py` comparing v16 (128ch, Gumbel, forward-only, 100 sims) vs v9 (64ch, standard MCTS, 200 sims) in 20 games each against depth-4 heuristic.
+
+### Bug Found: MCTS Tree Reuse Across Pail Sub-Moves
+
+**Critical finding**: Python-level game loops (`watch_game.py`, diagnostic) were broken by MCTS tree reuse. Tønnesjakk has two-phase turns (pail placement → barrel placement). When `search_network_batched` was called twice per turn, the second call reused the stale pail-phase tree, causing MCTS to return pail moves instead of barrel moves. Games never progressed beyond placement phase.
+
+**Not affected**: Training self-play and evaluation (`play_eval_match_impl`) handle pail sub-moves separately with `random_center_pail()` in Rust, so training was never broken.
+
+**Fix**: Both `diagnose_training.py` and `watch_game.py` now handle pail sub-moves with center-biased random selection (matching Rust) and create fresh MCTS engines per barrel search.
+
+### Eval Game Results (after fix)
+
+| Metric | v16 (128ch, 100sim) | v9 (64ch, 200sim) |
+|---|---|---|
+| W-D-L vs depth-4 | 7-4-9 | 7-3-10 |
+| Avg game length | 43 moves | 44 moves |
+| Net barrel advancement | +0.684 rows/move | +0.733 rows/move |
+| Heuristic advancement | +0.751 rows/move | +0.771 rows/move |
+| 3-fold repetitions | 4/20 games | 3/20 games |
+
+### Replay Buffer Analysis
+
+| Metric | v16 | v9 |
+|---|---|---|
+| Buffer size | 123,679 | 69,600 |
+| Value: Win/Draw/Loss | 17% / 65% / 18% | 19% / 59% / 22% |
+| Policy top-1 accuracy | 51.0% | 46.0% |
+| MCTS target entropy | 1.44 | 2.04 |
+| Search score |score|>0.5 | 13.2% | 14.6% |
+
+### Key Findings
+
+1. **Both models are roughly equal** — neither clearly dominates. Both lose to depth-4 heuristic (~35% win rate).
+
+2. **Heuristic advances barrels faster** — +0.75 rows/move vs +0.68-0.73 for network. Heuristic makes aggressive +4 cross-board jumps; network prefers cautious +1 steps.
+
+3. **Value head is poorly calibrated and systematically optimistic** — In v16 Loss #2 (game 1), the network's MCTS value stays positive (+0.497 to +0.602) for 30+ moves while actually losing W4-B2. The heuristic correctly reads the position at +0.9 throughout. The network can't tell it's behind until it's too late.
+
+4. **Too many draws → weak value signal** — 65% of v16's buffer (59% of v9's) are draws with value target ~0. Value head learns to output ~0 for most positions, destroying its ability to distinguish winning from losing.
+
+5. **Raw policy priors are near-uniform** — In several critical positions, `net=0.000` for all moves (rounded from ~1/1332). With near-uniform priors, 200 simulations are spread across ~16 legal moves (~12 sims/move), giving very shallow effective search depth.
+
+6. **Games collapse into repetition loops** — Network bounces barrels back and forth (e.g., `(2,2)->(2,3)` repeatedly) while thinking it's ahead. Heuristic also loops. Neither breaks out because 3-fold detection only terminates games — there's no cost for approaching repetition.
+
+### Root Cause Analysis
+
+The core issue is a **draw spiral**: too many draws → weak value targets → value head can't distinguish positions → network plays aimlessly → more draws. The heuristic breaks this because it has hand-crafted evaluation that knows barrel advancement and scoring potential from day one.
+
+### Planned Interventions
+
+1. **Repetition penalty in MCTS search** (highest priority) — Penalize positions that appear in the game's position history during MCTS tree evaluation. This directly breaks the shuffle-loops and produces more decisive training games. Implemented as a new `repetition_penalty` parameter on MCTSEngine.
+
+2. **Policy bootstrapping from heuristic** (future) — During heuristic self-play fraction, record heuristic move preferences as soft policy targets. Gives the policy head a head start so MCTS searches more efficiently.
+
+3. **Tune training signal density** (future) — Lower max_moves (50→40), increase early heuristic_ratio (50%→15% vs 30%→10%), increase value_blend_lambda toward 0.7.

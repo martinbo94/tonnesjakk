@@ -14,8 +14,7 @@ from tonnesjakk._core import (
     SearchResult,
     BOARD_SIZE,
     BARRELS_PER_PLAYER,
-    decode_halfpail,
-    decode_halfpail_batch,
+    decode_sparse_batch,
 )
 
 __version__ = "0.1.0"
@@ -29,6 +28,5 @@ __all__ = [
     "SearchResult",
     "BOARD_SIZE",
     "BARRELS_PER_PLAYER",
-    "decode_halfpail",
-    "decode_halfpail_batch",
+    "decode_sparse_batch",
 ]

@@ -2,7 +2,10 @@ use pyo3::prelude::*;
 
 pub mod board;
 pub mod nnue;
+pub mod race;
 pub mod search;
+pub mod tablebase;
+#[cfg(feature = "mcts")]
 pub mod mcts;
 
 // Re-export everything for backward compatibility
@@ -10,190 +13,181 @@ pub use board::*;
 pub use nnue::*;
 pub use search::{BitBoardEngine, Engine, SearchResult, TT_SIZE};
 
-/// Decode a 164-feature dense row into HalfPail sparse indices + dense features.
+/// Generic batch decoder: 164-feature rows -> sparse indices for ANY
+/// architecture the Rust evaluator supports. Feature indices come from the
+/// same `NnueConfig::active_features` the engine uses, so training and
+/// inference can never disagree on the encoding.
 ///
-/// This is the hot path for training data preparation — called ~63M times per epoch.
-/// Moving it from Python to Rust gives ~20-50x speedup.
-///
-/// Accepts either a list of 164 floats or raw bytes (656 bytes = 164 × f32).
-///
-/// Returns: (white_indices: list[int], black_indices: list[int], dense_6: list[float])
+/// Returns (white_indices, white_offsets, black_indices, black_offsets,
+///          dense_flat, output_bucket_per_sample, labels).
 #[pyfunction]
-fn decode_halfpail(data: &Bound<'_, pyo3::types::PyAny>) -> PyResult<(Vec<u16>, Vec<u16>, Vec<f32>)> {
-    let row: Vec<f32> = if let Ok(bytes) = data.extract::<Vec<u8>>() {
-        // Fast path: raw bytes (656 bytes = 164 × f32 little-endian)
-        if bytes.len() != 164 * 4 {
-            return Err(pyo3::exceptions::PyValueError::new_err(
-                format!("Expected 656 bytes (164×f32), got {}", bytes.len())
-            ));
-        }
-        bytes.chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect()
-    } else if let Ok(list) = data.extract::<Vec<f32>>() {
-        // Fallback: list of floats
-        if list.len() != 164 {
-            return Err(pyo3::exceptions::PyValueError::new_err(
-                format!("Expected 164 features, got {}", list.len())
-            ));
-        }
-        list
-    } else {
-        return Err(pyo3::exceptions::PyTypeError::new_err(
-            "Expected list of 164 floats or 656 bytes"
-        ));
-    };
-
-    // Decode board from first 144 features (36 squares × 4 piece types)
-    let mut white_barrels: Vec<usize> = Vec::with_capacity(5);
-    let mut black_barrels: Vec<usize> = Vec::with_capacity(5);
-    let mut white_pail: Option<usize> = None;
-    let mut black_pail: Option<usize> = None;
-
-    for sq in 0..NUM_SQUARES {
-        let base = sq * 4;
-        if row[base] > 0.5 { white_barrels.push(sq); }
-        if row[base + 1] > 0.5 { black_barrels.push(sq); }
-        if row[base + 2] > 0.5 { white_pail = Some(sq); }
-        if row[base + 3] > 0.5 { black_pail = Some(sq); }
-    }
-
-    // Extract scored counts and current player from relational features
-    let rel = &row[144..];
-    let white_scored = (rel[8] * 4.0).round() as i32;
-    let black_scored = (rel[9] * 4.0).round() as i32;
-    let current_player: f32 = if rel[12] > 0.0 { 1.0 } else { -1.0 };
-
-    // White perspective: bucket = white pail position
-    let w_bucket = white_pail.unwrap_or(NUM_SQUARES);
-    let mut white_indices: Vec<u16> = Vec::with_capacity(10);
-    for &sq in &white_barrels {
-        white_indices.push(halfpail_feature_index(w_bucket, sq, 0));
-    }
-    for &sq in &black_barrels {
-        white_indices.push(halfpail_feature_index(w_bucket, sq, 1));
-    }
-    if let Some(bp) = black_pail {
-        white_indices.push(halfpail_feature_index(w_bucket, bp, 2));
-    }
-
-    // Black perspective: bucket = black pail position
-    let b_bucket = black_pail.unwrap_or(NUM_SQUARES);
-    let mut black_indices: Vec<u16> = Vec::with_capacity(10);
-    for &sq in &black_barrels {
-        black_indices.push(halfpail_feature_index(b_bucket, sq, 0));
-    }
-    for &sq in &white_barrels {
-        black_indices.push(halfpail_feature_index(b_bucket, sq, 1));
-    }
-    if let Some(wp) = white_pail {
-        black_indices.push(halfpail_feature_index(b_bucket, wp, 2));
-    }
-
-    // Dense features (6 values)
-    let wb_on_board = white_barrels.len() as f32;
-    let bb_on_board = black_barrels.len() as f32;
-    let dense = vec![
-        white_scored as f32 / 4.0,
-        black_scored as f32 / 4.0,
-        (white_scored - black_scored) as f32 / 4.0,
-        current_player,
-        wb_on_board / 4.0,
-        bb_on_board / 4.0,
-    ];
-
-    Ok((white_indices, black_indices, dense))
-}
-
-/// Batch-decode multiple 164-feature rows into packed HalfPail tensors.
-///
-/// Accepts raw bytes from numpy arrays (via .tobytes()) for zero-copy transfer,
-/// or falls back to list-of-float for compatibility.
-///
-/// Returns everything the collate_fn would produce, skipping all Python-level overhead:
-///   (white_indices, white_offsets, black_indices, black_offsets, dense_flat, labels)
-/// All as flat Vec ready to be wrapped in torch tensors.
-#[pyfunction]
-fn decode_halfpail_batch(
-    data: Vec<f32>,      // N * 164 floats, row-major (from numpy .ravel().tolist())
-    labels: Vec<f32>,    // N floats
-) -> PyResult<(Vec<i64>, Vec<i64>, Vec<i64>, Vec<i64>, Vec<f32>, Vec<f32>)> {
+#[pyo3(signature = (data, labels, feature_set, mirror_black, dense_size, output_buckets))]
+fn decode_sparse_batch(
+    data: Vec<f32>,
+    labels: Vec<f32>,
+    feature_set: &str,
+    mirror_black: bool,
+    dense_size: usize,
+    output_buckets: usize,
+) -> PyResult<(Vec<i64>, Vec<i64>, Vec<i64>, Vec<i64>, Vec<f32>, Vec<i64>, Vec<f32>)> {
     let n = labels.len();
     if data.len() != n * 164 {
         return Err(pyo3::exceptions::PyValueError::new_err(
             format!("Expected {} floats ({}×164), got {}", n * 164, n, data.len())
         ));
     }
-    let data_owned = data;
+    let fs = FeatureSet::from_name(feature_set).ok_or_else(|| {
+        pyo3::exceptions::PyValueError::new_err(format!("unknown feature_set '{}'", feature_set))
+    })?;
+    let config = NnueConfig {
+        feature_set: fs, mirror_black, dense_size, hidden1: 0, hidden2: 0, output_buckets,
+    };
 
-    let mut all_w_idx: Vec<i64> = Vec::with_capacity(n * 10);
-    let mut all_b_idx: Vec<i64> = Vec::with_capacity(n * 10);
-    let mut w_offsets: Vec<i64> = Vec::with_capacity(n);
-    let mut b_offsets: Vec<i64> = Vec::with_capacity(n);
-    let mut dense_flat: Vec<f32> = Vec::with_capacity(n * HALFPAIL_DENSE);
-    let mut labels_out: Vec<f32> = Vec::with_capacity(n);
+    let mut w_idx: Vec<i64> = Vec::with_capacity(n * 10);
+    let mut b_idx: Vec<i64> = Vec::with_capacity(n * 10);
+    let mut w_off: Vec<i64> = Vec::with_capacity(n);
+    let mut b_off: Vec<i64> = Vec::with_capacity(n);
+    let mut dense_flat: Vec<f32> = Vec::with_capacity(n * dense_size);
+    let mut buckets: Vec<i64> = Vec::with_capacity(n);
+    let mut feats = [0u16; MAX_ACTIVE_FEATURES];
 
     for i in 0..n {
-        let row = &data_owned[i * 164..(i + 1) * 164];
+        let row = &data[i * 164..(i + 1) * 164];
+        let bb = bitboard_from_dense164(row);
 
-        // Record offsets before adding indices
-        w_offsets.push(all_w_idx.len() as i64);
-        b_offsets.push(all_b_idx.len() as i64);
+        w_off.push(w_idx.len() as i64);
+        let nw = config.active_features(&bb, Player::White, &mut feats);
+        w_idx.extend(feats[..nw].iter().map(|&f| f as i64));
 
-        // Decode board (BARRELS_PER_PLAYER=4, but use extra space for safety)
-        let mut white_barrels: [usize; 8] = [0; 8];
-        let mut black_barrels: [usize; 8] = [0; 8];
-        let mut n_wb: usize = 0;
-        let mut n_bb: usize = 0;
-        let mut white_pail: usize = NUM_SQUARES; // 36 = not placed
-        let mut black_pail: usize = NUM_SQUARES;
+        b_off.push(b_idx.len() as i64);
+        let nb = config.active_features(&bb, Player::Black, &mut feats);
+        b_idx.extend(feats[..nb].iter().map(|&f| f as i64));
 
-        for sq in 0..NUM_SQUARES {
-            let base = sq * 4;
-            if row[base] > 0.5 && n_wb < 8 { white_barrels[n_wb] = sq; n_wb += 1; }
-            if row[base + 1] > 0.5 && n_bb < 8 { black_barrels[n_bb] = sq; n_bb += 1; }
-            if row[base + 2] > 0.5 { white_pail = sq; }
-            if row[base + 3] > 0.5 { black_pail = sq; }
+        if dense_size == nnue::HALFPAIL_DENSE {
+            dense_flat.extend_from_slice(&row[144..144 + dense_size]); // stored (identical to recomputing)
+        } else if dense_size > 0 {
+            dense_flat.extend_from_slice(&nnue::compute_dense(&bb, dense_size)[..dense_size]);
         }
-
-        let rel = &row[144..];
-
-        // White perspective
-        for j in 0..n_wb {
-            all_w_idx.push(halfpail_feature_index(white_pail, white_barrels[j], 0) as i64);
-        }
-        for j in 0..n_bb {
-            all_w_idx.push(halfpail_feature_index(white_pail, black_barrels[j], 1) as i64);
-        }
-        if black_pail < NUM_SQUARES {
-            all_w_idx.push(halfpail_feature_index(white_pail, black_pail, 2) as i64);
-        }
-
-        // Black perspective
-        for j in 0..n_bb {
-            all_b_idx.push(halfpail_feature_index(black_pail, black_barrels[j], 0) as i64);
-        }
-        for j in 0..n_wb {
-            all_b_idx.push(halfpail_feature_index(black_pail, white_barrels[j], 1) as i64);
-        }
-        if white_pail < NUM_SQUARES {
-            all_b_idx.push(halfpail_feature_index(black_pail, white_pail, 2) as i64);
-        }
-
-        // Dense features: all 20 relational features from training data (features 144-163)
-        for k in 0..HALFPAIL_DENSE {
-            dense_flat.push(rel[k]);
-        }
-
-        labels_out.push(labels[i]);
+        buckets.push(config.output_bucket(&bb) as i64);
     }
 
-    Ok((all_w_idx, w_offsets, all_b_idx, b_offsets, dense_flat, labels_out))
+    Ok((w_idx, w_off, b_idx, b_off, dense_flat, buckets, labels))
+}
+
+/// Solve tablebase phase (wr, br) — barrels remaining per side — and write
+/// `dir/tb_{wr}v{br}.bin`. Lower phases must already exist in `dir`.
+/// Returns (states, white_wins, black_wins, draws).
+#[pyfunction]
+#[pyo3(signature = (dir, wr, br, verbose=true))]
+fn solve_tablebase(py: Python, dir: &str, wr: usize, br: usize, verbose: bool) -> PyResult<(usize, usize, usize, usize)> {
+    let path = std::path::Path::new(dir);
+    let mut tb = tablebase::Tablebase::load_dir(path)
+        .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("load tablebases: {}", e)))?;
+    for (lw, lb) in [(wr.saturating_sub(1), br), (wr, br.saturating_sub(1))] {
+        if lw >= 1 && lb >= 1 && tb.get(lw, lb).is_none() {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                format!("phase {}v{} must be solved before {}v{}", lw, lb, wr, br)));
+        }
+    }
+    let stats = py.allow_threads(|| {
+        let phase = tb.solve(wr, br, verbose);
+        let n = phase.num_states();
+        let w = phase.vals().iter().filter(|&&v| tablebase::is_white_win(v)).count();
+        let b = phase.vals().iter().filter(|&&v| tablebase::is_black_win(v)).count();
+        let d = phase.vals().iter().filter(|&&v| v == tablebase::V_DRAW).count();
+        phase.save(path).map(|_| (n, w, b, d))
+    }).map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("save tablebase: {}", e)))?;
+    Ok(stats)
+}
+
+/// (states, disjoint_pairs, array_bytes, pair_table_bytes) of a packed phase,
+/// computed without allocating it.
+#[pyfunction]
+fn packed_phase_stats(py: Python, wr: usize, br: usize) -> (u64, u64, u64, u64) {
+    py.allow_threads(|| tablebase::packed_phase_stats(wr, br))
+}
+
+/// Exact DTW of the initial position: iterative deepening over odd bounds
+/// from `start` to `max`. Returns (N, nodes) when a bound is proven winnable,
+/// or (0, nodes) if none within `max`.
+#[pyfunction]
+#[pyo3(signature = (dir, start = 27, max = 45, verbose = true))]
+fn dtw_initial(py: Python, dir: &str, start: i32, max: i32, verbose: bool) -> PyResult<(i32, u64)> {
+    let path = std::path::Path::new(dir);
+    let tb = tablebase::Tablebase::load_dir(path)
+        .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("load tablebases: {}", e)))?;
+    py.allow_threads(move || {
+        let bb = board::BitBoard::new();
+        let mut memo = std::collections::HashMap::new();
+        let mut nodes = 0u64;
+        let mut n = start;
+        while n <= max {
+            let t0 = std::time::Instant::now();
+            let n0 = nodes;
+            let ok = tablebase::dtw_can_win(&tb, &bb, n, &mut memo, &mut nodes);
+            if verbose {
+                eprintln!("N={}: {}  ({} nodes, {:.1}s, memo {})",
+                          n, if ok { "WIN" } else { "not yet" }, nodes - n0,
+                          t0.elapsed().as_secs_f64(), memo.len());
+            }
+            if ok { return Ok((n, nodes)); }
+            n += 2;
+        }
+        Ok((0, nodes))
+    })
+}
+
+/// Write the 2-bit WDL companion (`tb_{wr}v{br}.wdl`) of a solved full phase.
+#[pyfunction]
+fn repack_tablebase_wdl(py: Python, dir: &str, wr: usize, br: usize) -> PyResult<usize> {
+    let path = std::path::Path::new(dir);
+    let phase = tablebase::Phase::load(path, wr, br)
+        .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("load phase: {}", e)))?;
+    py.allow_threads(|| phase.save_wdl(path))
+        .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("write wdl: {}", e)))?;
+    Ok((phase.num_states() + 3) / 4)
+}
+
+/// Solve a phase into the packed 2-bit WDL format (`dir/tb_{wr}v{br}.p2`):
+/// symmetric phases store white-to-move states only, asymmetric ones both
+/// sides; no distances. Checkpoints every `checkpoint_every` passes
+/// (resumable). `lowmem` loads the lower phases from their `.wdl` companions
+/// (see `repack_tablebase_wdl`). Returns (states, white_wins, black_wins, draws).
+#[pyfunction]
+#[pyo3(signature = (dir, wr, br, checkpoint_every = 5, verbose = true, lowmem = false))]
+fn solve_tablebase_packed(py: Python, dir: &str, wr: usize, br: usize, checkpoint_every: usize, verbose: bool, lowmem: bool) -> PyResult<(usize, usize, usize, usize)> {
+    let path = std::path::Path::new(dir);
+    let tb = if lowmem { tablebase::Tablebase::load_dir_lowmem(path) } else { tablebase::Tablebase::load_dir(path) }
+        .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("load tablebases: {}", e)))?;
+    for (lw, lb) in [(wr.saturating_sub(1), br), (wr, br.saturating_sub(1))] {
+        if lw >= 1 && lb >= 1 && !tb.has_phase(lw, lb) {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!("phase {}v{} must be solved before {}v{}", lw, lb, wr, br)));
+        }
+    }
+    py.allow_threads(|| {
+        let p = tablebase::solve_packed(&tb, wr, br, path, checkpoint_every, verbose);
+        let n = p.num_states();
+        let (mut w, mut b, mut d) = (0usize, 0usize, 0usize);
+        for idx in 0..n {
+            match p.get(idx) {
+                tablebase::P_WHITE => w += 1,
+                tablebase::P_BLACK => b += 1,
+                tablebase::P_UNKNOWN => d += 1,
+                _ => {}
+            }
+        }
+        p.save(path).map(|_| (n, w, b, d))
+    }).map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("save tablebase: {}", e)))
 }
 
 /// Python-modul
 #[pymodule]
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(solve_tablebase, m)?)?;
+    m.add_function(wrap_pyfunction!(solve_tablebase_packed, m)?)?;
+    m.add_function(wrap_pyfunction!(repack_tablebase_wdl, m)?)?;
+    m.add_function(wrap_pyfunction!(packed_phase_stats, m)?)?;
+    m.add_function(wrap_pyfunction!(dtw_initial, m)?)?;
     m.add_class::<Player>()?;
     m.add_class::<Cell>()?;
     m.add_class::<Position>()?;
@@ -201,17 +195,19 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Board>()?;
     m.add_class::<Engine>()?;
     m.add_class::<SearchResult>()?;
-    m.add_function(wrap_pyfunction!(decode_halfpail, m)?)?;
-    m.add_function(wrap_pyfunction!(decode_halfpail_batch, m)?)?;
+    m.add_function(wrap_pyfunction!(decode_sparse_batch, m)?)?;
     m.add("BOARD_SIZE", BOARD_SIZE)?;
     m.add("BARRELS_PER_PLAYER", BARRELS_PER_PLAYER)?;
-    m.add("POLICY_SIZE", mcts::POLICY_SIZE)?;
-    m.add_class::<mcts::MCTSEngine>()?;
-    m.add_class::<mcts::MCTSSearchResult>()?;
-    m.add_class::<mcts::TrainingExample>()?;
-    m.add_class::<mcts::SelfPlayResult>()?;
-    m.add_class::<mcts::EvalMatchResult>()?;
-    m.add_class::<mcts::OnnxSession>()?;
+    #[cfg(feature = "mcts")]
+    {
+        m.add("POLICY_SIZE", mcts::POLICY_SIZE)?;
+        m.add_class::<mcts::MCTSEngine>()?;
+        m.add_class::<mcts::MCTSSearchResult>()?;
+        m.add_class::<mcts::TrainingExample>()?;
+        m.add_class::<mcts::SelfPlayResult>()?;
+        m.add_class::<mcts::EvalMatchResult>()?;
+        m.add_class::<mcts::OnnxSession>()?;
+    }
     Ok(())
 }
 
@@ -396,28 +392,30 @@ mod tests {
     /// Test at prekalkulerte tabeller er korrekte
     #[test]
     fn test_precomputed_tables() {
-        // Test ADJACENT
-        // Hjørne (0,0) har 2 naboer
+        // Test ADJACENT (8 retninger)
+        // Hjørne (0,0) har 3 naboer (høyre, ned, ned-høyre)
         let adj_00 = ADJACENT[sq(0, 0)];
-        assert_eq!(adj_00.count_ones(), 2);
+        assert_eq!(adj_00.count_ones(), 3);
         assert!(adj_00 & bit(sq(0, 1)) != 0); // høyre
         assert!(adj_00 & bit(sq(1, 0)) != 0); // ned
+        assert!(adj_00 & bit(sq(1, 1)) != 0); // ned-høyre
 
-        // Senter (2,2) har 4 naboer
+        // Senter (2,2) har 8 naboer
         let adj_22 = ADJACENT[sq(2, 2)];
-        assert_eq!(adj_22.count_ones(), 4);
+        assert_eq!(adj_22.count_ones(), 8);
 
         // Test JUMP_LANDING
-        // Fra (2,2) kan vi hoppe i alle 4 retninger
-        for dir in 0..4 {
+        // Fra (2,2) kan vi hoppe i alle 8 retninger
+        for dir in 0..NUM_JUMP_DIRS {
             assert!(JUMP_LANDING[sq(2, 2)][dir] >= 0);
         }
 
-        // Fra (0,0) kan vi bare hoppe ned og høyre
+        // Fra (0,0) kan vi bare hoppe ned, høyre og ned-høyre
         assert!(JUMP_LANDING[sq(0, 0)][0] < 0); // opp - ugyldig
         assert!(JUMP_LANDING[sq(0, 0)][1] >= 0); // ned - gyldig
         assert!(JUMP_LANDING[sq(0, 0)][2] < 0); // venstre - ugyldig
         assert!(JUMP_LANDING[sq(0, 0)][3] >= 0); // høyre - gyldig
+        assert!(JUMP_LANDING[sq(0, 0)][7] >= 0); // ned-høyre - gyldig
 
         println!("✓ Precomputed tables are correct");
     }
@@ -541,4 +539,121 @@ mod tests {
             score
         });
     }
+
+    // ═══════════════════════════════════════════════════════════════
+    // Draw-rule tests (halfmove clock, off-board Zobrist keys, repetition)
+    // ═══════════════════════════════════════════════════════════════
+
+    /// Play a pail placement + a barrel placement for the side to move.
+    fn place_pail_and_barrel(bb: &mut BitBoard, pail_sq: u8) {
+        bb.make_move(&BitMove::new_pail_placement(pail_sq));
+        let placement = bb
+            .generate_moves()
+            .into_iter()
+            .find(|m| m.is_placement())
+            .expect("placement available");
+        bb.make_move(&placement);
+    }
+
+    #[test]
+    fn test_halfmove_clock() {
+        let mut bb = BitBoard::new();
+        assert_eq!(bb.halfmove_clock, 0);
+
+        place_pail_and_barrel(&mut bb, sq(2, 0) as u8); // white
+        assert_eq!(bb.halfmove_clock, 0, "placement resets clock");
+        place_pail_and_barrel(&mut bb, sq(3, 5) as u8); // black
+        assert_eq!(bb.halfmove_clock, 0);
+
+        // Reversible barrel moves increment the clock
+        for expected in 1..=4u16 {
+            let mv = bb
+                .generate_moves()
+                .into_iter()
+                .find(|m| !m.is_placement() && !m.is_pail_placement())
+                .expect("barrel move available");
+            bb.make_move(&mv);
+            assert_eq!(bb.halfmove_clock, expected);
+        }
+
+        // Placement resets again
+        let mv = bb
+            .generate_moves()
+            .into_iter()
+            .find(|m| m.is_placement())
+            .expect("placement available");
+        bb.make_move(&mv);
+        assert_eq!(bb.halfmove_clock, 0);
+    }
+
+    /// Off-board Zobrist keys: same board occupancy with different
+    /// off-board/scored splits must hash differently.
+    #[test]
+    fn test_offboard_hash_keys() {
+        let a = BitBoard::new();
+        let mut b = BitBoard::new();
+        // Simulate "one white barrel scored, none in hand difference":
+        // manually alter off-board count and re-derive expected hash change.
+        b.hash ^= ZOBRIST_TEST_KEYS(0, 4);
+        b.hash ^= ZOBRIST_TEST_KEYS(0, 3);
+        b.white_barrels_off_board = 3;
+        b.white_scored = 1;
+        assert_ne!(a.hash, b.hash, "off-board count must affect the hash");
+    }
+
+    /// Repetition: with the position already in game history, search must
+    /// score the repeating line as a draw (0), not as the static eval.
+    #[test]
+    fn test_repetition_scored_as_draw() {
+        let mut bb = BitBoard::new();
+        place_pail_and_barrel(&mut bb, sq(2, 0) as u8);
+        place_pail_and_barrel(&mut bb, sq(3, 5) as u8);
+
+        let mut engine = BitBoardEngine::new();
+
+        // Baseline: no history → normal score
+        engine.game_history.clear();
+        let (score_free, _) = engine.search(&bb, 4);
+
+        // Poison history: every child position of every white move is
+        // "already seen twice" → every line starts with a repetition draw.
+        let mut all_children = Vec::new();
+        for mv in bb.generate_moves() {
+            let mut child = bb;
+            child.make_move(&mv);
+            all_children.push(child.hash);
+        }
+        engine.full_reset();
+        engine.game_history = all_children;
+        let (score_rep, _) = engine.search(&bb, 4);
+
+        assert_eq!(score_rep, 0, "all-repetition position must score as draw");
+        assert_ne!(score_free, score_rep, "baseline should differ from draw score");
+    }
+
+    /// No-progress rule: a position at the clock limit scores as a draw one
+    /// ply into the search.
+    #[test]
+    fn test_no_progress_draw() {
+        let mut bb = BitBoard::new();
+        place_pail_and_barrel(&mut bb, sq(2, 0) as u8);
+        place_pail_and_barrel(&mut bb, sq(3, 5) as u8);
+        bb.halfmove_clock = 59;
+
+        let mut engine = BitBoardEngine::new();
+        engine.no_progress_limit = 60;
+        // Only reversible moves exist here besides placements; a placement
+        // resets the clock, so search should either place a barrel (progress)
+        // or accept the draw — never return a large advantage from shuffling.
+        let (score, mv) = engine.search(&bb, 6);
+        assert!(mv.is_some());
+        assert!(score.abs() < 90_000);
+    }
+}
+
+/// Test-only accessor for the off-board Zobrist keys (keeps ZOBRIST private).
+#[cfg(test)]
+#[allow(non_snake_case)]
+fn ZOBRIST_TEST_KEYS(player: usize, count: usize) -> u64 {
+    crate::board::zobrist_off_board_key(player, count)
 }

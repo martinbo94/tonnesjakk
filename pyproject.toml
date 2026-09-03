@@ -14,6 +14,9 @@ dependencies = [
 [project.optional-dependencies]
 train = [
     "torch>=2.0",
+    "onnx>=1.14",
+    "onnxscript>=0.1",
+    "onnxruntime>=1.15",
 ]
 dev = [
     "pytest>=7.0",

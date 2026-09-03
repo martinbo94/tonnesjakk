@@ -8,11 +8,21 @@ name = "tonnesjakk_core"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-pyo3 = { version = "0.24", features = ["extension-module"] }
+# extension-module is enabled by maturin (pyproject.toml features), NOT here —
+# hardcoding it makes `cargo test` unlinkable (no Python symbols at test link time).
+pyo3 = { version = "0.24" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 wide = "0.7"  # Portable SIMD
-ort = { version = "2.0.0-rc.11", features = ["coreml"] }
+memmap2 = "0.9"  # Tablebase files: shared read-only pages across worker processes
+# ONNX runtime: ONLY the AlphaZero research module (mcts) needs it. Optional so
+# the tablebase-solver build on Linux (vm_solve.sh: --no-default-features)
+# never links onnxruntime (undefined OrtGetApiBase at import otherwise).
+ort = { version = "2.0.0-rc.11", features = ["coreml"], optional = true }
+
+[features]
+default = ["mcts"]
+mcts = ["dep:ort"]
 
 [profile.release]
 opt-level = 3
