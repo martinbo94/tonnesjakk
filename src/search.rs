@@ -675,7 +675,9 @@ impl Engine {
 
     /// Load all solved tablebase phases from a directory (tb_{w}v{b}.bin files).
     fn load_tablebases(&mut self, dir: &str) -> PyResult<Vec<(usize, usize)>> {
-        let tb = crate::tablebase::Tablebase::load_dir(std::path::Path::new(dir))
+        // dense=false: play only needs binary-search index(), which keeps the
+        // per-phase pair_offset matrix (~14 GB for the big phases) out of RAM.
+        let tb = crate::tablebase::Tablebase::load_dir(std::path::Path::new(dir), false)
             .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("load tablebases: {}", e)))?;
         let phases = tb.loaded_phases();
         self.inner.tablebase = Some(tb);

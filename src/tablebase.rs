@@ -445,7 +445,14 @@ pub fn packed_phase_stats(wr: usize, br: usize) -> (u64, u64, u64, u64) {
 }
 
 impl PackedPhase {
-    pub fn new(wr: usize, br: usize) -> Self {
+    /// Build the phase's index tables. When `dense`, also build the O(1)
+    /// `wc×bc` `pair_offset` matrix — needed while SOLVING (it is written
+    /// via `index()` in the retrograde loop), but ~8 GB for 4v4. When false,
+    /// `index()` falls back to a binary search over the sorted `pair_id`, so
+    /// loading a phase for PLAY costs a fraction of the RAM. `owned_data`
+    /// allocates the writable 2-bit array (for solving); loaders leave it
+    /// empty and attach a memory map instead.
+    fn build(wr: usize, br: usize, dense: bool, owned_data: bool) -> Self {
         let symmetric = wr == br;
         let wcfg = ConfigSpace::new(Player::White, wr);
         let bcfg = ConfigSpace::new(Player::Black, br);
@@ -453,7 +460,7 @@ impl PackedPhase {
         let bc = bcfg.count as usize;
         let wmasks: Vec<u64> = (0..wc).map(|i| wcfg.unrank(i as u64)).collect();
         let bmasks: Vec<u64> = (0..bc).map(|i| bcfg.unrank(i as u64)).collect();
-        let mut pair_offset = vec![u64::MAX; wc * bc];
+        let mut pair_offset = if dense { vec![u64::MAX; wc * bc] } else { Vec::new() };
         let mut pair_start = Vec::new();
         let mut pair_id = Vec::new();
         let mut acc = 0u64;
@@ -464,15 +471,21 @@ impl PackedPhase {
                 if w & b != 0 { continue; }
                 let f = NUM_SQUARES - (w | b).count_ones() as usize;
                 let p = wi * bc + bi;
-                pair_offset[p] = acc;
+                if dense { pair_offset[p] = acc; }
                 pair_start.push(acc);
                 pair_id.push(p as u32);
                 acc += (sides * pail_combos(f)) as u64;
             }
         }
         let n = acc as usize;
-        PackedPhase { wr, br, symmetric, wcfg, bcfg, data: vec![0u8; (n + 3) / 4], mapped: None, n_states: n,
+        let data = if owned_data { vec![0u8; (n + 3) / 4] } else { Vec::new() };
+        PackedPhase { wr, br, symmetric, wcfg, bcfg, data, mapped: None, n_states: n,
                       pair_offset, pair_start, pair_id }
+    }
+
+    /// Owned, writable phase for solving (dense O(1) index).
+    pub fn new(wr: usize, br: usize) -> Self {
+        Self::build(wr, br, true, true)
     }
 
     pub fn num_states(&self) -> usize { self.n_states }
@@ -504,8 +517,19 @@ impl PackedPhase {
         }
         let wi = self.wcfg.rank(bb.white_barrels)? as usize;
         let bi = self.bcfg.rank(bb.black_barrels)? as usize;
-        let off = self.pair_offset[wi * self.bcfg.count as usize + bi];
-        if off == u64::MAX { return None; }
+        let p = wi * self.bcfg.count as usize + bi;
+        let off = if self.pair_offset.is_empty() {
+            // Loaded for play: binary search the sorted valid-pair ids
+            // (pair_id is pushed in increasing `p` order in build()).
+            match self.pair_id.binary_search(&(p as u32)) {
+                Ok(pi) => self.pair_start[pi],
+                Err(_) => return None,   // overlapping configs: no such state
+            }
+        } else {
+            let o = self.pair_offset[p];   // solving: dense O(1)
+            if o == u64::MAX { return None; }
+            o
+        };
         let free = ALL_SQUARES & !(bb.white_barrels | bb.black_barrels);
         let f = free.count_ones() as usize;
         let (wp, bp) = (bb.white_pail, bb.black_pail);
@@ -592,10 +616,12 @@ impl PackedPhase {
         std::fs::write(dir.join(Self::file_name(self.wr, self.br)), self.bytes())
     }
 
-    pub fn load(dir: &Path, wr: usize, br: usize) -> std::io::Result<Self> {
-        let mut p = PackedPhase::new(wr, br);
-        let expected = p.data.len();
-        p.data = Vec::new();
+    /// Load a phase, memory-mapping its 2-bit array. `dense` builds the O(1)
+    /// `pair_offset` matrix (for the solver reloading lower phases); play
+    /// callers pass false to skip its ~GBs and use binary-search `index()`.
+    pub fn load(dir: &Path, wr: usize, br: usize, dense: bool) -> std::io::Result<Self> {
+        let mut p = PackedPhase::build(wr, br, dense, false);
+        let expected = (p.n_states + 3) / 4;
         let file = std::fs::File::open(dir.join(Self::file_name(wr, br)))?;
         let mmap = unsafe { memmap2::Mmap::map(&file)? };
         if mmap.len() != expected {
@@ -806,8 +832,10 @@ impl Tablebase {
         }
     }
 
-    /// Load every phase file present in `dir`.
-    pub fn load_dir(dir: &Path) -> std::io::Result<Self> {
+    /// Load every phase file present in `dir`. `dense` builds each packed
+    /// phase's O(1) `pair_offset` (needed by the solver, ~GBs); pass false
+    /// for PLAY (web app, tournament) to load with binary-search `index()`.
+    pub fn load_dir(dir: &Path, dense: bool) -> std::io::Result<Self> {
         let mut tb = Tablebase::new();
         for wr in 1..=4 {
             for br in 1..=4 {
@@ -819,7 +847,7 @@ impl Tablebase {
         for wr in 1..=4 {
             for br in 1..=4 {
                 if dir.join(PackedPhase::file_name(wr, br)).exists() && tb.get(wr, br).is_none() {
-                    tb.insert_packed(PackedPhase::load(dir, wr, br)?);
+                    tb.insert_packed(PackedPhase::load(dir, wr, br, dense)?);
                 }
             }
         }
@@ -829,7 +857,7 @@ impl Tablebase {
     /// Like `load_dir`, but prefer the 2-bit `.wdl` companions over the full
     /// `.bin` files: a quarter of the resident memory, no distances. For the
     /// solvers (which only need WDL of the lower phases), not for play.
-    pub fn load_dir_lowmem(dir: &Path) -> std::io::Result<Self> {
+    pub fn load_dir_lowmem(dir: &Path, dense: bool) -> std::io::Result<Self> {
         let mut tb = Tablebase::new();
         for wr in 1..=4 {
             for br in 1..=4 {
@@ -843,7 +871,7 @@ impl Tablebase {
         for wr in 1..=4 {
             for br in 1..=4 {
                 if dir.join(PackedPhase::file_name(wr, br)).exists() && tb.get(wr, br).is_none() {
-                    tb.insert_packed(PackedPhase::load(dir, wr, br)?);
+                    tb.insert_packed(PackedPhase::load(dir, wr, br, dense)?);
                 }
             }
         }
@@ -1188,6 +1216,19 @@ mod tests {
             assert_eq!(p2.index(&bb), Some(idx));
         }
         assert_eq!(PackedPhase::new(3, 3).num_states(), 30_053_815_328);
+
+        // Loaded-for-play (dense=false): the binary-search index() must return
+        // exactly what the dense matrix does for every state, and keep no matrix.
+        let dir = std::env::temp_dir().join("tonnesjakk_tb_sparse_idx");
+        let _ = std::fs::remove_dir_all(&dir);
+        p1.save(&dir).unwrap();
+        let p1s = PackedPhase::load(&dir, 1, 1, false).unwrap();
+        assert!(p1s.pair_offset.is_empty(), "play load keeps no dense pair_offset");
+        for idx in 0..p1s.num_states() {
+            let bb = p1s.decode(idx).expect("valid");
+            assert_eq!(p1s.index(&bb), Some(idx), "sparse roundtrip at {}", idx);
+            assert_eq!(p1s.index(&bb), p1.index(&bb), "sparse vs dense at {}", idx);
+        }
     }
 
     /// Asymmetric packed phase (both sides to move): index/decode roundtrip,
@@ -1276,7 +1317,7 @@ mod tests {
             p.save(&dir).unwrap();
             p.save_wdl(&dir).unwrap();
         }
-        let low = Tablebase::load_dir_lowmem(&dir).unwrap();
+        let low = Tablebase::load_dir_lowmem(&dir, false).unwrap();
         assert!(low.get(2, 1).unwrap().is_wdl_only());
         let same = |v: u8, w: u8| (is_white_win(v) && is_white_win(w)) || (is_black_win(v) && is_black_win(w)) || (v == V_DRAW && w == V_DRAW);
         let phase21 = full.get(2, 1).unwrap();

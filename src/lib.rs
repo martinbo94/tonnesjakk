@@ -81,7 +81,7 @@ fn decode_sparse_batch(
 #[pyo3(signature = (dir, wr, br, verbose=true))]
 fn solve_tablebase(py: Python, dir: &str, wr: usize, br: usize, verbose: bool) -> PyResult<(usize, usize, usize, usize)> {
     let path = std::path::Path::new(dir);
-    let mut tb = tablebase::Tablebase::load_dir(path)
+    let mut tb = tablebase::Tablebase::load_dir(path, true)
         .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("load tablebases: {}", e)))?;
     for (lw, lb) in [(wr.saturating_sub(1), br), (wr, br.saturating_sub(1))] {
         if lw >= 1 && lb >= 1 && tb.get(lw, lb).is_none() {
@@ -114,7 +114,7 @@ fn packed_phase_stats(py: Python, wr: usize, br: usize) -> (u64, u64, u64, u64) 
 #[pyo3(signature = (dir, start = 27, max = 45, verbose = true))]
 fn dtw_initial(py: Python, dir: &str, start: i32, max: i32, verbose: bool) -> PyResult<(i32, u64)> {
     let path = std::path::Path::new(dir);
-    let tb = tablebase::Tablebase::load_dir(path)
+    let tb = tablebase::Tablebase::load_dir(path, true)
         .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("load tablebases: {}", e)))?;
     py.allow_threads(move || {
         let bb = board::BitBoard::new();
@@ -157,7 +157,7 @@ fn repack_tablebase_wdl(py: Python, dir: &str, wr: usize, br: usize) -> PyResult
 #[pyo3(signature = (dir, wr, br, checkpoint_every = 5, verbose = true, lowmem = false))]
 fn solve_tablebase_packed(py: Python, dir: &str, wr: usize, br: usize, checkpoint_every: usize, verbose: bool, lowmem: bool) -> PyResult<(usize, usize, usize, usize)> {
     let path = std::path::Path::new(dir);
-    let tb = if lowmem { tablebase::Tablebase::load_dir_lowmem(path) } else { tablebase::Tablebase::load_dir(path) }
+    let tb = if lowmem { tablebase::Tablebase::load_dir_lowmem(path, true) } else { tablebase::Tablebase::load_dir(path, true) }
         .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("load tablebases: {}", e)))?;
     for (lw, lb) in [(wr.saturating_sub(1), br), (wr, br.saturating_sub(1))] {
         if lw >= 1 && lb >= 1 && !tb.has_phase(lw, lb) {
